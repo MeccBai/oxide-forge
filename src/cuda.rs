@@ -9,8 +9,16 @@ use std::sync::Arc;
 const DEFAULT_BLOCK_SIZE: usize = 1024;
 
 mod device;
+mod matrix;
+mod runtime;
+mod vector;
+
 mod span;
-pub use span::DeviceSpanMut;
+
+pub use runtime::CudaRuntime;
+pub use runtime::InitType;
+pub(crate) use span::{DeviceSpan, DeviceSpanMut};
+
 #[cuda_module]
 mod kernels {
     const DEFAULT_BLOCK_SIZE_U32: u32 = 1024;
@@ -92,7 +100,7 @@ mod kernels {
     {
         let index = thread::index_1d().get();
         if index < span.len {
-            let element = unsafe { span.ptr.add(index * span.stride) };
+            let element = unsafe { span.ptr.add(index) };
             unsafe {
                 element.write(f(element.read()));
             }
@@ -136,61 +144,19 @@ mod kernels {
             *elem = buffer[index];
         }
     }
-}
 
-mod matrix;
-mod vector;
-pub enum InitType {
-    Sequence,
-    Reserve,
-    Random,
-    Zero,
-}
-
-impl InitType {
-    pub fn is_zero(&self) -> bool {
-        match self {
-            Self::Sequence => false,
-            Self::Reserve => false,
-            Self::Random => false,
-            Self::Zero => true,
+    #[kernel]
+    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
+    #[launch_contract(domain = 1)]
+    pub fn vector_pre_dot_product(
+        buffer1: &[f32],
+        buffer2: &[f32],
+        mut result: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let index = idx.get();
+        if let Some(elem) = result.get_mut(idx) {
+            *elem = buffer1[index] * buffer2[index];
         }
-    }
-}
-
-pub struct CudaRuntime {
-    module: kernels::LoadedModule,
-    ctx: Arc<CudaContext>,
-    stream: Arc<CudaStream>,
-    temp_stream: Vec<Arc<CudaStream>>,
-}
-
-impl CudaRuntime {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let ctx = CudaContext::new(0)?;
-        let stream = ctx.default_stream();
-        let temp_stream = Vec::new();
-        let module = unsafe { kernels::load(&ctx)? };
-
-        Ok(Self {
-            module,
-            ctx,
-            stream,
-            temp_stream,
-        })
-    }
-
-    pub fn get_uninit_buffer(&self, size: usize) -> DeviceBuffer<f32> {
-        let buffer = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, size) };
-        buffer.unwrap()
-    }
-
-    pub fn get_zerod_buffer(&self, size: usize) -> DeviceBuffer<f32> {
-        let buffer = DeviceBuffer::<f32>::zeroed(&self.stream, size);
-        buffer.unwrap()
-    }
-
-    pub fn sync(&self) {
-        self.stream.synchronize().unwrap();
     }
 }

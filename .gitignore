@@ -9,3 +9,5 @@
 **/*.options
 **/*.ptx
 **/*.target
+/.vscode/settings.json
+/docs/impl

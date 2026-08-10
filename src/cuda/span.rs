@@ -1,10 +1,10 @@
 use core::marker::PhantomData;
 
-use cuda_core::DeviceBuffer;
+use cuda_core::{DeviceBuffer, memory};
 
 use super::{CudaRuntime, DEFAULT_BLOCK_SIZE};
 
-/// Copyable device-side description of a possibly-strided mutable span.
+/// Copyable device-side description of a contiguous mutable span.
 ///
 /// This value never owns the allocation. Keep construction private to the
 /// borrowing `DeviceSpanMut` wrapper below.
@@ -12,7 +12,6 @@ use super::{CudaRuntime, DEFAULT_BLOCK_SIZE};
 pub(super) struct DeviceSpanDescriptor<T> {
     pub ptr: *mut T,
     pub len: usize,
-    pub stride: usize,
 }
 
 impl<T> Copy for DeviceSpanDescriptor<T> {}
@@ -23,55 +22,94 @@ impl<T> Clone for DeviceSpanDescriptor<T> {
     }
 }
 
+/// A non-owning shared borrow of a contiguous `DeviceBuffer` region.
+pub(crate) struct DeviceSpan<'a, T> {
+    ptr: *const T,
+    len: usize,
+    _borrow: PhantomData<&'a [T]>,
+}
+
+impl<'a, T> DeviceSpan<'a, T> {
+    pub(super) fn from_buffer(buffer: &'a DeviceBuffer<T>, offset: usize, len: usize) -> Self {
+        check_range(buffer.len(), offset, len);
+        let ptr = offset_ptr::<T>(buffer.cu_deviceptr(), offset);
+
+        Self {
+            ptr: ptr as usize as *const T,
+            len,
+            _borrow: PhantomData,
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+
+    fn split(self, chunk_size: usize) -> Vec<Self> {
+        split_spans::<T>(self.ptr as usize as u64, self.len, chunk_size)
+            .into_iter()
+            .map(|(ptr, len)| Self {
+                ptr: ptr as usize as *const T,
+                len,
+                _borrow: PhantomData,
+            })
+            .collect()
+    }
+
+    pub(super) fn chunks(buffer: &'a DeviceBuffer<T>, chunk_size: usize) -> Vec<Self> {
+        Self::from_buffer(buffer, 0, buffer.len()).split(chunk_size)
+    }
+}
+
+impl DeviceSpan<'_, f32> {
+    pub(super) fn to_buffer(&self, runtime: &CudaRuntime) -> DeviceBuffer<f32> {
+        copy_to_buffer(self.ptr as usize as u64, self.len, runtime)
+    }
+}
+
+impl<'a> Clone for DeviceSpan<'a, f32> {
+    fn clone(&self) -> Self {
+        DeviceSpan {
+            ptr: self.ptr.clone(),
+            len: self.len,
+            _borrow: self._borrow.clone(),
+        }
+    }
+}
+
 /// A non-owning, exclusively borrowed region of a `DeviceBuffer`.
 ///
 /// Dropping this value does not free device memory. The `PhantomData` keeps the
 /// mutable borrow of the owning allocation active for the span's lifetime.
-pub struct DeviceSpanMut<'a, T> {
+pub(crate) struct DeviceSpanMut<'a, T> {
     descriptor: DeviceSpanDescriptor<T>,
     _borrow: PhantomData<&'a mut [T]>,
 }
 
 impl<'a, T> DeviceSpanMut<'a, T> {
-    pub fn from_buffer(buffer: &'a mut DeviceBuffer<T>, offset: usize, len: usize) -> Self {
-        Self::from_buffer_strided(buffer, offset, len, 1)
-    }
-
-    pub fn from_buffer_strided(
-        buffer: &'a mut DeviceBuffer<T>,
-        offset: usize,
-        len: usize,
-        stride: usize,
-    ) -> Self {
-        assert!(stride > 0, "device span stride must be non-zero");
-        assert!(offset <= buffer.len(), "device span offset out of bounds");
-
-        if len > 0 {
-            let last = offset
-                .checked_add((len - 1).checked_mul(stride).expect("device span overflow"))
-                .expect("device span overflow");
-            assert!(last < buffer.len(), "device span exceeds its buffer");
-        }
-
-        let byte_offset = offset
-            .checked_mul(core::mem::size_of::<T>())
-            .expect("device span byte offset overflow");
-        let ptr = buffer
-            .cu_deviceptr()
-            .checked_add(byte_offset as u64)
-            .expect("device span pointer overflow") as usize as *mut T;
+    pub(super) fn from_buffer(buffer: &'a mut DeviceBuffer<T>, offset: usize, len: usize) -> Self {
+        check_range(buffer.len(), offset, len);
+        let ptr = offset_ptr::<T>(buffer.cu_deviceptr(), offset) as usize as *mut T;
 
         Self {
-            descriptor: DeviceSpanDescriptor { ptr, len, stride },
+            descriptor: DeviceSpanDescriptor { ptr, len },
             _borrow: PhantomData,
         }
     }
 
-    pub fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.descriptor.len
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn into_span(self) -> DeviceSpan<'a, T> {
+        DeviceSpan {
+            ptr: self.descriptor.ptr,
+            len: self.descriptor.len,
+            _borrow: PhantomData,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
@@ -79,51 +117,44 @@ impl<'a, T> DeviceSpanMut<'a, T> {
         self.descriptor
     }
 
-    /// Splits one allocation into disjoint, contiguous mutable spans.
-    pub(super) fn split_contiguous(
-        buffer: &'a mut DeviceBuffer<T>,
-        chunk_len: usize,
-        chunks: usize,
-    ) -> Vec<Self> {
-        let covered = chunk_len
-            .checked_mul(chunks)
-            .expect("device span partition overflow");
-        assert!(
-            covered <= buffer.len(),
-            "device span partition exceeds buffer"
-        );
+    /// Consumes this span and partitions it into disjoint contiguous chunks.
+    /// The last chunk may be shorter than `chunk_size`.
+    fn split(self, chunk_size: usize) -> Vec<Self> {
+        split_spans::<T>(
+            self.descriptor.ptr as usize as u64,
+            self.descriptor.len,
+            chunk_size,
+        )
+        .into_iter()
+        .map(|(ptr, len)| Self {
+            descriptor: DeviceSpanDescriptor {
+                ptr: ptr as usize as *mut T,
+                len,
+            },
+            _borrow: PhantomData,
+        })
+        .collect()
+    }
 
-        let base = buffer.cu_deviceptr();
-        let elem_size = core::mem::size_of::<T>();
-        let mut spans = Vec::with_capacity(chunks);
-
-        for index in 0..chunks {
-            let offset = index
-                .checked_mul(chunk_len)
-                .expect("device span partition overflow");
-            let byte_offset = offset
-                .checked_mul(elem_size)
-                .expect("device span partition overflow");
-            let ptr = base
-                .checked_add(byte_offset as u64)
-                .expect("device span pointer overflow") as usize as *mut T;
-
-            spans.push(Self {
-                descriptor: DeviceSpanDescriptor {
-                    ptr,
-                    len: chunk_len,
-                    stride: 1,
-                },
-                _borrow: PhantomData,
-            });
-        }
-
-        spans
+    /// Borrows an entire buffer and partitions it into mutable chunks.
+    /// The last chunk may be shorter than `chunk_size`.
+    pub(super) fn chunks(buffer: &'a mut DeviceBuffer<T>, chunk_size: usize) -> Vec<Self> {
+        let len = buffer.len();
+        Self::from_buffer(buffer, 0, len).split(chunk_size)
     }
 }
 
 impl DeviceSpanMut<'_, f32> {
-    pub fn for_each<F>(&mut self, runtime: &CudaRuntime, f: F)
+    /// Copies this span into a new independently-owned device buffer.
+    pub(super) fn to_buffer(&self, runtime: &CudaRuntime) -> DeviceBuffer<f32> {
+        copy_to_buffer(
+            self.descriptor.ptr as usize as u64,
+            self.descriptor.len,
+            runtime,
+        )
+    }
+
+    pub(super) fn for_each<F>(&mut self, runtime: &CudaRuntime, f: F)
     where
         F: Fn(f32) -> f32 + Copy,
     {
@@ -132,14 +163,109 @@ impl DeviceSpanMut<'_, f32> {
         }
 
         let config = runtime.get_launch_config(self.len(), DEFAULT_BLOCK_SIZE);
-        let prepared = runtime.module.prepare_span_for_each::<F>(config).unwrap();
+        let prepared = runtime.module().prepare_span_for_each::<F>(config).unwrap();
 
         unsafe {
             runtime
-                .module
-                .span_for_each::<F>(&runtime.stream, &prepared, self.descriptor(), f)
+                .module()
+                .span_for_each::<F>(runtime.stream(), &prepared, self.descriptor(), f)
                 .unwrap();
         }
         runtime.sync();
+    }
+}
+
+fn check_range(buffer_len: usize, offset: usize, len: usize) {
+    assert!(offset <= buffer_len, "device span offset out of bounds");
+    let end = offset.checked_add(len).expect("device span overflow");
+    assert!(end <= buffer_len, "device span exceeds its buffer");
+}
+
+fn offset_ptr<T>(base: u64, offset: usize) -> u64 {
+    let byte_offset = offset
+        .checked_mul(core::mem::size_of::<T>())
+        .expect("device span byte offset overflow");
+    base.checked_add(byte_offset as u64)
+        .expect("device span pointer overflow")
+}
+
+fn split_spans<T>(base: u64, len: usize, chunk_size: usize) -> Vec<(u64, usize)> {
+    assert!(chunk_size > 0, "device span chunk size must be non-zero");
+
+    let chunk_count = len.div_ceil(chunk_size);
+    let mut spans = Vec::with_capacity(chunk_count);
+    for index in 0..chunk_count {
+        let offset = index
+            .checked_mul(chunk_size)
+            .expect("device span partition overflow");
+        spans.push((offset_ptr::<T>(base, offset), chunk_size.min(len - offset)));
+    }
+    spans
+}
+
+fn copy_to_buffer(src: u64, len: usize, runtime: &CudaRuntime) -> DeviceBuffer<f32> {
+    let result = runtime.get_uninit_buffer(len);
+    if len == 0 {
+        return result;
+    }
+
+    let byte_len = len
+        .checked_mul(core::mem::size_of::<f32>())
+        .expect("device span copy size overflow");
+    unsafe {
+        memory::memcpy_dtod_async(
+            result.cu_deviceptr(),
+            src,
+            byte_len,
+            runtime.stream().cu_stream(),
+        )
+        .unwrap();
+    }
+    runtime.sync();
+    result
+}
+
+impl CudaRuntime {
+    pub(crate) fn concat_buffers_from_span(
+        &self,
+        spans: &[DeviceSpan<'_, f32>],
+    ) -> DeviceBuffer<f32> {
+        let total_len = spans
+            .iter()
+            .try_fold(0usize, |total, span| total.checked_add(span.len))
+            .expect("concatenated device span length overflow");
+        let result = self.get_uninit_buffer(total_len);
+        let mut destination_offset = 0usize;
+
+        for span in spans {
+            if span.len == 0 {
+                continue;
+            }
+
+            let destination = offset_ptr::<f32>(result.cu_deviceptr(), destination_offset);
+            let byte_len = span
+                .len
+                .checked_mul(core::mem::size_of::<f32>())
+                .expect("device span copy size overflow");
+
+            unsafe {
+                memory::memcpy_dtod_async(
+                    destination,
+                    span.ptr as usize as u64,
+                    byte_len,
+                    self.stream().cu_stream(),
+                )
+                .unwrap();
+            }
+
+            destination_offset = destination_offset
+                .checked_add(span.len)
+                .expect("concatenated device span offset overflow");
+        }
+
+        if total_len > 0 {
+            self.sync();
+        }
+        result
     }
 }

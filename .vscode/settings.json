@@ -1,3 +1,6 @@
 {
-    "git.untrackedChanges": "separate"
+    "vscode-active-button.runDefaults.rust": {
+        "action": "task",
+        "task": "rust: cargo run"
+    }
 }
