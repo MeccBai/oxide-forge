@@ -2,5 +2,12 @@
     "vscode-active-button.runDefaults.rust": {
         "action": "task",
         "task": "rust: cargo run"
-    }
+    },
+    "vscode-active-button.buttons": [
+        {
+            "action": "command",
+            "command": "cargo oxide build",
+            "name": "build"
+        }
+    ]
 }

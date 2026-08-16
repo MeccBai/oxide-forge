@@ -4,13 +4,9 @@ use crate::cuda::{
     DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, runtime::CudaRuntime, runtime::InitType,
 };
 
-use crate::cuda::vector::{Vector, VectorView};
+use crate::cuda::container::{Vector, VectorView};
 
-pub struct Matrix {
-    buffer: DeviceBuffer<f32>,
-    rows: usize,
-    cols: usize,
-}
+use super::Matrix;
 
 impl Matrix {
     pub fn to_host(&self, runtime: &CudaRuntime) -> Vec<f32> {
@@ -27,10 +23,10 @@ impl Matrix {
 
     pub fn softmax_rows(&mut self, runtime: &CudaRuntime) {
         let mut rows = runtime.split_view(self);
-
         for row in &mut rows {
-            row.softmax(&runtime);
+            row.softmax(runtime);
         }
+        runtime.sync();
     }
 
     pub fn sum_rows(&mut self, runtime: &CudaRuntime) -> Vector {
@@ -55,6 +51,7 @@ impl Matrix {
             let std = (variance + 1e-5).sqrt();
             row.for_each(runtime, move |x| (x - mean) / std);
         }
+        runtime.sync();
     }
 
     pub fn for_each<F>(&mut self, runtime: &CudaRuntime, f: F)
@@ -65,15 +62,29 @@ impl Matrix {
             return;
         }
 
-        let config = runtime.get_launch_config(self.buffer.len(), DEFAULT_BLOCK_SIZE);
-        let prepared = runtime.module().prepare_vector_for_each(config).unwrap();
-        runtime.module()
-            .vector_for_each(runtime.stream(), &prepared, &mut self.buffer, f)
-            .unwrap();
+        let len = self.buffer.len();
+        let mut span = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
+        span.for_each(runtime, f);
+    }
+
+    pub fn add_by_rows(&mut self, vec: &Vector, runtime: &CudaRuntime) {
+        let mut rows = runtime.split_view(self);
+        let streams = runtime.create_extra_streams(rows.len());
+        let rhs = DeviceSpan::from_buffer(&vec.buffer, 0, vec.buffer.len());
+
+        rows.iter_mut()
+            .zip(streams.iter())
+            .for_each(|(row, stream)| {
+                let config = runtime.get_launch_config(row.len(), DEFAULT_BLOCK_SIZE);
+                let prepared = runtime.module().prepare_slice_add_assign(config).unwrap();
+                runtime
+                    .module()
+                    .slice_add_assign(stream, &prepared, row.span.descriptor(), rhs.descriptor())
+                    .unwrap();
+            });
+        runtime.sync_streams(&streams);
     }
 }
-
-mod compute;
 
 impl CudaRuntime {
     pub fn new_matrix(&self, init_type: InitType, rows: usize, cols: usize) -> Matrix {
@@ -87,23 +98,27 @@ impl CudaRuntime {
         }
         let mut buffer = self.get_uninit_buffer(size);
         let config = self.get_launch_config(buffer.len(), DEFAULT_BLOCK_SIZE);
-        let prepared = self.module().prepare_vec_set_seq(config).unwrap();
         match init_type {
             InitType::Sequence => {
+                let prepared = self.module().prepare_slice_set_seq(config).unwrap();
+                let span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
                 self.module()
-                    .vec_set_seq(self.stream(), &prepared, &mut buffer, true)
+                    .slice_set_seq(self.stream(), &prepared, span.descriptor(), true)
                     .unwrap();
             }
             InitType::Reserve => {
+                let prepared = self.module().prepare_slice_set_seq(config).unwrap();
+                let span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
                 self.module()
-                    .vec_set_seq(self.stream(), &prepared, &mut buffer, false)
+                    .slice_set_seq(self.stream(), &prepared, span.descriptor(), false)
                     .unwrap();
             }
             InitType::Random => {
                 let seed = rand::random();
-                let prepared = self.module().prepare_vector_set_random(config).unwrap();
+                let prepared = self.module().prepare_slice_set_random(config).unwrap();
+                let span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
                 self.module()
-                    .vector_set_random(self.stream(), &prepared, &mut buffer, seed)
+                    .slice_set_random(self.stream(), &prepared, span.descriptor(), seed)
                     .unwrap();
             }
             InitType::Zero => {}
@@ -142,7 +157,7 @@ impl CudaRuntime {
     pub fn broadcast(&self, vector: &Vector, copies: usize) -> Matrix {
         let spans = vec![vector.as_span(); copies];
         let buffer = self.concat_buffers_from_span(&spans);
-        self.create_matrix(buffer, copies, vector.buffer_len())
+        self.create_matrix(buffer, copies, vector.len())
     }
 
     pub fn extract_vector(&self, matrix: Matrix) -> Vector {

@@ -1,5 +1,5 @@
 use crate::cuda::{DeviceSpan, kernels};
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer, memory};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D, memory};
 use std::sync::Arc;
 
 pub enum InitType {
@@ -26,23 +26,18 @@ pub struct CudaRuntime {
     #[allow(dead_code)]
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
-
-    #[allow(dead_code)]
-    temp_stream: Vec<Arc<CudaStream>>,
 }
 
 impl CudaRuntime {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let ctx = CudaContext::new(0)?;
         let stream = ctx.default_stream();
-        let temp_stream = Vec::new();
         let module = unsafe { kernels::load(&ctx)? };
 
         Ok(Self {
             module,
             ctx,
             stream,
-            temp_stream,
         })
     }
 
@@ -66,6 +61,14 @@ impl CudaRuntime {
 
     pub fn module(&self) -> &kernels::LoadedModule {
         &self.module
+    }
+
+    pub(crate) fn get_launch_config(&self, size: usize, block_size: usize) -> LaunchConfig1D {
+        LaunchConfig1D::new(
+            size.div_ceil(block_size).max(1) as u32,
+            block_size as u32,
+            0,
+        )
     }
 
     pub fn concat_buffers(&self, buffers: &[&DeviceBuffer<f32>]) -> DeviceBuffer<f32> {
@@ -124,5 +127,22 @@ impl CudaRuntime {
 
     pub fn span_to_buffer_async(&self, span: &DeviceSpan<'_, f32>) -> DeviceBuffer<f32> {
         span.to_buffer_async(self)
+    }
+
+    pub fn create_extra_streams(&self, count: usize) -> Vec<Arc<CudaStream>> {
+        (0..count)
+            .map(|_| self.stream.fork().unwrap())
+            .collect::<Vec<_>>()
+    }
+
+    pub fn join_streams(&self, streams: &[Arc<CudaStream>]) {
+        for stream in streams {
+            self.stream.join(stream).unwrap();
+        }
+    }
+
+    pub fn sync_streams(&self, streams: &[Arc<CudaStream>]) {
+        self.join_streams(streams);
+        self.sync();
     }
 }

@@ -1,13 +1,11 @@
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D, PreparedLaunch};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, shared, thread, warp};
 use cuda_host::cuda_module;
 
 const DEFAULT_BLOCK_SIZE: usize = 1024;
 
+pub mod container;
 mod device;
-pub mod matrix;
 pub mod runtime;
-pub mod vector;
 //mod tensor;
 
 mod span;
@@ -23,75 +21,104 @@ mod kernels {
     use super::*;
 
     #[kernel]
-    #[launch_bounds(256)]
+    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn vec_set(mut buffer: DisjointSlice<f32>, value: f32) {
-        let idx = thread::index_1d();
-        if let Some(elem) = buffer.get_mut(idx) {
-            *elem = value;
+    pub fn slice_set(target: span::DeviceSliceMutDescriptor<f32>, value: f32) {
+        let index = thread::index_1d().get();
+        if index < target.len {
+            unsafe { target.ptr.add(index).write(value) };
         }
     }
 
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn vec_set_seq(mut buffer: DisjointSlice<f32>, dir: bool) {
-        let idx = thread::index_1d();
-        let max = buffer.len();
-        let val = if dir {
-            idx.get() as f32
-        } else {
-            (max - idx.get()) as f32
-        };
-        if let Some(elem) = buffer.get_mut(idx) {
-            *elem = val;
+    pub fn slice_set_seq(target: span::DeviceSliceMutDescriptor<f32>, dir: bool) {
+        let index = thread::index_1d().get();
+        if index < target.len {
+            let value = if dir {
+                index as f32
+            } else {
+                (target.len - index) as f32
+            };
+            unsafe { target.ptr.add(index).write(value) };
         }
     }
 
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn vector_add(buffer1: &[f32], buffer2: &[f32], mut result: DisjointSlice<f32>) {
-        let idx = thread::index_1d();
-        let index = idx.get();
-        if let Some(elem) = result.get_mut(idx) {
-            *elem = buffer1[index] + buffer2[index];
-        }
-    }
-
-    #[kernel]
-    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
-    #[launch_contract(domain = 1)]
-    pub fn vector_sum(buffer: &[f32], mut result: DisjointSlice<f32>) {
-        let value = device::vector_add_device(buffer);
-        if thread::threadIdx_x() == 0 {
-            let block_id = thread::blockIdx_x() as usize;
-            if block_id < result.len() {
-                unsafe {
-                    *result.get_unchecked_mut(block_id) = value;
-                }
+    pub fn slice_set_random(target: span::DeviceSliceMutDescriptor<f32>, seed: u32) {
+        let index = thread::index_1d().get();
+        if index < target.len {
+            let rand = device::random(seed + index as u32);
+            unsafe {
+                target
+                    .ptr
+                    .add(index)
+                    .write((rand as f32) / (u32::MAX as f32));
             }
         }
     }
 
     #[kernel]
-    #[launch_bounds(1024)]
+    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn vector_for_each<F>(mut buffer: DisjointSlice<f32>, f: F)
-    where
-        F: Fn(f32) -> f32 + Copy,
-    {
-        let idx = thread::index_1d();
-
-        if let Some(element) = buffer.get_mut(idx) {
-            *element = f(*element);
+    pub fn slice_add(
+        lhs: span::DeviceSliceDescriptor<f32>,
+        rhs: span::DeviceSliceDescriptor<f32>,
+        output: span::DeviceSliceMutDescriptor<f32>,
+    ) {
+        let index = thread::index_1d().get();
+        if index < output.len && index < lhs.len && index < rhs.len {
+            unsafe {
+                output
+                    .ptr
+                    .add(index)
+                    .write(lhs.ptr.add(index).read() + rhs.ptr.add(index).read());
+            }
         }
     }
 
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn span_for_each<F>(span: span::DeviceSpanDescriptor<f32>, f: F)
+    pub fn slice_add_assign(
+        target: span::DeviceSliceMutDescriptor<f32>,
+        rhs: span::DeviceSliceDescriptor<f32>,
+    ) {
+        let index = thread::index_1d().get();
+        if index < target.len && index < rhs.len {
+            unsafe {
+                let element = target.ptr.add(index);
+                element.write(element.read() + rhs.ptr.add(index).read());
+            }
+        }
+    }
+
+    #[kernel]
+    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
+    #[launch_contract(domain = 1)]
+    pub fn slice_mul(
+        lhs: span::DeviceSliceDescriptor<f32>,
+        rhs: span::DeviceSliceDescriptor<f32>,
+        output: span::DeviceSliceMutDescriptor<f32>,
+    ) {
+        let index = thread::index_1d().get();
+        if index < output.len && index < lhs.len && index < rhs.len {
+            unsafe {
+                output
+                    .ptr
+                    .add(index)
+                    .write(lhs.ptr.add(index).read() * rhs.ptr.add(index).read());
+            }
+        }
+    }
+
+    #[kernel]
+    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
+    #[launch_contract(domain = 1)]
+    pub fn slice_for_each<F>(span: span::DeviceSliceMutDescriptor<f32>, f: F)
     where
         F: Fn(f32) -> f32 + Copy,
     {
@@ -107,7 +134,10 @@ mod kernels {
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub unsafe fn span_sum(span: span::DeviceSpanDescriptor<f32>, mut result: DisjointSlice<f32>) {
+    pub unsafe fn slice_sum(
+        span: span::DeviceSliceDescriptor<f32>,
+        result: span::DeviceSliceMutDescriptor<f32>,
+    ) {
         static mut SHARED: shared::SharedArray<f32, 32> = shared::SharedArray::UNINIT;
 
         let index = thread::index_1d().get();
@@ -136,8 +166,8 @@ mod kernels {
 
         if thread::threadIdx_x() == 0 {
             let block_id = thread::blockIdx_x() as usize;
-            if block_id < result.len() {
-                unsafe { *result.get_unchecked_mut(block_id) = value };
+            if block_id < result.len {
+                unsafe { result.ptr.add(block_id).write(value) };
             }
         }
     }
@@ -145,9 +175,9 @@ mod kernels {
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn span_map_sum<F>(
-        span: span::DeviceSpanDescriptor<f32>,
-        mut result: DisjointSlice<f32>,
+    pub fn slice_map_sum<F>(
+        span: span::DeviceSliceDescriptor<f32>,
+        result: span::DeviceSliceMutDescriptor<f32>,
         f: F,
     ) where
         F: Fn(f32) -> f32 + Copy,
@@ -188,10 +218,8 @@ mod kernels {
         if thread::threadIdx_x() == 0 {
             let block_id = thread::blockIdx_x() as usize;
 
-            if block_id < result.len() {
-                unsafe {
-                    *result.get_unchecked_mut(block_id) = value;
-                }
+            if block_id < result.len {
+                unsafe { result.ptr.add(block_id).write(value) };
             }
         }
     }
@@ -199,7 +227,10 @@ mod kernels {
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub unsafe fn span_max(span: span::DeviceSpanDescriptor<f32>, mut result: DisjointSlice<f32>) {
+    pub unsafe fn slice_max(
+        span: span::DeviceSliceDescriptor<f32>,
+        result: span::DeviceSliceMutDescriptor<f32>,
+    ) {
         static mut SHARED: shared::SharedArray<f32, 32> = shared::SharedArray::UNINIT;
 
         let index = thread::index_1d().get();
@@ -228,62 +259,9 @@ mod kernels {
 
         if thread::threadIdx_x() == 0 {
             let block_id = thread::blockIdx_x() as usize;
-            if block_id < result.len() {
-                unsafe { *result.get_unchecked_mut(block_id) = value };
+            if block_id < result.len {
+                unsafe { result.ptr.add(block_id).write(value) };
             }
-        }
-    }
-
-    #[kernel]
-    #[launch_bounds(1024)]
-    #[launch_contract(domain = 1)]
-    pub fn vector_set_random(mut buffer: DisjointSlice<f32>, seed: u32) {
-        let idx = thread::index_1d();
-        let val = idx.get() as u32;
-        if let Some(elem) = buffer.get_mut(idx) {
-            let rand = device::random(seed + val as u32);
-            *elem = (rand as f32) / (u32::MAX as f32);
-        }
-    }
-
-    #[kernel]
-    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
-    #[launch_contract(domain = 1)]
-    pub fn vector_max(buffer: &[f32], mut result: DisjointSlice<f32>) {
-        let value = device::vector_max_device(buffer);
-        if thread::threadIdx_x() == 0 {
-            let block_id = thread::blockIdx_x() as usize;
-            if block_id < result.len() {
-                unsafe {
-                    *result.get_unchecked_mut(block_id) = value;
-                }
-            }
-        }
-    }
-
-    #[kernel]
-    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
-    #[launch_contract(domain = 1)]
-    pub fn copy_slice(buffer: &[f32], mut result: DisjointSlice<f32>) {
-        let idx = thread::index_1d();
-        let index = idx.get();
-        if let Some(elem) = result.get_mut(idx) {
-            *elem = buffer[index];
-        }
-    }
-
-    #[kernel]
-    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
-    #[launch_contract(domain = 1)]
-    pub fn vector_pre_dot_product(
-        buffer1: &[f32],
-        buffer2: &[f32],
-        mut result: DisjointSlice<f32>,
-    ) {
-        let idx = thread::index_1d();
-        let index = idx.get();
-        if let Some(elem) = result.get_mut(idx) {
-            *elem = buffer1[index] * buffer2[index];
         }
     }
 

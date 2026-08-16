@@ -203,7 +203,7 @@ Output = Hidden × W2 + b2     [1024,768]
 
 实现时必须固定为训练时采用的结构。
 
-推荐采用 ViT 常见的 Pre-LN：
+ViT 常见的一种实现是 Pre-LN：
 
 ```text
 N1 = LayerNorm(X)
@@ -213,12 +213,14 @@ N2 = LayerNorm(X)
 X  = X + MLP(N2)
 ```
 
-如果训练端采用 Post-LN，则推理端必须保持：
+当前项目实现采用 Post-LN：
 
 ```text
 X = LayerNorm(X + Attention(X))
 X = LayerNorm(X + MLP(X))
 ```
+
+训练端必须采用相同顺序，不能在加载权重时混用 Pre-LN 和 Post-LN。
 
 LayerNorm 的完整形式为：
 
@@ -227,8 +229,9 @@ normalized = (x - mean) / sqrt(variance + epsilon)
 output = normalized * gamma + beta
 ```
 
-当前非破坏性 `map_sum` 可以正确计算方差，不需要复制临时 Vector。后续为了性能，
-可将每行的 mean、variance 和 normalize 融合为一个 kernel。
+当前非破坏性 `map_sum` 可以正确计算方差，不需要复制临时 Vector。`sum` 和
+`map_sum` 返回 host 标量，因此每个归约阶段会同步。对于当前固定尺寸实现优先保持
+接口简单，后续只在 profiler 表明它是热点时再考虑设备标量或 kernel 融合。
 
 ## 8. Mask Head
 

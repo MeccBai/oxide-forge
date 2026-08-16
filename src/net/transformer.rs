@@ -1,74 +1,59 @@
-use crate::cuda;
+use crate::cuda::{container::Matrix, runtime::CudaRuntime};
+use crate::net::linear::Linear;
+use crate::net::mlp::Mlp;
 
-pub struct Transformer<const R: usize, const C: usize> {
-    q_matrix: cuda::matrix::Matrix,
-    k_matrix: cuda::matrix::Matrix,
-    v_matrix: cuda::matrix::Matrix,
-    position_matrix: cuda::matrix::Matrix,
+pub struct Transformer {
+    q_matrix: Linear,
+    k_matrix: Linear,
+    v_matrix: Linear,
+    position_matrix: Matrix,
+    fcs: Mlp,
+    output_matrix: Linear,
 }
 
-impl<const R: usize, const C: usize> Transformer<R, C> {
+impl Transformer {
     pub fn new(
-        q_matrix: cuda::matrix::Matrix,
-        k_matrix: cuda::matrix::Matrix,
-        v_matrix: cuda::matrix::Matrix,
-        position_matrix: cuda::matrix::Matrix,
+        q_matrix: Linear,
+        k_matrix: Linear,
+        v_matrix: Linear,
+        position_matrix: Matrix,
+        fcs: Mlp,
+        output_matrix: Linear,
     ) -> Self {
-        assert!(q_matrix.rows() == R && q_matrix.cols() == C);
-        assert!(k_matrix.rows() == R && k_matrix.cols() == C);
-        assert!(v_matrix.rows() == R && v_matrix.cols() == C);
-        assert!(position_matrix.rows() == R && position_matrix.cols() == C);
-
         Self {
             q_matrix,
             k_matrix,
             v_matrix,
             position_matrix,
+            fcs,
+            output_matrix,
         }
     }
 
-    pub fn forward(
-        &self,
-        input: &cuda::matrix::Matrix,
-        runtime: &cuda::runtime::CudaRuntime,
-    ) -> cuda::matrix::Matrix {
-        let input_with_position = runtime.matrix_add(input, &self.position_matrix);
+    pub fn forward(&self, input: &Matrix, runtime: &CudaRuntime) -> Matrix {
+        let positioned = runtime.matrix_add(input, &self.position_matrix);
 
-        let qs = runtime.matrix_multiply(&input_with_position, &self.q_matrix);
-        let ks = runtime.matrix_multiply(&input_with_position, &self.k_matrix);
-        let vs = runtime.matrix_multiply(&input_with_position, &self.v_matrix);
+        let q = self.q_matrix.forward(&positioned, runtime);
+        let k = self.k_matrix.forward(&positioned, runtime);
+        let v = self.v_matrix.forward(&positioned, runtime);
 
-        let kst = runtime.matrix_transpose(&ks);
-        let mut scores = runtime.matrix_multiply(&qs, &kst);
+        let k_t = runtime.matrix_transpose(&k);
+        let mut scores = runtime.matrix_multiply(&q, &k_t);
 
-        let scale = 1.0 / (qs.cols() as f32).sqrt();
-        scores.scale(scale, runtime);
+        scores.scale(1.0 / (q.cols() as f32).sqrt(), runtime);
         scores.softmax_rows(runtime);
-        let attention = runtime.matrix_multiply(&scores, &vs);
 
-        let mut net_input = runtime.matrix_add(&attention, &input_with_position);
+        let attention = runtime.matrix_multiply(&scores, &v);
 
-        net_input.layer_norm(&runtime);
+        let mut x = runtime.matrix_add(&positioned, &attention);
+        x.layer_norm(runtime);
 
-        println!("[{}:{}]", net_input.rows(), net_input.cols());
+        let ffn = self.fcs.forward(&x, runtime);
+        let mut output = runtime.matrix_add(&x, &ffn);
+        output.layer_norm(runtime);
 
-        let fc1 = runtime.new_matrix(cuda::InitType::Random, 768, 3072);
-
-        let fc2 = runtime.new_matrix(cuda::InitType::Random, 3072, 768);
-
-        let mut hidden = runtime.matrix_multiply(&net_input, &fc1);
-
-        let gelu =
-            move |x: f32| 0.5 * x * (1.0 + (0.7978845608 * (x + 0.044715 * x * x * x)).tanh());
-
-        hidden.for_each(&runtime, gelu);
-
-        let mlp_output = runtime.matrix_multiply(&hidden, &fc2);
-        let mut output = runtime.matrix_add(&net_input, &mlp_output);
-
-        output.layer_norm(&runtime);
-
+        let output = self.output_matrix.forward(&output, runtime);
+        runtime.sync();
         output
     }
-
 }

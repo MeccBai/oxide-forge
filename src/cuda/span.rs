@@ -4,19 +4,29 @@ use cuda_core::{DeviceBuffer, memory};
 
 use super::{CudaRuntime, DEFAULT_BLOCK_SIZE};
 
-/// Copyable device-side description of a contiguous mutable span.
-///
-/// This value never owns the allocation. Keep construction private to the
-/// borrowing `DeviceSpanMut` wrapper below.
 #[repr(C)]
-pub(super) struct DeviceSpanDescriptor<T> {
+pub(super) struct DeviceSliceDescriptor<T> {
+    pub ptr: *const T,
+    pub len: usize,
+}
+
+impl<T> Copy for DeviceSliceDescriptor<T> {}
+
+impl<T> Clone for DeviceSliceDescriptor<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+#[repr(C)]
+pub(super) struct DeviceSliceMutDescriptor<T> {
     pub ptr: *mut T,
     pub len: usize,
 }
 
-impl<T> Copy for DeviceSpanDescriptor<T> {}
+impl<T> Copy for DeviceSliceMutDescriptor<T> {}
 
-impl<T> Clone for DeviceSpanDescriptor<T> {
+impl<T> Clone for DeviceSliceMutDescriptor<T> {
     fn clone(&self) -> Self {
         *self
     }
@@ -44,6 +54,13 @@ impl<'a, T> DeviceSpan<'a, T> {
         self.len
     }
 
+    pub(super) fn descriptor(&self) -> DeviceSliceDescriptor<T> {
+        DeviceSliceDescriptor {
+            ptr: self.ptr,
+            len: self.len,
+        }
+    }
+
     fn split(self, chunk_size: usize) -> Vec<Self> {
         split_spans::<T>(self.ptr as usize as u64, self.len, chunk_size)
             .into_iter()
@@ -68,6 +85,21 @@ impl DeviceSpan<'_, f32> {
     pub fn to_buffer(&self, runtime: &CudaRuntime) -> DeviceBuffer<f32> {
         copy_to_buffer(self.ptr as usize as u64, self.len, runtime)
     }
+
+    pub fn sum(&self, runtime: &CudaRuntime) -> f32 {
+        sum_descriptor(self.descriptor(), runtime)
+    }
+
+    pub fn max(&self, runtime: &CudaRuntime) -> f32 {
+        max_descriptor(self.descriptor(), runtime)
+    }
+
+    pub fn map_sum<F>(&self, runtime: &CudaRuntime, f: F) -> f32
+    where
+        F: Fn(f32) -> f32 + Copy,
+    {
+        map_sum_descriptor(self.descriptor(), runtime, f)
+    }
 }
 
 impl<'a> Clone for DeviceSpan<'a, f32> {
@@ -85,7 +117,7 @@ impl<'a> Clone for DeviceSpan<'a, f32> {
 /// Dropping this value does not free device memory. The `PhantomData` keeps the
 /// mutable borrow of the owning allocation active for the span's lifetime.
 pub(crate) struct DeviceSpanMut<'a, T> {
-    descriptor: DeviceSpanDescriptor<T>,
+    descriptor: DeviceSliceMutDescriptor<T>,
     _borrow: PhantomData<&'a mut [T]>,
 }
 
@@ -95,7 +127,7 @@ impl<'a, T> DeviceSpanMut<'a, T> {
         let ptr = offset_ptr::<T>(buffer.cu_deviceptr(), offset) as usize as *mut T;
 
         Self {
-            descriptor: DeviceSpanDescriptor { ptr, len },
+            descriptor: DeviceSliceMutDescriptor { ptr, len },
             _borrow: PhantomData,
         }
     }
@@ -116,8 +148,15 @@ impl<'a, T> DeviceSpanMut<'a, T> {
         self.len() == 0
     }
 
-    pub(super) fn descriptor(&self) -> DeviceSpanDescriptor<T> {
+    pub(super) fn descriptor(&self) -> DeviceSliceMutDescriptor<T> {
         self.descriptor
+    }
+
+    pub(super) fn read_descriptor(&self) -> DeviceSliceDescriptor<T> {
+        DeviceSliceDescriptor {
+            ptr: self.descriptor.ptr,
+            len: self.descriptor.len,
+        }
     }
 
     /// Consumes this span and partitions it into disjoint contiguous chunks.
@@ -130,7 +169,7 @@ impl<'a, T> DeviceSpanMut<'a, T> {
         )
         .into_iter()
         .map(|(ptr, len)| Self {
-            descriptor: DeviceSpanDescriptor {
+            descriptor: DeviceSliceMutDescriptor {
                 ptr: ptr as usize as *mut T,
                 len,
             },
@@ -174,15 +213,15 @@ impl DeviceSpanMut<'_, f32> {
         }
 
         let config = runtime.get_launch_config(self.len(), DEFAULT_BLOCK_SIZE);
-        let prepared = runtime.module().prepare_span_for_each::<F>(config).unwrap();
+        let prepared = runtime
+            .module()
+            .prepare_slice_for_each::<F>(config)
+            .unwrap();
 
-        unsafe {
-            runtime
-                .module()
-                .span_for_each::<F>(runtime.stream(), &prepared, self.descriptor(), f)
-                .unwrap();
-        }
-        runtime.sync();
+        runtime
+            .module()
+            .slice_for_each::<F>(runtime.stream(), &prepared, self.descriptor(), f)
+            .unwrap();
     }
 
     pub fn scale(&mut self, value: f32, runtime: &CudaRuntime) {
@@ -190,70 +229,86 @@ impl DeviceSpanMut<'_, f32> {
     }
 
     pub fn sum(&self, runtime: &CudaRuntime) -> f32 {
-        if self.is_empty() {
-            return 0.0;
-        }
-
-        let output_len = self.len().div_ceil(DEFAULT_BLOCK_SIZE);
-        let mut output = runtime.get_uninit_buffer(output_len);
-        let config = runtime.get_launch_config(self.len(), DEFAULT_BLOCK_SIZE);
-        let prepared = runtime.module().prepare_span_sum(config).unwrap();
-
-        unsafe {
-            runtime
-                .module()
-                .span_sum(runtime.stream(), &prepared, self.descriptor(), &mut output)
-                .unwrap();
-        }
-        runtime.sync();
-
-        reduce_sum_buffer(output, runtime)
+        sum_descriptor(self.read_descriptor(), runtime)
     }
 
     pub fn max(&self, runtime: &CudaRuntime) -> f32 {
-        if self.is_empty() {
-            return f32::MIN;
-        }
-
-        let output_len = self.len().div_ceil(DEFAULT_BLOCK_SIZE);
-        let mut output = runtime.get_uninit_buffer(output_len);
-        let config = runtime.get_launch_config(self.len(), DEFAULT_BLOCK_SIZE);
-        let prepared = runtime.module().prepare_span_max(config).unwrap();
-
-        unsafe {
-            runtime
-                .module()
-                .span_max(runtime.stream(), &prepared, self.descriptor(), &mut output)
-                .unwrap();
-        }
-        runtime.sync();
-
-        reduce_max_buffer(output, runtime)
+        max_descriptor(self.read_descriptor(), runtime)
     }
 
     pub fn map_sum<F>(&self, runtime: &CudaRuntime, f: F) -> f32
     where
         F: Fn(f32) -> f32 + Copy,
     {
-        if self.is_empty() {
-            return 0.0;
-        }
-
-        let output_len = self.len().div_ceil(DEFAULT_BLOCK_SIZE);
-        let mut output = runtime.get_uninit_buffer(output_len);
-        let config = runtime.get_launch_config(self.len(), DEFAULT_BLOCK_SIZE);
-        let prepared = runtime.module().prepare_span_map_sum::<F>(config).unwrap();
-
-        unsafe {
-            runtime
-                .module()
-                .span_map_sum::<F>(runtime.stream(), &prepared, self.descriptor(), &mut output, f)
-                .unwrap();
-        }
-        runtime.sync();
-
-        reduce_sum_buffer(output, runtime)
+        map_sum_descriptor(self.read_descriptor(), runtime, f)
     }
+}
+
+fn sum_descriptor(span: DeviceSliceDescriptor<f32>, runtime: &CudaRuntime) -> f32 {
+    if span.len == 0 {
+        return 0.0;
+    }
+
+    let output_len = span.len.div_ceil(DEFAULT_BLOCK_SIZE);
+    let mut output = runtime.get_uninit_buffer(output_len);
+    let config = runtime.get_launch_config(span.len, DEFAULT_BLOCK_SIZE);
+    let prepared = runtime.module().prepare_slice_sum(config).unwrap();
+    let output_span = DeviceSpanMut::from_buffer(&mut output, 0, output_len);
+    unsafe {
+        runtime
+            .module()
+            .slice_sum(runtime.stream(), &prepared, span, output_span.descriptor())
+            .unwrap();
+    }
+    runtime.sync();
+    reduce_sum_buffer(output, runtime)
+}
+
+fn max_descriptor(span: DeviceSliceDescriptor<f32>, runtime: &CudaRuntime) -> f32 {
+    if span.len == 0 {
+        return f32::MIN;
+    }
+
+    let output_len = span.len.div_ceil(DEFAULT_BLOCK_SIZE);
+    let mut output = runtime.get_uninit_buffer(output_len);
+    let config = runtime.get_launch_config(span.len, DEFAULT_BLOCK_SIZE);
+    let prepared = runtime.module().prepare_slice_max(config).unwrap();
+    let output_span = DeviceSpanMut::from_buffer(&mut output, 0, output_len);
+    unsafe {
+        runtime
+            .module()
+            .slice_max(runtime.stream(), &prepared, span, output_span.descriptor())
+            .unwrap();
+    }
+    runtime.sync();
+    reduce_max_buffer(output, runtime)
+}
+
+fn map_sum_descriptor<F>(span: DeviceSliceDescriptor<f32>, runtime: &CudaRuntime, f: F) -> f32
+where
+    F: Fn(f32) -> f32 + Copy,
+{
+    if span.len == 0 {
+        return 0.0;
+    }
+
+    let output_len = span.len.div_ceil(DEFAULT_BLOCK_SIZE);
+    let mut output = runtime.get_uninit_buffer(output_len);
+    let config = runtime.get_launch_config(span.len, DEFAULT_BLOCK_SIZE);
+    let prepared = runtime.module().prepare_slice_map_sum::<F>(config).unwrap();
+    let output_span = DeviceSpanMut::from_buffer(&mut output, 0, output_len);
+    runtime
+        .module()
+        .slice_map_sum::<F>(
+            runtime.stream(),
+            &prepared,
+            span,
+            output_span.descriptor(),
+            f,
+        )
+        .unwrap();
+    runtime.sync();
+    reduce_sum_buffer(output, runtime)
 }
 
 fn reduce_sum_buffer(mut input: DeviceBuffer<f32>, runtime: &CudaRuntime) -> f32 {
@@ -261,11 +316,20 @@ fn reduce_sum_buffer(mut input: DeviceBuffer<f32>, runtime: &CudaRuntime) -> f32
         let output_len = input.len().div_ceil(DEFAULT_BLOCK_SIZE);
         let mut output = runtime.get_uninit_buffer(output_len);
         let config = runtime.get_launch_config(input.len(), DEFAULT_BLOCK_SIZE);
-        let prepared = runtime.module().prepare_vector_sum(config).unwrap();
-        runtime
-            .module()
-            .vector_sum(runtime.stream(), &prepared, &input, &mut output)
-            .unwrap();
+        let prepared = runtime.module().prepare_slice_sum(config).unwrap();
+        let input_span = DeviceSpan::from_buffer(&input, 0, input.len());
+        let output_span = DeviceSpanMut::from_buffer(&mut output, 0, output_len);
+        unsafe {
+            runtime
+                .module()
+                .slice_sum(
+                    runtime.stream(),
+                    &prepared,
+                    input_span.descriptor(),
+                    output_span.descriptor(),
+                )
+                .unwrap();
+        }
         runtime.sync();
         input = output;
     }
@@ -278,11 +342,20 @@ fn reduce_max_buffer(mut input: DeviceBuffer<f32>, runtime: &CudaRuntime) -> f32
         let output_len = input.len().div_ceil(DEFAULT_BLOCK_SIZE);
         let mut output = runtime.get_uninit_buffer(output_len);
         let config = runtime.get_launch_config(input.len(), DEFAULT_BLOCK_SIZE);
-        let prepared = runtime.module().prepare_vector_max(config).unwrap();
-        runtime
-            .module()
-            .vector_max(runtime.stream(), &prepared, &input, &mut output)
-            .unwrap();
+        let prepared = runtime.module().prepare_slice_max(config).unwrap();
+        let input_span = DeviceSpan::from_buffer(&input, 0, input.len());
+        let output_span = DeviceSpanMut::from_buffer(&mut output, 0, output_len);
+        unsafe {
+            runtime
+                .module()
+                .slice_max(
+                    runtime.stream(),
+                    &prepared,
+                    input_span.descriptor(),
+                    output_span.descriptor(),
+                )
+                .unwrap();
+        }
         runtime.sync();
         input = output;
     }

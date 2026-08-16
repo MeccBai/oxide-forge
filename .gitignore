@@ -10,3 +10,4 @@
 **/*.ptx
 **/*.target
 /docs/impl
+.idea

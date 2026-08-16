@@ -1,34 +1,16 @@
-use cuda_core::{DeviceBuffer, LaunchConfig2D};
+use cuda_core::LaunchConfig2D;
 
-use crate::cuda::{
-    DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, runtime::CudaRuntime, runtime::InitType,
-};
+use crate::cuda::{DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, runtime::CudaRuntime};
 
 use super::Matrix;
 
 impl Matrix {
     pub fn scale(&mut self, value: f32, runtime: &CudaRuntime) {
-        let config = runtime.get_launch_config(self.buffer.len(), DEFAULT_BLOCK_SIZE);
-        let prepared = runtime.module().prepare_vector_for_each(config).unwrap();
-        runtime
-            .module()
-            .vector_for_each(runtime.stream(), &prepared, &mut self.buffer, move |x| {
-                x * value
-            })
-            .unwrap();
-        runtime.sync();
+        self.for_each(runtime, move |x| x * value);
     }
 
     pub fn add_val(&mut self, value: f32, runtime: &CudaRuntime) {
-        let config = runtime.get_launch_config(self.buffer.len(), DEFAULT_BLOCK_SIZE);
-        let prepared = runtime.module().prepare_vector_for_each(config).unwrap();
-        runtime
-            .module()
-            .vector_for_each(runtime.stream(), &prepared, &mut self.buffer, move |x| {
-                x + value
-            })
-            .unwrap();
-        runtime.sync();
+        self.for_each(runtime, move |x| x + value);
     }
 }
 
@@ -64,8 +46,6 @@ impl CudaRuntime {
                 cols,
             )
             .unwrap();
-        self.sync();
-
         Matrix {
             buffer: result_buffer,
             rows,
@@ -83,19 +63,20 @@ impl CudaRuntime {
         let mut result_buffer = self.get_uninit_buffer(rows * cols);
 
         let config = self.get_launch_config(mat1.buffer.len(), DEFAULT_BLOCK_SIZE);
-        let prepared = self.module().prepare_vector_add(config).unwrap();
+        let prepared = self.module().prepare_slice_add(config).unwrap();
+        let lhs = DeviceSpan::from_buffer(&mat1.buffer, 0, mat1.buffer.len());
+        let rhs = DeviceSpan::from_buffer(&mat2.buffer, 0, mat2.buffer.len());
+        let output = DeviceSpanMut::from_buffer(&mut result_buffer, 0, rows * cols);
 
         self.module()
-            .vector_add(
+            .slice_add(
                 self.stream(),
                 &prepared,
-                &mat1.buffer,
-                &mat2.buffer,
-                &mut result_buffer,
+                lhs.descriptor(),
+                rhs.descriptor(),
+                output.descriptor(),
             )
             .unwrap();
-        self.sync();
-
         Matrix {
             buffer: result_buffer,
             rows,
@@ -134,8 +115,6 @@ impl CudaRuntime {
                 mat.cols,
             )
             .unwrap();
-        self.sync();
-
         Matrix {
             buffer: result_buffer,
             rows,
