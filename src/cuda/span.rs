@@ -40,7 +40,6 @@ impl<'a, T> DeviceSpan<'a, T> {
             _borrow: PhantomData,
         }
     }
-
     pub(super) fn len(&self) -> usize {
         self.len
     }
@@ -59,10 +58,14 @@ impl<'a, T> DeviceSpan<'a, T> {
     pub(super) fn chunks(buffer: &'a DeviceBuffer<T>, chunk_size: usize) -> Vec<Self> {
         Self::from_buffer(buffer, 0, buffer.len()).split(chunk_size)
     }
+
+    pub fn to_buffer_async(&self, runtime: &CudaRuntime) -> DeviceBuffer<f32> {
+        copy_to_buffer_async(self.ptr as usize as u64, self.len, runtime)
+    }
 }
 
 impl DeviceSpan<'_, f32> {
-    pub(super) fn to_buffer(&self, runtime: &CudaRuntime) -> DeviceBuffer<f32> {
+    pub fn to_buffer(&self, runtime: &CudaRuntime) -> DeviceBuffer<f32> {
         copy_to_buffer(self.ptr as usize as u64, self.len, runtime)
     }
 }
@@ -146,7 +149,7 @@ impl<'a, T> DeviceSpanMut<'a, T> {
 
 impl DeviceSpanMut<'_, f32> {
     /// Copies this span into a new independently-owned device buffer.
-    pub(super) fn to_buffer(&self, runtime: &CudaRuntime) -> DeviceBuffer<f32> {
+    pub fn to_buffer(&self, runtime: &CudaRuntime) -> DeviceBuffer<f32> {
         copy_to_buffer(
             self.descriptor.ptr as usize as u64,
             self.descriptor.len,
@@ -154,7 +157,15 @@ impl DeviceSpanMut<'_, f32> {
         )
     }
 
-    pub(super) fn for_each<F>(&mut self, runtime: &CudaRuntime, f: F)
+    pub fn to_buffer_async(&self, runtime: &CudaRuntime) -> DeviceBuffer<f32> {
+        copy_to_buffer_async(
+            self.descriptor.ptr as usize as u64,
+            self.descriptor.len,
+            runtime,
+        )
+    }
+
+    pub fn for_each<F>(&mut self, runtime: &CudaRuntime, f: F)
     where
         F: Fn(f32) -> f32 + Copy,
     {
@@ -173,6 +184,110 @@ impl DeviceSpanMut<'_, f32> {
         }
         runtime.sync();
     }
+
+    pub fn scale(&mut self, value: f32, runtime: &CudaRuntime) {
+        self.for_each(runtime, move |x| x * value);
+    }
+
+    pub fn sum(&self, runtime: &CudaRuntime) -> f32 {
+        if self.is_empty() {
+            return 0.0;
+        }
+
+        let output_len = self.len().div_ceil(DEFAULT_BLOCK_SIZE);
+        let mut output = runtime.get_uninit_buffer(output_len);
+        let config = runtime.get_launch_config(self.len(), DEFAULT_BLOCK_SIZE);
+        let prepared = runtime.module().prepare_span_sum(config).unwrap();
+
+        unsafe {
+            runtime
+                .module()
+                .span_sum(runtime.stream(), &prepared, self.descriptor(), &mut output)
+                .unwrap();
+        }
+        runtime.sync();
+
+        reduce_sum_buffer(output, runtime)
+    }
+
+    pub fn max(&self, runtime: &CudaRuntime) -> f32 {
+        if self.is_empty() {
+            return f32::MIN;
+        }
+
+        let output_len = self.len().div_ceil(DEFAULT_BLOCK_SIZE);
+        let mut output = runtime.get_uninit_buffer(output_len);
+        let config = runtime.get_launch_config(self.len(), DEFAULT_BLOCK_SIZE);
+        let prepared = runtime.module().prepare_span_max(config).unwrap();
+
+        unsafe {
+            runtime
+                .module()
+                .span_max(runtime.stream(), &prepared, self.descriptor(), &mut output)
+                .unwrap();
+        }
+        runtime.sync();
+
+        reduce_max_buffer(output, runtime)
+    }
+
+    pub fn map_sum<F>(&self, runtime: &CudaRuntime, f: F) -> f32
+    where
+        F: Fn(f32) -> f32 + Copy,
+    {
+        if self.is_empty() {
+            return 0.0;
+        }
+
+        let output_len = self.len().div_ceil(DEFAULT_BLOCK_SIZE);
+        let mut output = runtime.get_uninit_buffer(output_len);
+        let config = runtime.get_launch_config(self.len(), DEFAULT_BLOCK_SIZE);
+        let prepared = runtime.module().prepare_span_map_sum::<F>(config).unwrap();
+
+        unsafe {
+            runtime
+                .module()
+                .span_map_sum::<F>(runtime.stream(), &prepared, self.descriptor(), &mut output, f)
+                .unwrap();
+        }
+        runtime.sync();
+
+        reduce_sum_buffer(output, runtime)
+    }
+}
+
+fn reduce_sum_buffer(mut input: DeviceBuffer<f32>, runtime: &CudaRuntime) -> f32 {
+    while input.len() > 1 {
+        let output_len = input.len().div_ceil(DEFAULT_BLOCK_SIZE);
+        let mut output = runtime.get_uninit_buffer(output_len);
+        let config = runtime.get_launch_config(input.len(), DEFAULT_BLOCK_SIZE);
+        let prepared = runtime.module().prepare_vector_sum(config).unwrap();
+        runtime
+            .module()
+            .vector_sum(runtime.stream(), &prepared, &input, &mut output)
+            .unwrap();
+        runtime.sync();
+        input = output;
+    }
+
+    input.to_host_vec(runtime.stream()).unwrap()[0]
+}
+
+fn reduce_max_buffer(mut input: DeviceBuffer<f32>, runtime: &CudaRuntime) -> f32 {
+    while input.len() > 1 {
+        let output_len = input.len().div_ceil(DEFAULT_BLOCK_SIZE);
+        let mut output = runtime.get_uninit_buffer(output_len);
+        let config = runtime.get_launch_config(input.len(), DEFAULT_BLOCK_SIZE);
+        let prepared = runtime.module().prepare_vector_max(config).unwrap();
+        runtime
+            .module()
+            .vector_max(runtime.stream(), &prepared, &input, &mut output)
+            .unwrap();
+        runtime.sync();
+        input = output;
+    }
+
+    input.to_host_vec(runtime.stream()).unwrap()[0]
 }
 
 fn check_range(buffer_len: usize, offset: usize, len: usize) {
@@ -222,6 +337,27 @@ fn copy_to_buffer(src: u64, len: usize, runtime: &CudaRuntime) -> DeviceBuffer<f
         .unwrap();
     }
     runtime.sync();
+    result
+}
+
+fn copy_to_buffer_async(src: u64, len: usize, runtime: &CudaRuntime) -> DeviceBuffer<f32> {
+    let result = runtime.get_uninit_buffer(len);
+    if len == 0 {
+        return result;
+    }
+
+    let byte_len = len
+        .checked_mul(core::mem::size_of::<f32>())
+        .expect("device span copy size overflow");
+    unsafe {
+        memory::memcpy_dtod_async(
+            result.cu_deviceptr(),
+            src,
+            byte_len,
+            runtime.stream().cu_stream(),
+        )
+        .unwrap();
+    }
     result
 }
 

@@ -1,6 +1,6 @@
 use crate::cuda::{CudaRuntime, DEFAULT_BLOCK_SIZE};
 
-use crate::cuda::vector::Vector;
+use super::Vector;
 
 impl Vector {
     pub fn to_host(&self, runtime: &CudaRuntime) -> Vec<f32> {
@@ -84,5 +84,12 @@ impl Vector {
             .vector_for_each(runtime.stream(), &prepared, &mut self.buffer, exp)
             .unwrap();
         runtime.sync();
+    }
+
+    pub fn softmax(&mut self, runtime: &CudaRuntime) {
+        let max = self.max(runtime);
+        self.exp(max, runtime);
+        let sum = self.sum(runtime);
+        self.scale(1.0 / sum, runtime);
     }
 }

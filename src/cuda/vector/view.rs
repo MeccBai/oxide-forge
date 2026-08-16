@@ -2,8 +2,8 @@ use cuda_core::DeviceBuffer;
 
 use crate::cuda::CudaRuntime;
 
+use super::{Vector, VectorView};
 use crate::cuda::span::{DeviceSpan, DeviceSpanMut};
-use crate::cuda::vector::{Vector, VectorView};
 
 impl Vector {
     pub fn as_span(&self) -> DeviceSpan<'_, f32> {

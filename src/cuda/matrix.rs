@@ -24,7 +24,56 @@ impl Matrix {
     pub fn cols(&self) -> usize {
         self.cols
     }
+
+    pub fn softmax_rows(&mut self, runtime: &CudaRuntime) {
+        let mut rows = runtime.split_view(self);
+
+        for row in &mut rows {
+            row.softmax(&runtime);
+        }
+    }
+
+    pub fn sum_rows(&mut self, runtime: &CudaRuntime) -> Vector {
+        let mut rows = runtime
+            .split_view(self)
+            .into_iter()
+            .map(|row| row.sum(runtime))
+            .collect::<Vec<f32>>();
+
+        runtime
+            .create_vector(DeviceBuffer::from_host(runtime.stream(), rows.as_mut_slice()).unwrap())
+    }
+
+    pub fn layer_norm(&mut self, runtime: &CudaRuntime) {
+        let mut rows = runtime.split_view(self);
+        for row in &mut rows {
+            let mean = row.sum(runtime) / row.len() as f32;
+            let variance = row.map_sum(runtime, move |x| {
+                let diff = x - mean;
+                diff * diff
+            }) / row.len() as f32;
+            let std = (variance + 1e-5).sqrt();
+            row.for_each(runtime, move |x| (x - mean) / std);
+        }
+    }
+
+    pub fn for_each<F>(&mut self, runtime: &CudaRuntime, f: F)
+    where
+        F: Fn(f32) -> f32 + Copy,
+    {
+        if self.buffer.is_empty() {
+            return;
+        }
+
+        let config = runtime.get_launch_config(self.buffer.len(), DEFAULT_BLOCK_SIZE);
+        let prepared = runtime.module().prepare_vector_for_each(config).unwrap();
+        runtime.module()
+            .vector_for_each(runtime.stream(), &prepared, &mut self.buffer, f)
+            .unwrap();
+    }
 }
+
+mod compute;
 
 impl CudaRuntime {
     pub fn new_matrix(&self, init_type: InitType, rows: usize, cols: usize) -> Matrix {
@@ -83,7 +132,7 @@ impl CudaRuntime {
             .collect()
     }
 
-    pub fn split(&self, matrix: &mut Matrix) -> Vec<Vector> {
+    pub fn matrix_split(&self, matrix: &mut Matrix) -> Vec<Vector> {
         DeviceSpanMut::chunks(&mut matrix.buffer, matrix.cols)
             .into_iter()
             .map(|span| self.create_vector(span.to_buffer(self)))
@@ -108,5 +157,47 @@ impl CudaRuntime {
 
         let span = DeviceSpan::from_buffer(&matrix.buffer, 0, matrix.cols);
         self.create_vector(span.to_buffer(self))
+    }
+
+    pub fn matrix_slice(&self, matrix: &Matrix, cols: usize, rows: usize) -> Vec<Matrix> {
+        assert!(cols > 0, "matrix slice cols must be non-zero");
+        assert!(rows > 0, "matrix slice rows must be non-zero");
+        assert_eq!(
+            matrix.cols % cols,
+            0,
+            "matrix cols must be divisible by slice cols"
+        );
+        assert_eq!(
+            matrix.rows % rows,
+            0,
+            "matrix rows must be divisible by slice rows"
+        );
+
+        // Each span is one contiguous row segment of an output tile.
+        let spans = DeviceSpan::chunks(&matrix.buffer, cols);
+        let tiles_per_row = matrix.cols / cols;
+        let tile_row_count = matrix.rows / rows;
+        let mut result = Vec::with_capacity(tiles_per_row * tile_row_count);
+
+        for tile_row in 0..tile_row_count {
+            for tile_col in 0..tiles_per_row {
+                let mut tile_spans = Vec::with_capacity(rows);
+
+                for local_row in 0..rows {
+                    let matrix_row = tile_row * rows + local_row;
+                    let span_index = matrix_row * tiles_per_row + tile_col;
+                    tile_spans.push(spans[span_index].clone());
+                }
+
+                let buffer = self.concat_buffers_from_span(&tile_spans);
+                result.push(self.create_matrix(buffer, rows, cols));
+            }
+        }
+
+        result
+    }
+
+    pub fn to_vector(&self, matrix: Matrix) -> Vector {
+        self.create_vector(matrix.buffer)
     }
 }

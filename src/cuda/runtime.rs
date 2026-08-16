@@ -1,4 +1,4 @@
-use crate::cuda::kernels;
+use crate::cuda::{DeviceSpan, kernels};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, memory};
 use std::sync::Arc;
 
@@ -120,5 +120,9 @@ impl CudaRuntime {
             .unwrap();
         self.sync();
         new_buffer
+    }
+
+    pub fn span_to_buffer_async(&self, span: &DeviceSpan<'_, f32>) -> DeviceBuffer<f32> {
+        span.to_buffer_async(self)
     }
 }
