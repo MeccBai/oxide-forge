@@ -459,19 +459,24 @@ mod kernels {
         let c_row = thread::blockIdx_y() as usize * TILE_SIZE + ty;
         let c_col = thread::blockIdx_x() as usize * TILE_SIZE + tx;
 
-        let mut shared_matrix1 = shared::SharedArray::<f32, SHARED_SIZE>::UNINIT;
-        let mut shared_matrix2 = shared::SharedArray::<f32, SHARED_SIZE>::UNINIT;
+        static mut SHARED_MATRIX1: shared::SharedArray<f32, SHARED_SIZE> =
+            shared::SharedArray::UNINIT;
+        static mut SHARED_MATRIX2: shared::SharedArray<f32, SHARED_SIZE> =
+            shared::SharedArray::UNINIT;
 
         let mut sum = 0.0;
 
         for t in 0..len / TILE_SIZE {
-            shared_matrix1[ty * TILE_SIZE + tx] = matrix1[c_row * len + t * TILE_SIZE + tx];
-            shared_matrix2[ty * TILE_SIZE + tx] = matrix2[(t * TILE_SIZE + ty) * cols + c_col];
-
+            unsafe {
+                SHARED_MATRIX1[ty * TILE_SIZE + tx] = matrix1[c_row * len + t * TILE_SIZE + tx];
+                SHARED_MATRIX2[ty * TILE_SIZE + tx] = matrix2[(t * TILE_SIZE + ty) * cols + c_col];
+            }
             thread::sync_threads();
 
             for k in 0..TILE_SIZE {
-                sum += shared_matrix1[ty * TILE_SIZE + k] * shared_matrix2[k * TILE_SIZE + tx]
+                unsafe {
+                    sum += SHARED_MATRIX1[ty * TILE_SIZE + k] * SHARED_MATRIX2[k * TILE_SIZE + tx];
+                }
             }
 
             thread::sync_threads();

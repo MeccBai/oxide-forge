@@ -1,69 +1,83 @@
 # OxideForge
 
-OxideForge 是一个基于
-[CUDA-Oxide](https://nvlabs.github.io/cuda-oxide/index.html) 编写的 Rust/CUDA
-神经网络运行时。项目由 GPU 计算、连续内存容器和神经网络执行层组成，为形状明确、
-数据布局可控的模型提供轻量基座。
+English | [简体中文](README.cn.md)
 
-项目不试图复刻通用张量框架。它面向形状明确、数据布局可控的模型，以手写 CUDA
-kernel 和显式所有权换取可预测的数据流、较低的运行时开销，以及足够贴近硬件的编程
-体验。
+OxideForge is a purpose-built Rust/CUDA neural-network runtime powered by
+[CUDA-Oxide](https://nvlabs.github.io/cuda-oxide/index.html). It combines GPU
+compute primitives, contiguous-memory containers, and neural-network execution
+layers into a lightweight foundation for models with known shapes and controlled
+data layouts.
 
-> 追求最大程度的无额外成本抽象，而不是最大程度的抽象。
+OxideForge is not intended to reproduce a general-purpose tensor framework. It
+uses handwritten CUDA kernels and explicit ownership to keep data flow
+predictable, runtime overhead low, and the programming model close to the
+hardware.
 
-## 项目状态
+> Maximize zero-overhead abstraction, not abstraction itself.
 
-OxideForge 目前处于实验性开发阶段，API 会继续调整。核心前向计算路径已经可以构建，
-训练反向路径已经完成基础封装；数据集接入、checkpoint 格式和端到端训练程序仍在开发。
+## Status
 
-当前实现包括：
+OxideForge is experimental and its API is still evolving. The core forward path
+builds successfully, and the fundamental backward path is implemented. Dataset
+integration, a stable checkpoint format, and end-to-end training orchestration
+remain under development.
 
-- CUDA context、module、stream、buffer 分配和同步；
-- 连续只读/可变 Device Span，以及基于借用的 VectorView；
-- 拥有显存的 `Vector` 和 row-major `Matrix`；
-- 元素级四则运算、映射、缩放、归约和广播；
-- tiled matrix multiplication 和 shared-memory transpose；
-- row Softmax、LayerNorm 及其 backward kernel；
-- Linear、GELU、MLP、残差连接和对应反向传播；
-- 单头 Post-LN Transformer 的推理与训练执行器；
-- 主 stream 异步提交，以及额外 stream 的 fork/join。
+Implemented capabilities include:
 
-尚未完成的主要工程闭环：
+- CUDA context, module, stream, buffer allocation, and synchronization;
+- immutable and mutable contiguous device spans, plus borrowed vector views;
+- device-owning `Vector` and row-major `Matrix` containers;
+- element-wise arithmetic, mapping, scaling, reduction, and row broadcasting;
+- tiled matrix multiplication and shared-memory matrix transpose;
+- row-wise Softmax and LayerNorm, including backward kernels;
+- Linear, GELU, MLP, residual connections, and their backward paths;
+- inference and training executors for a single-head Post-LN Transformer;
+- asynchronous submission on the primary stream and explicit fork/join for
+  additional streams.
 
-- 输入和 label 的数据管线；
-- 模型级 forward/backward 与训练循环；
-- 权重、bias、位置编码及训练状态的 save/load；
-- checkpoint round-trip 和小尺寸数值梯度测试。
+The remaining integration work is primarily:
 
-## 设计原则
+- input and label pipelines;
+- model-level forward/backward orchestration and training loops;
+- save/load support for weights, biases, positional parameters, and training
+  state;
+- checkpoint round-trip tests and small-shape numerical gradient tests.
 
-### 连续内存优先
+## Design Principles
 
-`Matrix` 固定使用 row-major 连续布局，Span 只表示一段连续设备内存，不支持 stride。
-需要按列访问或把不连续区域变为独立对象时，先执行转置或显式重排。项目不会为了表面
-上的通用性，把不连续布局的成本扩散到后续所有 kernel。
+### Contiguous memory first
 
-### 所有权表达数据生命周期
+`Matrix` always uses a contiguous row-major layout. Spans represent contiguous
+device-memory regions only and deliberately do not support strides. Column-wise
+access and disconnected regions must be handled through an explicit transpose
+or physical rearrangement. This prevents the cost of irregular layouts from
+propagating into every downstream kernel.
 
-`Matrix` 和 `Vector` 拥有显存，Span 和 View 只借用显存。创建新容器的操作由
-`CudaRuntime` 提供，原地修改由容器自身提供。训练执行器拥有 backward 真正需要的
-中间结果；每层产生的新矩阵直接 move 到下一层缓存，不为缓存额外执行 device copy。
-最终输出按所有权返回，由上级模型决定是否保留。
+### Ownership defines data lifetime
 
-### 显式同步
+`Matrix` and `Vector` own device memory; spans and views borrow it. Operations
+that allocate a new container live on `CudaRuntime`, while in-place operations
+live on the container itself. Training executors retain only the values needed
+by backward. A layer's newly allocated output is moved directly into the next
+layer's cache without an additional device copy. Final outputs are returned by
+value so the parent model controls whether they remain alive.
 
-能够连续执行的操作进入同一个 CUDA stream，不在每次 kernel launch 后等待。返回 host
-标量的归约和模型边界才形成同步点。额外 stream 只用于确实彼此独立的工作，并通过
-fork/join 明确汇合。
+### Synchronization is explicit
 
-### 专用实现胜过无成本假象
+Dependent operations are queued on the same CUDA stream without synchronizing
+after every kernel launch. Host-valued reductions and model boundaries form the
+main synchronization points. Additional streams are reserved for genuinely
+independent work and are explicitly rejoined.
 
-当前运行时固定使用 `f32`，并针对已知模型尺寸提供实现。只有在不会显著增加复杂度或
-损害性能时才提升通用性。热点优化以 profiler 结果为依据，而不是预先堆叠抽象层。
+### Specialized implementations over illusory generality
 
-## 计算模型
+The runtime currently uses `f32` and targets known model shapes. Generality is
+added only when it does not impose significant complexity or performance cost.
+Optimization follows profiler evidence instead of speculative abstraction.
 
-当前 Transformer 接收 `[sequence, hidden]` 矩阵：
+## Execution Model
+
+The current Transformer consumes a `[sequence, hidden]` matrix:
 
 ```text
 X = input + position
@@ -76,45 +90,49 @@ X ───────────────── residual ── LayerNorm 
                                                               output projection
 ```
 
-推理层不保存 activation。训练层只保存反向计算所需的数据，并由 MLP 层统一调度 Linear
-参数更新；Linear 自身不持有 tape 或 workspace。
+Inference executors do not retain activations. Training executors keep only the
+data required by backward, while the MLP owns scheduling for Linear parameter
+updates. Individual Linear layers do not own a tape or workspace.
 
-## 环境要求
+## Requirements
 
-- 支持 CUDA 的 NVIDIA GPU；
-- 可用的 NVIDIA Driver 和 CUDA 开发环境；
-- `rust-toolchain.toml` 指定的 Rust nightly toolchain；
-- 已安装 `cargo oxide`。
+- an NVIDIA GPU with CUDA support;
+- a working NVIDIA driver and CUDA development environment;
+- the Rust nightly toolchain pinned in `rust-toolchain.toml`;
+- `cargo oxide` installed and configured.
 
-首先检查 CUDA-Oxide 环境：
+Check the CUDA-Oxide environment first:
 
 ```bash
 cargo oxide doctor
 ```
 
-构建并运行：
+Build and run the project:
 
 ```bash
 cargo oxide run
 ```
 
-普通 `cargo build` 不能替代这个流程，因为设备端代码需要由 CUDA-Oxide 单独生成并链接。
+A plain `cargo build` does not replace this workflow because CUDA-Oxide must
+compile and link the device artifact separately.
 
-设备调试构建：
+Build with device debugging enabled:
 
 ```bash
 cargo oxide run --device-debug
 ```
 
-保留优化并为 Compute Sanitizer 或 profiler 生成行号：
+Keep optimization while emitting source line information for Compute Sanitizer
+or profilers:
 
 ```bash
 cargo oxide run --lineinfo
 ```
 
-## 最小示例
+## Minimal Example
 
-下面的示例构造一个 `[batch, input_features]` 输入，并通过 Linear 完成特征映射：
+The following example maps a `[batch, input_features]` matrix through a Linear
+layer:
 
 ```rust
 let runtime = CudaRuntime::new()?;
@@ -132,41 +150,43 @@ runtime.sync();
 assert_eq!((output.rows(), output.cols()), (256, 64));
 ```
 
-项目当前是 binary crate，示例展示的是内部 API 的使用方式；稳定公共 crate 接口不是
-现阶段的目标。
+The project is currently a binary crate, so this demonstrates internal API
+usage. A stable public crate interface is not a present goal.
 
-## 代码结构
+## Repository Layout
 
 ```text
 src/
-├── cuda.rs                    CUDA kernel 与 module 入口
+├── cuda.rs                    CUDA kernels and module entry point
 ├── cuda/
-│   ├── runtime.rs            context、stream、buffer 与同步
-│   ├── span.rs               连续设备内存借用
+│   ├── runtime.rs            context, streams, buffers, synchronization
+│   ├── span.rs               contiguous device-memory borrows
 │   └── container/
-│       ├── matrix.rs         Matrix 生命周期、按行操作与转换
-│       ├── matrix_compute.rs Matrix 计算
-│       ├── vector.rs         Vector 创建和 Vector 间运算
-│       ├── vector_compute.rs Vector 原地计算与归约
-│       └── vector_view.rs    连续 View 接口与计算
+│       ├── matrix.rs         Matrix lifecycle, row operations, conversions
+│       ├── matrix_compute.rs Matrix computation
+│       ├── vector.rs         Vector construction and binary operations
+│       ├── vector_compute.rs in-place Vector operations and reductions
+│       └── vector_view.rs    contiguous borrowed-view operations
 └── net/
-    ├── linear.rs             Linear、activation 与参数更新
-    ├── mlp.rs                inference/training MLP executor
-    └── transformer.rs        single-head Transformer
+    ├── linear.rs             Linear, activation, and parameter updates
+    ├── mlp.rs                inference/training MLP executors
+    └── transformer.rs        single-head Transformer executors
 ```
 
-更完整的容器、Span、同步及网络接口说明见
-[CUDA Runtime API](docs/api.md)。
+See the [CUDA Runtime API](docs/api.md) for the complete container, span,
+synchronization, and network-layer reference.
 
-## 当前约束
+## Current Constraints
 
-- 仅支持 `f32`；
-- 仅支持连续 row-major Matrix，不支持 stride；
-- 当前矩阵乘法要求 M/K/N 为 16 的倍数；
-- 当前 row Softmax 和 LayerNorm backward 每行最多 1024 个元素；
-- 当前 Transformer 是单头 Post-LN 结构；
-- 当前参数更新为直接 SGD，不包含通用 optimizer；
-- 当前尚无稳定 checkpoint 格式或兼容性承诺。
+- `f32` only;
+- contiguous row-major matrices only; no stride support;
+- matrix M/K/N dimensions must currently be multiples of 16;
+- row Softmax and LayerNorm backward currently support at most 1024 elements per
+  row;
+- the current Transformer is single-head and Post-LN;
+- parameter updates use direct SGD rather than a general optimizer abstraction;
+- no stable checkpoint format or compatibility guarantee yet.
 
-这些约束是当前实现边界，不是对通用框架接口的模拟。随着实际模型需要和 profiling
-结果出现，项目会在明确成本的前提下扩展。
+These are explicit implementation boundaries, not emulations of a generic
+framework API. OxideForge will expand when concrete model requirements and
+profiling results justify the cost.
