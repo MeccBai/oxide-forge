@@ -1,7 +1,8 @@
-use cuda_core::DeviceBuffer;
+use cuda_core::{DeviceBuffer, LaunchConfig1D};
 
 use crate::cuda::{
-    DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, runtime::CudaRuntime, runtime::InitType,
+    BinaryOp, DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, runtime::CudaRuntime,
+    runtime::InitType,
 };
 
 use crate::cuda::container::{Vector, VectorView};
@@ -67,7 +68,7 @@ impl Matrix {
         span.for_each(runtime, f);
     }
 
-    pub fn add_by_rows(&mut self, vec: &Vector, runtime: &CudaRuntime) {
+    pub fn binary_assign_by_rows(&mut self, vec: &Vector, op: BinaryOp, runtime: &CudaRuntime) {
         let mut rows = runtime.split_view(self);
         let streams = runtime.create_extra_streams(rows.len());
         let rhs = DeviceSpan::from_buffer(&vec.buffer, 0, vec.buffer.len());
@@ -76,10 +77,19 @@ impl Matrix {
             .zip(streams.iter())
             .for_each(|(row, stream)| {
                 let config = runtime.get_launch_config(row.len(), DEFAULT_BLOCK_SIZE);
-                let prepared = runtime.module().prepare_slice_add_assign(config).unwrap();
+                let prepared = runtime
+                    .module()
+                    .prepare_slice_binary_assign(config)
+                    .unwrap();
                 runtime
                     .module()
-                    .slice_add_assign(stream, &prepared, row.span.descriptor(), rhs.descriptor())
+                    .slice_binary_assign(
+                        stream,
+                        &prepared,
+                        row.span.descriptor(),
+                        rhs.descriptor(),
+                        op,
+                    )
                     .unwrap();
             });
         runtime.sync_streams(&streams);
@@ -87,6 +97,63 @@ impl Matrix {
 }
 
 impl CudaRuntime {
+    pub fn softmax_rows_backward(
+        &self,
+        probabilities: &Matrix,
+        output_gradient: &Matrix,
+    ) -> Matrix {
+        assert_eq!(probabilities.rows, output_gradient.rows);
+        assert_eq!(probabilities.cols, output_gradient.cols);
+        assert!(probabilities.cols <= DEFAULT_BLOCK_SIZE);
+        let mut buffer = self.get_uninit_buffer(probabilities.rows * probabilities.cols);
+        let config = LaunchConfig1D::new(probabilities.rows as u32, DEFAULT_BLOCK_SIZE as u32, 0);
+        let prepared = self.module().prepare_softmax_rows_backward(config).unwrap();
+        let probabilities_span =
+            DeviceSpan::from_buffer(&probabilities.buffer, 0, probabilities.buffer.len());
+        let output_gradient_span =
+            DeviceSpan::from_buffer(&output_gradient.buffer, 0, output_gradient.buffer.len());
+        let len = buffer.len();
+        let result = DeviceSpanMut::from_buffer(&mut buffer, 0, len);
+        self.module()
+            .softmax_rows_backward(
+                self.stream(),
+                &prepared,
+                probabilities_span.descriptor(),
+                output_gradient_span.descriptor(),
+                result.descriptor(),
+                probabilities.cols,
+            )
+            .unwrap();
+        self.create_matrix(buffer, probabilities.rows, probabilities.cols)
+    }
+
+    pub fn layer_norm_backward(&self, input: &Matrix, output_gradient: &Matrix) -> Matrix {
+        assert_eq!(input.rows, output_gradient.rows);
+        assert_eq!(input.cols, output_gradient.cols);
+
+        assert!(input.cols <= DEFAULT_BLOCK_SIZE);
+        let mut buffer = self.get_uninit_buffer(input.rows * input.cols);
+        let config = LaunchConfig1D::new(input.rows as u32, DEFAULT_BLOCK_SIZE as u32, 0);
+        let prepared = self.module().prepare_layer_norm_backward(config).unwrap();
+        let input_span = DeviceSpan::from_buffer(&input.buffer, 0, input.buffer.len());
+        let output_gradient_span =
+            DeviceSpan::from_buffer(&output_gradient.buffer, 0, output_gradient.buffer.len());
+        let len = buffer.len();
+        let result = DeviceSpanMut::from_buffer(&mut buffer, 0, len);
+        self.module()
+            .layer_norm_backward(
+                self.stream(),
+                &prepared,
+                input_span.descriptor(),
+                output_gradient_span.descriptor(),
+                result.descriptor(),
+                input.cols,
+                1e-5,
+            )
+            .unwrap();
+        self.create_matrix(buffer, input.rows, input.cols)
+    }
+
     pub fn new_matrix(&self, init_type: InitType, rows: usize, cols: usize) -> Matrix {
         let size = rows * cols;
         if init_type.is_zero() {
@@ -214,5 +281,10 @@ impl CudaRuntime {
 
     pub fn to_vector(&self, matrix: Matrix) -> Vector {
         self.create_vector(matrix.buffer)
+    }
+
+    pub fn matrix_copy(&self, matrix: &Matrix) -> Matrix {
+        let buffer = self.clone_buffer(&matrix.buffer);
+        self.create_matrix(buffer, matrix.rows, matrix.cols)
     }
 }

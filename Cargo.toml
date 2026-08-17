@@ -1,7 +1,8 @@
 [package]
-name = "OCR"
+name = "oxide-forge"
 version = "0.1.0"
 edition = "2024"
+description = "A purpose-built Rust/CUDA neural network runtime powered by CUDA-Oxide"
 
 [workspace]
 

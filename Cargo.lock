@@ -3,16 +3,6 @@
 version = 4
 
 [[package]]
-name = "OCR"
-version = "0.1.0"
-dependencies = [
- "cuda-core",
- "cuda-device",
- "cuda-host",
- "rand",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -386,6 +376,16 @@ version = "0.2.1"
 source = "git+https://github.com/NVlabs/cuda-oxide.git#2db97134d9a3a79fe71c211e65a616dacdf03235"
 dependencies = [
  "object",
+]
+
+[[package]]
+name = "oxide-forge"
+version = "0.1.0"
+dependencies = [
+ "cuda-core",
+ "cuda-device",
+ "cuda-host",
+ "rand",
 ]
 
 [[package]]

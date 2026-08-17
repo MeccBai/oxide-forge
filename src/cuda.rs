@@ -3,6 +3,15 @@ use cuda_host::cuda_module;
 
 const DEFAULT_BLOCK_SIZE: usize = 1024;
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
 pub mod container;
 mod device;
 pub mod runtime;
@@ -19,6 +28,16 @@ mod kernels {
     const DEFAULT_BLOCK_SIZE_U32: u32 = 1024;
 
     use super::*;
+
+    #[inline(always)]
+    fn apply_binary(lhs: f32, rhs: f32, op: BinaryOp) -> f32 {
+        match op {
+            BinaryOp::Add => lhs + rhs,
+            BinaryOp::Sub => lhs - rhs,
+            BinaryOp::Mul => lhs * rhs,
+            BinaryOp::Div => lhs / rhs,
+        }
+    }
 
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
@@ -64,18 +83,20 @@ mod kernels {
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn slice_add(
+    pub fn slice_binary(
         lhs: span::DeviceSliceDescriptor<f32>,
         rhs: span::DeviceSliceDescriptor<f32>,
         output: span::DeviceSliceMutDescriptor<f32>,
+        op: BinaryOp,
     ) {
         let index = thread::index_1d().get();
         if index < output.len && index < lhs.len && index < rhs.len {
             unsafe {
-                output
-                    .ptr
-                    .add(index)
-                    .write(lhs.ptr.add(index).read() + rhs.ptr.add(index).read());
+                output.ptr.add(index).write(apply_binary(
+                    lhs.ptr.add(index).read(),
+                    rhs.ptr.add(index).read(),
+                    op,
+                ));
             }
         }
     }
@@ -83,34 +104,16 @@ mod kernels {
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn slice_add_assign(
+    pub fn slice_binary_assign(
         target: span::DeviceSliceMutDescriptor<f32>,
         rhs: span::DeviceSliceDescriptor<f32>,
+        op: BinaryOp,
     ) {
         let index = thread::index_1d().get();
         if index < target.len && index < rhs.len {
             unsafe {
                 let element = target.ptr.add(index);
-                element.write(element.read() + rhs.ptr.add(index).read());
-            }
-        }
-    }
-
-    #[kernel]
-    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
-    #[launch_contract(domain = 1)]
-    pub fn slice_mul(
-        lhs: span::DeviceSliceDescriptor<f32>,
-        rhs: span::DeviceSliceDescriptor<f32>,
-        output: span::DeviceSliceMutDescriptor<f32>,
-    ) {
-        let index = thread::index_1d().get();
-        if index < output.len && index < lhs.len && index < rhs.len {
-            unsafe {
-                output
-                    .ptr
-                    .add(index)
-                    .write(lhs.ptr.add(index).read() * rhs.ptr.add(index).read());
+                element.write(apply_binary(element.read(), rhs.ptr.add(index).read(), op));
             }
         }
     }
@@ -262,6 +265,175 @@ mod kernels {
             if block_id < result.len {
                 unsafe { result.ptr.add(block_id).write(value) };
             }
+        }
+    }
+
+    #[kernel]
+    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
+    #[launch_contract(domain = 1)]
+    pub fn softmax_rows_backward(
+        probabilities: span::DeviceSliceDescriptor<f32>,
+        output_gradient: span::DeviceSliceDescriptor<f32>,
+        result: span::DeviceSliceMutDescriptor<f32>,
+        cols: usize,
+    ) {
+        static mut SHARED: shared::SharedArray<f32, 32> = shared::SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid % 32;
+        let warp_id = tid / 32;
+        let index = thread::blockIdx_x() as usize * cols + tid;
+        let active = tid < cols && index < result.len;
+        let probability = if active {
+            unsafe { probabilities.ptr.add(index).read() }
+        } else {
+            0.0
+        };
+        let gradient = if active {
+            unsafe { output_gradient.ptr.add(index).read() }
+        } else {
+            0.0
+        };
+        let mut value = probability * gradient;
+        for delta in [1, 2, 4, 8, 16] {
+            value += warp::shuffle_down_f32(value, delta);
+        }
+        if lane == 0 {
+            unsafe { SHARED[warp_id] = value };
+        }
+        thread::sync_threads();
+        if warp_id == 0 {
+            value = unsafe { SHARED[lane] };
+            for delta in [1, 2, 4, 8, 16] {
+                value += warp::shuffle_down_f32(value, delta);
+            }
+            if lane == 0 {
+                unsafe { SHARED[0] = value };
+            }
+        }
+        thread::sync_threads();
+        if active {
+            unsafe {
+                result
+                    .ptr
+                    .add(index)
+                    .write(probability * (gradient - SHARED[0]))
+            };
+        }
+    }
+
+    #[kernel]
+    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
+    #[launch_contract(domain = 1)]
+    pub fn layer_norm_backward(
+        input: span::DeviceSliceDescriptor<f32>,
+        output_gradient: span::DeviceSliceDescriptor<f32>,
+        result: span::DeviceSliceMutDescriptor<f32>,
+        cols: usize,
+        epsilon: f32,
+    ) {
+        static mut SHARED: shared::SharedArray<f32, 32> = shared::SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid % 32;
+        let warp_id = tid / 32;
+        let index = thread::blockIdx_x() as usize * cols + tid;
+        let active = tid < cols && index < result.len;
+        let x = if active {
+            unsafe { input.ptr.add(index).read() }
+        } else {
+            0.0
+        };
+        let dy = if active {
+            unsafe { output_gradient.ptr.add(index).read() }
+        } else {
+            0.0
+        };
+
+        let mut value = x;
+        for delta in [1, 2, 4, 8, 16] {
+            value += warp::shuffle_down_f32(value, delta);
+        }
+        if lane == 0 {
+            unsafe { SHARED[warp_id] = value };
+        }
+        thread::sync_threads();
+        if warp_id == 0 {
+            value = unsafe { SHARED[lane] };
+            for delta in [1, 2, 4, 8, 16] {
+                value += warp::shuffle_down_f32(value, delta);
+            }
+            if lane == 0 {
+                unsafe { SHARED[0] = value / cols as f32 };
+            }
+        }
+        thread::sync_threads();
+        let mean = unsafe { SHARED[0] };
+        let diff = x - mean;
+
+        value = if active { diff * diff } else { 0.0 };
+        for delta in [1, 2, 4, 8, 16] {
+            value += warp::shuffle_down_f32(value, delta);
+        }
+        if lane == 0 {
+            unsafe { SHARED[warp_id] = value };
+        }
+        thread::sync_threads();
+        if warp_id == 0 {
+            value = unsafe { SHARED[lane] };
+            for delta in [1, 2, 4, 8, 16] {
+                value += warp::shuffle_down_f32(value, delta);
+            }
+            if lane == 0 {
+                unsafe { SHARED[0] = 1.0 / (value / cols as f32 + epsilon).sqrt() };
+            }
+        }
+        thread::sync_threads();
+        let inverse_std = unsafe { SHARED[0] };
+        let normalized = diff * inverse_std;
+
+        value = dy;
+        for delta in [1, 2, 4, 8, 16] {
+            value += warp::shuffle_down_f32(value, delta);
+        }
+        if lane == 0 {
+            unsafe { SHARED[warp_id] = value };
+        }
+        thread::sync_threads();
+        if warp_id == 0 {
+            value = unsafe { SHARED[lane] };
+            for delta in [1, 2, 4, 8, 16] {
+                value += warp::shuffle_down_f32(value, delta);
+            }
+            if lane == 0 {
+                unsafe { SHARED[0] = value };
+            }
+        }
+        thread::sync_threads();
+        let gradient_sum = unsafe { SHARED[0] };
+
+        value = dy * normalized;
+        for delta in [1, 2, 4, 8, 16] {
+            value += warp::shuffle_down_f32(value, delta);
+        }
+        if lane == 0 {
+            unsafe { SHARED[warp_id] = value };
+        }
+        thread::sync_threads();
+        if warp_id == 0 {
+            value = unsafe { SHARED[lane] };
+            for delta in [1, 2, 4, 8, 16] {
+                value += warp::shuffle_down_f32(value, delta);
+            }
+            if lane == 0 {
+                unsafe { SHARED[0] = value };
+            }
+        }
+        thread::sync_threads();
+        let gradient_normalized_sum = unsafe { SHARED[0] };
+
+        if active {
+            let dx = inverse_std / cols as f32
+                * (cols as f32 * dy - gradient_sum - normalized * gradient_normalized_sum);
+            unsafe { result.ptr.add(index).write(dx) };
         }
     }
 

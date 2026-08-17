@@ -3,7 +3,7 @@ mod net;
 
 use crate::net::linear::Activation::{Gelu, Identity};
 use crate::net::linear::Linear;
-use crate::net::mlp::Mlp;
+use crate::net::mlp::InferenceMLP;
 
 /*
 fn main() {
@@ -98,7 +98,7 @@ fn main() {
     // seq × hidden
     let matrix_position = runtime.new_matrix(cuda::InitType::Random, 1024, 768);
 
-    let fcs = Mlp::new(
+    let fcs = InferenceMLP::new(
         vec![
             Linear::new(
                 runtime.new_matrix(cuda::InitType::Random, 768, 3072),
@@ -120,7 +120,7 @@ fn main() {
         Identity,
     );
 
-    let transformer = net::transformer::Transformer::new(
+    let mut transformer = net::transformer::InferenceTransformer::new(
         matrix_q,
         matrix_k,
         matrix_v,

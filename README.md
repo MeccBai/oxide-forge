@@ -1,65 +1,160 @@
-# OCR
+# OxideForge
 
-一个基于 [CUDA-Oxide](https://nvlabs.github.io/cuda-oxide/index.html) 的 Rust/CUDA
-OCR 实验项目。目前目标是固定 `512×512` 输入的两级模型，并优先完成第一级单头
-Transformer 掩码推理。项目用于练习 GPU 编程和模型实现，不以通用张量框架为目标。
+OxideForge 是一个基于
+[CUDA-Oxide](https://nvlabs.github.io/cuda-oxide/index.html) 编写的 Rust/CUDA
+神经网络运行时。它从一个固定尺寸的图像掩码模型起步，但项目的主体已经成为一套独立
+的 GPU 计算、连续内存容器和神经网络执行层。
 
-## 第一级模型
+项目不试图复刻通用张量框架。它面向形状明确、数据布局可控的模型，以手写 CUDA
+kernel 和显式所有权换取可预测的数据流、较低的运行时开销，以及足够贴近硬件的编程
+体验。
+
+> 追求最大程度的无额外成本抽象，而不是最大程度的抽象。
+
+## 项目状态
+
+OxideForge 目前处于实验性开发阶段，API 会继续调整。核心前向计算路径已经可以构建，
+训练反向路径已经完成基础封装；数据集接入、checkpoint 格式和端到端训练程序仍在开发。
+
+当前实现包括：
+
+- CUDA context、module、stream、buffer 分配和同步；
+- 连续只读/可变 Device Span，以及基于借用的 VectorView；
+- 拥有显存的 `Vector` 和 row-major `Matrix`；
+- 元素级四则运算、映射、缩放、归约和广播；
+- tiled matrix multiplication 和 shared-memory transpose；
+- row Softmax、LayerNorm 及其 backward kernel；
+- Linear、GELU、MLP、残差连接和对应反向传播；
+- 单头 Post-LN Transformer 的推理与训练执行器；
+- 主 stream 异步提交，以及额外 stream 的 fork/join。
+
+尚未完成的主要工程闭环：
+
+- 输入和 label 的数据管线；
+- 模型级 forward/backward 与训练循环；
+- 权重、bias、位置编码及训练状态的 save/load；
+- checkpoint round-trip 和小尺寸数值梯度测试。
+
+## 设计原则
+
+### 连续内存优先
+
+`Matrix` 固定使用 row-major 连续布局，Span 只表示一段连续设备内存，不支持 stride。
+需要按列访问或把不连续区域变为独立对象时，先执行转置或显式重排。项目不会为了表面
+上的通用性，把不连续布局的成本扩散到后续所有 kernel。
+
+### 所有权表达数据生命周期
+
+`Matrix` 和 `Vector` 拥有显存，Span 和 View 只借用显存。创建新容器的操作由
+`CudaRuntime` 提供，原地修改由容器自身提供。训练执行器拥有 backward 真正需要的
+中间结果；每层产生的新矩阵直接 move 到下一层缓存，不为缓存额外执行 device copy。
+最终输出按所有权返回，由上级模型决定是否保留。
+
+### 显式同步
+
+能够连续执行的操作进入同一个 CUDA stream，不在每次 kernel launch 后等待。返回 host
+标量的归约和模型边界才形成同步点。额外 stream 只用于确实彼此独立的工作，并通过
+fork/join 明确汇合。
+
+### 专用实现胜过无成本假象
+
+当前运行时固定使用 `f32`，并针对已知模型尺寸提供实现。只有在不会显著增加复杂度或
+损害性能时才提升通用性。热点优化以 profiler 结果为依据，而不是预先堆叠抽象层。
+
+## 计算模型
+
+当前 Transformer 接收 `[sequence, hidden]` 矩阵：
 
 ```text
-Image [512,512,3]
-  → Patchify（16×16×3）
-Tokens [1024,768]
-  → Position Embedding
-  → Single-Head Transformer
-  → FFN（768→3072→768）
-  → Output Projection（768→256）
-Mask Patches [1024,256]
-  → 按切分顺序拼回
-Mask [512,512]
+X = input + position
+    ├── Q ──┐
+    ├── K ──┴── QKᵀ / √hidden ── row softmax ──┐
+    └── V ─────────────────────────────────────┴── attention value
+                                                       │
+X ───────────────── residual ── LayerNorm ── FFN ── residual ── LayerNorm
+                                                                       │
+                                                              output projection
 ```
 
-每个 token 输出一个 `16×16=256` 的局部掩码块。1024 个块直接重排回原图尺寸，
-不做插值放大。
+推理层不保存 activation。训练层只保存反向计算所需的数据，并由 MLP 层统一调度 Linear
+参数更新；Linear 自身不持有 tape 或 workspace。
 
-- [第一级架构说明](docs/STAGE1_ARCHITECTURE.md)
-- [CUDA Runtime API](docs/impl/api.md)
+## 第一个使用场景：原尺寸掩码生成
 
-## 当前能力
+最初的 OCR 需求现在作为 OxideForge 的第一个模型用例存在：将固定 `512×512×3`
+图像切成 `16×16×3` patch，由单头 Transformer 为每个 patch 输出一个
+`16×16` 局部掩码，再按原切分顺序直接拼回整张图像。
 
-- DeviceBuffer 分配、复制与拼接；
-- 连续只读/可变 Device Span；
-- Vector、VectorView 和 row-major Matrix；
-- 矩阵加法、tiled 矩阵乘法与优化转置；
-- `for_each`、`scale`、`sum`、`max` 和 `map_sum`；
-- 按行 Softmax 和 LayerNorm；
-- Linear、GELU、MLP；
-- 单头 Self-Attention、残差连接和 `768→256` 输出投影；
-- 主 stream 异步提交及额外 stream 的 fork/join。
+```text
+Image                    [512,512,3]
+  → Patchify 16×16×3
+Tokens                   [1024,768]
+  → Position + Transformer + FFN
+Context                  [1024,768]
+  → Output projection 768→256
+Mask patches             [1024,256]
+  → Unpatchify
+Mask                     [512,512]
+```
 
-## 环境准备
+这个过程不做低分辨率插值：`1024 × 256 = 512 × 512`，输出只是一次布局重排。
+完整的尺寸推导和实现方案见[第一级掩码模型架构](docs/STAGE1_ARCHITECTURE.md)。
+
+## 环境要求
+
+- 支持 CUDA 的 NVIDIA GPU；
+- 可用的 NVIDIA Driver 和 CUDA 开发环境；
+- `rust-toolchain.toml` 指定的 Rust nightly toolchain；
+- 已安装 `cargo oxide`。
+
+首先检查 CUDA-Oxide 环境：
 
 ```bash
 cargo oxide doctor
 ```
 
-项目必须使用 CUDA-Oxide 工作流生成设备 artifact。普通 `cargo build` 不能替代：
+构建并运行：
 
 ```bash
 cargo oxide run
 ```
 
-设备调试：
+普通 `cargo build` 不能替代这个流程，因为设备端代码需要由 CUDA-Oxide 单独生成并链接。
+
+设备调试构建：
 
 ```bash
 cargo oxide run --device-debug
 ```
 
-保留优化并生成 profiler/Compute Sanitizer 可用的行号：
+保留优化并为 Compute Sanitizer 或 profiler 生成行号：
 
 ```bash
 cargo oxide run --lineinfo
 ```
+
+## 最小示例
+
+下面的示例构造一个 `1024×768` 输入，并通过 Linear 映射为 `1024×256` 输出：
+
+```rust
+let runtime = CudaRuntime::new()?;
+
+let input = runtime.new_matrix(InitType::Random, 1024, 768);
+let projection = Linear::new(
+    runtime.new_matrix(InitType::Random, 768, 256),
+    None,
+    Activation::Identity,
+);
+
+let output = projection.forward(&input, None, &runtime);
+runtime.sync();
+
+assert_eq!((output.rows(), output.cols()), (1024, 256));
+```
+
+项目当前是 binary crate，示例展示的是内部 API 的使用方式；稳定公共 crate 接口不是
+现阶段的目标。
 
 ## 代码结构
 
@@ -70,25 +165,29 @@ src/
 │   ├── runtime.rs            context、stream、buffer 与同步
 │   ├── span.rs               连续设备内存借用
 │   └── container/
-│       ├── matrix.rs         Matrix 属性、按行操作与转换
+│       ├── matrix.rs         Matrix 生命周期、按行操作与转换
 │       ├── matrix_compute.rs Matrix 计算
-│       ├── vector.rs         Vector 创建与 Vector 间运算
+│       ├── vector.rs         Vector 创建和 Vector 间运算
 │       ├── vector_compute.rs Vector 原地计算与归约
-│       └── vector_view.rs    Span/View 接口与计算
+│       └── vector_view.rs    连续 View 接口与计算
 └── net/
-    ├── linear.rs
-    ├── mlp.rs
-    └── transformer.rs
+    ├── linear.rs             Linear、activation 与参数更新
+    ├── mlp.rs                inference/training MLP executor
+    └── transformer.rs        single-head Transformer
 ```
 
-## 执行与同步
+更完整的容器、Span、同步及网络接口说明见
+[CUDA Runtime API](docs/api.md)。
 
-矩阵乘法、矩阵加法、转置和元素级操作向主 stream 排队，不在每一步自动等待。
-同一 stream 天然保证顺序，`Transformer::forward` 在返回前统一同步。
+## 当前约束
 
-`sum/max/map_sum` 返回 CPU `f32`，因此必须等待归约结果。当前按行 Softmax 和
-LayerNorm 保留这种直接实现；在 profiler 证明它们成为瓶颈前，不引入设备标量或
-更复杂的调度。
+- 仅支持 `f32`；
+- 仅支持连续 row-major Matrix，不支持 stride；
+- 当前矩阵乘法要求 M/K/N 为 16 的倍数；
+- 当前 row Softmax 和 LayerNorm backward 每行最多 1024 个元素；
+- 当前 Transformer 是单头 Post-LN 结构；
+- 当前参数更新为直接 SGD，不包含通用 optimizer；
+- 当前尚无稳定 checkpoint 格式或兼容性承诺。
 
-`create_extra_streams()` 使用 `fork()` 创建真正的非阻塞 stream。额外 stream 完成后
-必须用 `join_streams()` 或 `sync_streams()` 汇合。
+这些约束是当前实现边界，不是对通用框架接口的模拟。随着实际模型需要和 profiling
+结果出现，项目会在明确成本的前提下扩展。
