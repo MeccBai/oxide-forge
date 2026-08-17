@@ -107,6 +107,7 @@ index = row * cols + col
 let product = runtime.matrix_multiply(&a, &b);
 let sum = runtime.matrix_add(&a, &b);
 let transposed = runtime.matrix_transpose(&a);
+let row_sums = runtime.matrix_sum_rows(&a);
 ```
 
 Element-wise arithmetic is selected through `BinaryOp`:
@@ -139,6 +140,7 @@ kernel launch.
 | `matrix_multiply(a, b)` | `a.cols == b.rows`; M/K/N must currently be multiples of 16 | `[a.rows, b.cols]` |
 | `matrix_add(a, b)` | Identical shapes | Input shape |
 | `matrix_transpose(a)` | No additional shape constraint | `[a.cols, a.rows]` |
+| `matrix_sum_rows(a)` | At most 1024 columns | Vector with `a.rows` elements |
 | `softmax_rows_backward(p, dy)` | Identical shapes; at most 1024 columns | `dScores`, same shape |
 | `layer_norm_backward(x, dy)` | Identical shapes; at most 1024 columns | `dX`, same shape |
 
@@ -160,13 +162,18 @@ matrix.binary_assign_by_rows(&bias, BinaryOp::Add, &runtime);
 | API | Synchronization behavior |
 | --- | --- |
 | `scale`, `add_val`, `for_each` | Asynchronous submission |
-| `softmax_rows` | Synchronizes internally because `max` and `sum` return host scalars |
-| `layer_norm` | Synchronizes internally because `sum` and `map_sum` return host scalars |
+| `softmax_rows` | One block per row in one asynchronous launch |
+| `layer_norm` | One block per row in one asynchronous launch |
 | `binary_assign` | In-place element-wise operation on equal-shaped matrices; asynchronous |
-| `binary_assign_by_rows` | Broadcasts a Vector across rows; submits to multiple streams and rejoins them |
+| `binary_assign_by_rows` | One asynchronous broadcast kernel over the complete Matrix |
 
 The closure passed to `for_each` must implement `Fn(f32) -> f32 + Copy` and must
 be compilable as device code.
+
+`matrix_sum_rows`, `softmax_rows`, and `layer_norm` launch one block for every
+row. Blocks from the same launch are distributed across SMs by CUDA; no Matrix
+row is materialized as a `VectorView`, and no per-row stream or host-valued
+reduction is involved.
 
 ### Matrix and Vector conversion
 
@@ -388,6 +395,57 @@ output projection
 `TrainingTransformer::backward` returns the input gradient and updates Linear
 parameters and the positional Matrix with the supplied learning rate.
 
+## Model Checkpoints
+
+MLP and Transformer executors use the same two-file checkpoint convention:
+
+```text
+model.toml   versioned model metadata and parameter byte ranges
+model.bin    contiguous little-endian f32 parameter data
+```
+
+Passing a path without an extension adds `.toml`; other explicit extensions are
+rejected. The corresponding `.bin` name is written into the metadata. Available
+entry points are:
+
+```rust
+model.dump_to_file("model.toml", &runtime)?;
+
+let linear = Linear::load_from_file("linear.toml", &runtime)?;
+
+let mlp = MlpExecutor::load_from_file("model.toml", &runtime)?;
+let mlp = InferenceMLP::load_from_file("model.toml", &runtime)?;
+let mlp = TrainingMlp::load_from_file("model.toml", &runtime)?;
+
+let model = InferenceTransformer::load_from_file("model.toml", &runtime)?;
+let model = TrainingTransformer::load_from_file("model.toml", &runtime)?;
+```
+
+`Linear`, `MlpExecutor`, both MLP forms, and both Transformer forms provide
+`dump_to_file` and `load_from_file`. The inference/training forms share identical
+persistent parameters. Training activation caches are intentionally excluded
+and are empty after loading.
+
+The TOML document records:
+
+- format version, model type, scalar encoding, binary file name and size;
+- loss function and Transformer block count;
+- MLP layer count and optional residual range `[start, end)`;
+- the input/output neuron count and activation of each Linear layer;
+- Matrix/Vector shapes and each parameter's `[byte_start, byte_end)` range;
+- the Transformer's fixed attention and feed-forward residual connections.
+
+`MlpExecutor::new`, `InferenceMLP::new`, and `TrainingMlp::new` default to
+`Loss::MeanSquaredError`. Use `with_loss` when selecting the persisted loss
+explicitly. Version 1 currently defines only mean squared error.
+
+Dump uses the existing `Matrix::to_host` and `Vector::to_host` paths. Load seeks
+directly to each declared range, reads only that parameter, and creates its
+device allocation with `DeviceBuffer::from_host`. It validates the format,
+binary size, ranges, tensor shapes, Linear connectivity, residual dimensions,
+and Transformer dimensions before constructing the executor. No checkpoint
+kernel or Span-specific transfer path exists.
+
 ## Synchronization Summary
 
 | Operation | Behavior |
@@ -396,9 +454,9 @@ parameters and the positional Matrix with the supplied learning rate.
 | Matrix/View in-place element operation | Asynchronous submission |
 | `vector_binary` and convenience wrappers | Synchronize before returning |
 | `sum`, `max`, `map_sum` | Synchronize and return a host scalar |
-| `softmax_rows`, `layer_norm` | Synchronize during internal reductions |
+| `matrix_sum_rows`, `softmax_rows`, `layer_norm` | One row-parallel kernel; asynchronous submission |
 | `softmax_rows_backward`, `layer_norm_backward` | One row-wise kernel; asynchronous submission |
-| `binary_assign_by_rows` | Parallel extra-stream submission followed by a join |
+| `binary_assign_by_rows` | One Matrix-wide broadcast kernel; asynchronous submission |
 | Transformer `forward` | Synchronizes before returning |
 | `to_host` | Host-read synchronization boundary |
 

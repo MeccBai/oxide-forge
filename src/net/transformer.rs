@@ -3,16 +3,19 @@ use crate::cuda::{
     container::Matrix,
     runtime::CudaRuntime,
 };
+use crate::net::checkpoint;
 use crate::net::linear::Linear;
 use crate::net::mlp::{InferenceMLP, TrainingMlp};
+use std::error::Error;
+use std::path::Path;
 
 pub struct InferenceTransformer {
-    q_matrix: Linear,
-    k_matrix: Linear,
-    v_matrix: Linear,
-    position_matrix: Matrix,
-    fcs: InferenceMLP,
-    output_matrix: Linear,
+    pub(super) q_matrix: Linear,
+    pub(super) k_matrix: Linear,
+    pub(super) v_matrix: Linear,
+    pub(super) position_matrix: Matrix,
+    pub(super) fcs: InferenceMLP,
+    pub(super) output_matrix: Linear,
 }
 
 impl InferenceTransformer {
@@ -60,15 +63,30 @@ impl InferenceTransformer {
         runtime.sync();
         output
     }
+
+    pub fn dump_to_file<P: AsRef<Path>>(
+        &self,
+        path: P,
+        runtime: &CudaRuntime,
+    ) -> Result<(), Box<dyn Error>> {
+        checkpoint::dump_inference_transformer_file(self, path.as_ref(), runtime)
+    }
+
+    pub fn load_from_file<P: AsRef<Path>>(
+        path: P,
+        runtime: &CudaRuntime,
+    ) -> Result<Self, Box<dyn Error>> {
+        checkpoint::load_inference_transformer_file(path.as_ref(), runtime)
+    }
 }
 
 pub struct TrainingTransformer {
-    q_matrix: Linear,
-    k_matrix: Linear,
-    v_matrix: Linear,
-    position_matrix: Matrix,
-    fcs: TrainingMlp,
-    output_matrix: Linear,
+    pub(super) q_matrix: Linear,
+    pub(super) k_matrix: Linear,
+    pub(super) v_matrix: Linear,
+    pub(super) position_matrix: Matrix,
+    pub(super) fcs: TrainingMlp,
+    pub(super) output_matrix: Linear,
     cache: Option<TransformerCache>,
 }
 
@@ -220,5 +238,20 @@ impl TrainingTransformer {
             .binary_assign(&position_update, Sub, runtime);
         runtime.sync();
         input_gradient
+    }
+
+    pub fn dump_to_file<P: AsRef<Path>>(
+        &self,
+        path: P,
+        runtime: &CudaRuntime,
+    ) -> Result<(), Box<dyn Error>> {
+        checkpoint::dump_training_transformer_file(self, path.as_ref(), runtime)
+    }
+
+    pub fn load_from_file<P: AsRef<Path>>(
+        path: P,
+        runtime: &CudaRuntime,
+    ) -> Result<Self, Box<dyn Error>> {
+        checkpoint::load_training_transformer_file(path.as_ref(), runtime)
     }
 }

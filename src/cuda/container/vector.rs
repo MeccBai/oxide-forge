@@ -19,7 +19,7 @@ impl Vector {
 }
 
 impl CudaRuntime {
-    pub(super) fn create_vector(&self, buffer: DeviceBuffer<f32>) -> Vector {
+    pub(crate) fn create_vector(&self, buffer: DeviceBuffer<f32>) -> Vector {
         Vector { buffer }
     }
 

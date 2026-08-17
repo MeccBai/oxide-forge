@@ -15,8 +15,8 @@ kernel 和显式所有权换取可预测的数据流、较低的运行时开销�
 
 ## 项目状态
 
-OxideForge 目前处于实验性开发阶段，API 会继续调整。核心前向计算路径已经可以构建，
-训练反向路径已经完成基础封装；数据集接入、checkpoint 格式和端到端训练程序仍在开发。
+OxideForge 目前处于实验性开发阶段，API 会继续调整。核心前向与反向路径已经完成，
+同时提供版本化 TOML + BIN 模型存档；数据集接入和端到端训练程序仍在开发。
 
 当前实现包括：
 
@@ -28,14 +28,14 @@ OxideForge 目前处于实验性开发阶段，API 会继续调整。核心前�
 - row Softmax、LayerNorm 及其 backward kernel；
 - Linear、GELU、MLP、残差连接和对应反向传播；
 - 单头 Post-LN Transformer 的推理与训练执行器；
+- MLP 与 Transformer 参数的 checkpoint 保存和加载；
 - 主 stream 异步提交，以及额外 stream 的 fork/join。
 
 尚未完成的主要工程闭环：
 
 - 输入和 label 的数据管线；
 - 模型级 forward/backward 与训练循环；
-- 权重、bias、位置编码及训练状态的 save/load；
-- checkpoint round-trip 和小尺寸数值梯度测试。
+- 小尺寸数值梯度测试与 optimizer 状态持久化。
 
 ## 设计原则
 
@@ -152,6 +152,7 @@ src/
 │       ├── vector_compute.rs Vector 原地计算与归约
 │       └── vector_view.rs    连续 View 接口与计算
 └── net/
+    ├── checkpoint.rs         版本化 TOML 元数据与二进制参数
     ├── linear.rs             Linear、activation 与参数更新
     ├── mlp.rs                inference/training MLP executor
     └── transformer.rs        single-head Transformer
@@ -168,7 +169,7 @@ src/
 - 当前 row Softmax 和 LayerNorm backward 每行最多 1024 个元素；
 - 当前 Transformer 是单头 Post-LN 结构；
 - 当前参数更新为直接 SGD，不包含通用 optimizer；
-- 当前尚无稳定 checkpoint 格式或兼容性承诺。
+- checkpoint 格式版本 1 固定保存 little-endian `f32` 参数；加载器会明确拒绝不支持的版本。
 
 这些约束是当前实现边界，不是对通用框架接口的模拟。随着实际模型需要和 profiling
 结果出现，项目会在明确成本的前提下扩展。

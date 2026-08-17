@@ -17,9 +17,9 @@ hardware.
 
 ## Status
 
-OxideForge is experimental and its API is still evolving. The core forward path
-builds successfully, and the fundamental backward path is implemented. Dataset
-integration, a stable checkpoint format, and end-to-end training orchestration
+OxideForge is experimental and its API is still evolving. The core forward and
+backward paths are implemented, together with a versioned TOML + binary model
+checkpoint format. Dataset integration and end-to-end training orchestration
 remain under development.
 
 Implemented capabilities include:
@@ -32,6 +32,7 @@ Implemented capabilities include:
 - row-wise Softmax and LayerNorm, including backward kernels;
 - Linear, GELU, MLP, residual connections, and their backward paths;
 - inference and training executors for a single-head Post-LN Transformer;
+- parameter checkpoint save/load for MLP and Transformer executors;
 - asynchronous submission on the primary stream and explicit fork/join for
   additional streams.
 
@@ -39,9 +40,7 @@ The remaining integration work is primarily:
 
 - input and label pipelines;
 - model-level forward/backward orchestration and training loops;
-- save/load support for weights, biases, positional parameters, and training
-  state;
-- checkpoint round-trip tests and small-shape numerical gradient tests.
+- small-shape numerical gradient tests and optimizer state persistence.
 
 ## Design Principles
 
@@ -168,6 +167,7 @@ src/
 │       ├── vector_compute.rs in-place Vector operations and reductions
 │       └── vector_view.rs    contiguous borrowed-view operations
 └── net/
+    ├── checkpoint.rs         versioned TOML metadata and binary parameters
     ├── linear.rs             Linear, activation, and parameter updates
     ├── mlp.rs                inference/training MLP executors
     └── transformer.rs        single-head Transformer executors
@@ -185,7 +185,8 @@ synchronization, and network-layer reference.
   row;
 - the current Transformer is single-head and Post-LN;
 - parameter updates use direct SGD rather than a general optimizer abstraction;
-- no stable checkpoint format or compatibility guarantee yet.
+- checkpoint format version 1 stores little-endian `f32` parameters; unsupported
+  versions are rejected explicitly.
 
 These are explicit implementation boundaries, not emulations of a generic
 framework API. OxideForge will expand when concrete model requirements and

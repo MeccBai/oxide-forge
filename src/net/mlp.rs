@@ -1,21 +1,40 @@
 use crate::cuda::BinaryOp::Add;
 use crate::cuda::container::Matrix;
 use crate::cuda::runtime::CudaRuntime;
+use crate::net::checkpoint;
 use crate::net::linear::Linear;
+use serde::{Deserialize, Serialize};
+use std::error::Error;
+use std::path::Path;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Loss {
+    MeanSquaredError,
+}
 
 pub struct MlpExecutor {
-    layers: Vec<Linear>,
+    pub(super) layers: Vec<Linear>,
     /// A residual from the input of `start` to the output of `end - 1`.
-    res_range: Option<(usize, usize)>,
+    pub(super) res_range: Option<(usize, usize)>,
+    pub(super) loss: Loss,
 }
 
 impl MlpExecutor {
     pub fn new(layers: Vec<Linear>, res_range: Option<(usize, usize)>) -> Self {
+        Self::with_loss(layers, res_range, Loss::MeanSquaredError)
+    }
+
+    pub fn with_loss(layers: Vec<Linear>, res_range: Option<(usize, usize)>, loss: Loss) -> Self {
         assert!(!layers.is_empty(), "MLP must contain at least one layer");
         if let Some((start, end)) = res_range {
             assert!(start < end && end <= layers.len(), "invalid residual range");
         }
-        Self { layers, res_range }
+        Self {
+            layers,
+            res_range,
+            loss,
+        }
     }
 
     pub fn forward(&self, input: &Matrix, runtime: &CudaRuntime) -> Matrix {
@@ -44,6 +63,10 @@ impl MlpExecutor {
 
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
+    }
+
+    pub fn loss(&self) -> Loss {
+        self.loss
     }
 
     pub fn backward(
@@ -92,35 +115,75 @@ impl MlpExecutor {
         assert!(residual_gradient.is_none(), "unresolved residual gradient");
         gradient
     }
+
+    pub fn dump_to_file<P: AsRef<Path>>(
+        &self,
+        path: P,
+        runtime: &CudaRuntime,
+    ) -> Result<(), Box<dyn Error>> {
+        checkpoint::dump_mlp_file(self, path.as_ref(), runtime)
+    }
+
+    pub fn load_from_file<P: AsRef<Path>>(
+        path: P,
+        runtime: &CudaRuntime,
+    ) -> Result<Self, Box<dyn Error>> {
+        checkpoint::load_mlp_file(path.as_ref(), runtime)
+    }
 }
 
 pub struct InferenceMLP {
-    executor: MlpExecutor,
+    pub(super) executor: MlpExecutor,
 }
 
 impl InferenceMLP {
     pub fn new(layers: Vec<Linear>, res_range: Option<(usize, usize)>) -> Self {
+        Self::with_loss(layers, res_range, Loss::MeanSquaredError)
+    }
+
+    pub fn with_loss(layers: Vec<Linear>, res_range: Option<(usize, usize)>, loss: Loss) -> Self {
         Self {
-            executor: MlpExecutor::new(layers, res_range),
+            executor: MlpExecutor::with_loss(layers, res_range, loss),
         }
     }
 
     pub fn forward(&self, input: &Matrix, runtime: &CudaRuntime) -> Matrix {
         self.executor.forward(input, runtime)
     }
+
+    pub fn dump_to_file<P: AsRef<Path>>(
+        &self,
+        path: P,
+        runtime: &CudaRuntime,
+    ) -> Result<(), Box<dyn Error>> {
+        self.executor.dump_to_file(path, runtime)
+    }
+
+    pub fn load_from_file<P: AsRef<Path>>(
+        path: P,
+        runtime: &CudaRuntime,
+    ) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            executor: MlpExecutor::load_from_file(path, runtime)?,
+        })
+    }
 }
 
 pub struct TrainingMlp {
     /// `layer_inputs[i]` owns the input consumed by layer `i`.
-    layer_inputs: Vec<Matrix>,
-    executor: MlpExecutor,
+    pub(super) layer_inputs: Vec<Matrix>,
+    pub(super) executor: MlpExecutor,
 }
 
 impl TrainingMlp {
     pub fn new(layers: Vec<Linear>, res_range: Option<(usize, usize)>) -> Self {
+        Self::with_loss(layers, res_range, Loss::MeanSquaredError)
+    }
+
+    pub fn with_loss(layers: Vec<Linear>, res_range: Option<(usize, usize)>, loss: Loss) -> Self {
         Self {
             layer_inputs: Vec::new(),
-            executor: MlpExecutor::new(layers, res_range),
+            executor: MlpExecutor::with_loss(layers, res_range, loss),
         }
     }
 
@@ -159,5 +222,23 @@ impl TrainingMlp {
 
     pub fn input(&self) -> Option<&Matrix> {
         self.layer_inputs.first()
+    }
+
+    pub fn dump_to_file<P: AsRef<Path>>(
+        &self,
+        path: P,
+        runtime: &CudaRuntime,
+    ) -> Result<(), Box<dyn Error>> {
+        self.executor.dump_to_file(path, runtime)
+    }
+
+    pub fn load_from_file<P: AsRef<Path>>(
+        path: P,
+        runtime: &CudaRuntime,
+    ) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            layer_inputs: Vec::new(),
+            executor: MlpExecutor::load_from_file(path, runtime)?,
+        })
     }
 }

@@ -23,36 +23,45 @@ impl Matrix {
     }
 
     pub fn softmax_rows(&mut self, runtime: &CudaRuntime) {
-        let mut rows = runtime.split_view(self);
-        for row in &mut rows {
-            row.softmax(runtime);
+        if self.rows == 0 {
+            return;
         }
-        runtime.sync();
-    }
-
-    pub fn sum_rows(&mut self, runtime: &CudaRuntime) -> Vector {
-        let mut rows = runtime
-            .split_view(self)
-            .into_iter()
-            .map(|row| row.sum(runtime))
-            .collect::<Vec<f32>>();
-
+        assert!(self.cols > 0 && self.cols <= DEFAULT_BLOCK_SIZE);
+        let config = LaunchConfig1D::new(self.rows as u32, DEFAULT_BLOCK_SIZE as u32, 0);
+        let prepared = runtime
+            .module()
+            .prepare_matrix_softmax_rows(config)
+            .unwrap();
+        let len = self.buffer.len();
+        let matrix = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
         runtime
-            .create_vector(DeviceBuffer::from_host(runtime.stream(), rows.as_mut_slice()).unwrap())
+            .module()
+            .matrix_softmax_rows(runtime.stream(), &prepared, matrix.descriptor(), self.cols)
+            .unwrap();
     }
 
     pub fn layer_norm(&mut self, runtime: &CudaRuntime) {
-        let mut rows = runtime.split_view(self);
-        for row in &mut rows {
-            let mean = row.sum(runtime) / row.len() as f32;
-            let variance = row.map_sum(runtime, move |x| {
-                let diff = x - mean;
-                diff * diff
-            }) / row.len() as f32;
-            let std = (variance + 1e-5).sqrt();
-            row.for_each(runtime, move |x| (x - mean) / std);
+        if self.rows == 0 {
+            return;
         }
-        runtime.sync();
+        assert!(self.cols > 0 && self.cols <= DEFAULT_BLOCK_SIZE);
+        let config = LaunchConfig1D::new(self.rows as u32, DEFAULT_BLOCK_SIZE as u32, 0);
+        let prepared = runtime
+            .module()
+            .prepare_matrix_layer_norm_rows(config)
+            .unwrap();
+        let len = self.buffer.len();
+        let matrix = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
+        runtime
+            .module()
+            .matrix_layer_norm_rows(
+                runtime.stream(),
+                &prepared,
+                matrix.descriptor(),
+                self.cols,
+                1e-5,
+            )
+            .unwrap();
     }
 
     pub fn for_each<F>(&mut self, runtime: &CudaRuntime, f: F)
@@ -69,34 +78,56 @@ impl Matrix {
     }
 
     pub fn binary_assign_by_rows(&mut self, vec: &Vector, op: BinaryOp, runtime: &CudaRuntime) {
-        let mut rows = runtime.split_view(self);
-        let streams = runtime.create_extra_streams(rows.len());
+        assert_eq!(self.cols, vec.len());
+        if self.buffer.is_empty() {
+            return;
+        }
+        let config = runtime.get_launch_config(self.buffer.len(), DEFAULT_BLOCK_SIZE);
+        let prepared = runtime
+            .module()
+            .prepare_matrix_binary_assign_by_rows(config)
+            .unwrap();
+        let len = self.buffer.len();
+        let matrix = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
         let rhs = DeviceSpan::from_buffer(&vec.buffer, 0, vec.buffer.len());
-
-        rows.iter_mut()
-            .zip(streams.iter())
-            .for_each(|(row, stream)| {
-                let config = runtime.get_launch_config(row.len(), DEFAULT_BLOCK_SIZE);
-                let prepared = runtime
-                    .module()
-                    .prepare_slice_binary_assign(config)
-                    .unwrap();
-                runtime
-                    .module()
-                    .slice_binary_assign(
-                        stream,
-                        &prepared,
-                        row.span.descriptor(),
-                        rhs.descriptor(),
-                        op,
-                    )
-                    .unwrap();
-            });
-        runtime.sync_streams(&streams);
+        runtime
+            .module()
+            .matrix_binary_assign_by_rows(
+                runtime.stream(),
+                &prepared,
+                matrix.descriptor(),
+                rhs.descriptor(),
+                self.cols,
+                op,
+            )
+            .unwrap();
     }
 }
 
 impl CudaRuntime {
+    pub fn matrix_sum_rows(&self, matrix: &Matrix) -> Vector {
+        if matrix.rows == 0 {
+            return self.create_vector(self.get_uninit_buffer(0));
+        }
+        assert!(matrix.cols > 0 && matrix.cols <= DEFAULT_BLOCK_SIZE);
+        let mut buffer = self.get_uninit_buffer(matrix.rows);
+        let config = LaunchConfig1D::new(matrix.rows as u32, DEFAULT_BLOCK_SIZE as u32, 0);
+        let prepared = self.module().prepare_matrix_sum_rows(config).unwrap();
+        let input = DeviceSpan::from_buffer(&matrix.buffer, 0, matrix.buffer.len());
+        let result_len = buffer.len();
+        let result = DeviceSpanMut::from_buffer(&mut buffer, 0, result_len);
+        self.module()
+            .matrix_sum_rows(
+                self.stream(),
+                &prepared,
+                input.descriptor(),
+                result.descriptor(),
+                matrix.cols,
+            )
+            .unwrap();
+        self.create_vector(buffer)
+    }
+
     pub fn softmax_rows_backward(
         &self,
         probabilities: &Matrix,
@@ -194,7 +225,12 @@ impl CudaRuntime {
         Matrix { buffer, rows, cols }
     }
 
-    fn create_matrix(&self, buffer: DeviceBuffer<f32>, rows: usize, cols: usize) -> Matrix {
+    pub(crate) fn create_matrix(
+        &self,
+        buffer: DeviceBuffer<f32>,
+        rows: usize,
+        cols: usize,
+    ) -> Matrix {
         Matrix { buffer, rows, cols }
     }
 

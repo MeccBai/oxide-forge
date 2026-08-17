@@ -4,8 +4,14 @@ use crate::cuda::{
     runtime::CudaRuntime,
 };
 use cuda::container::{Matrix, Vector};
+use serde::{Deserialize, Serialize};
+use std::error::Error;
+use std::path::Path;
 
-#[derive(Clone, Copy)]
+use crate::net::checkpoint;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Activation {
     Identity,
     Gelu,
@@ -44,9 +50,9 @@ impl Activation {
 }
 
 pub struct Linear {
-    weights: Matrix,
-    bias: Option<Vector>,
-    activation: Activation,
+    pub(super) weights: Matrix,
+    pub(super) bias: Option<Vector>,
+    pub(super) activation: Activation,
 }
 
 impl Linear {
@@ -56,6 +62,21 @@ impl Linear {
             bias,
             activation,
         }
+    }
+
+    pub fn dump_to_file<P: AsRef<Path>>(
+        &self,
+        path: P,
+        runtime: &CudaRuntime,
+    ) -> Result<(), Box<dyn Error>> {
+        checkpoint::dump_linear_file(self, path.as_ref(), runtime)
+    }
+
+    pub fn load_from_file<P: AsRef<Path>>(
+        path: P,
+        runtime: &CudaRuntime,
+    ) -> Result<Self, Box<dyn Error>> {
+        checkpoint::load_linear_file(path.as_ref(), runtime)
     }
 
     pub fn forward(
@@ -117,8 +138,8 @@ impl Linear {
         }
 
         let bias_gradient = if self.bias.is_some() {
-            let mut transposed = runtime.matrix_transpose(&gradient);
-            Some(transposed.sum_rows(runtime))
+            let transposed = runtime.matrix_transpose(&gradient);
+            Some(runtime.matrix_sum_rows(&transposed))
         } else {
             None
         };
@@ -135,7 +156,7 @@ impl Linear {
         loss.for_each(runtime, |x| 0.5 * x * x);
 
         let cols = loss.cols() as f32;
-        let mut row_loss = loss.sum_rows(runtime);
+        let mut row_loss = runtime.matrix_sum_rows(&loss);
         row_loss.scale(1.0 / cols, runtime);
         row_loss
     }
@@ -191,8 +212,8 @@ impl Linear {
         }
 
         let bias_gradient = if self.bias.is_some() {
-            let mut transposed = runtime.matrix_transpose(&gradient);
-            Some(transposed.sum_rows(runtime))
+            let transposed = runtime.matrix_transpose(&gradient);
+            Some(runtime.matrix_sum_rows(&transposed))
         } else {
             None
         };

@@ -101,6 +101,7 @@ index = row * cols + col
 let c = runtime.matrix_multiply(&a, &b);
 let sum = runtime.matrix_add(&a, &b);
 let transposed = runtime.matrix_transpose(&a);
+let row_sums = runtime.matrix_sum_rows(&a);
 ```
 
 逐元素四则运算统一由 `BinaryOp` 控制：
@@ -130,6 +131,7 @@ launch 共享的 host 枚举参数，warp 内不会因不同元素选择不同�
 | `matrix_multiply(a,b)` | `a.cols == b.rows`，当前 M/K/N 均须为 16 的倍数 | `[a.rows,b.cols]` |
 | `matrix_add(a,b)` | 形状完全一致 | 输入形状 |
 | `matrix_transpose(a)` | 无额外尺寸约束 | `[a.cols,a.rows]` |
+| `matrix_sum_rows(a)` | 列数不超过 1024 | 长度为 `a.rows` 的 Vector |
 | `softmax_rows_backward(p,dy)` | 两者同形且列数不超过 1024 | `dScores` |
 | `layer_norm_backward(x,dy)` | 两者同形且列数不超过 1024 | `dX` |
 
@@ -150,12 +152,16 @@ matrix.binary_assign_by_rows(&bias, BinaryOp::Add, &runtime);
 | API | 同步行为 |
 | --- | --- |
 | `scale/add_val/for_each` | 异步提交 |
-| `softmax_rows` | `max/sum` 返回 host 标量，内部同步 |
-| `layer_norm` | `sum/map_sum` 返回 host 标量，内部同步 |
+| `softmax_rows` | 单次异步 launch，每行一个 block |
+| `layer_norm` | 单次异步 launch，每行一个 block |
 | `binary_assign` | 与同形 Matrix 原地逐元素计算，异步提交 |
-| `binary_assign_by_rows` | 将 Vector 广播到每行；多 stream 提交后统一汇合 |
+| `binary_assign_by_rows` | 对完整 Matrix 启动一次异步广播 kernel |
 
 传入 `for_each` 的闭包必须满足 `Fn(f32) -> f32 + Copy`，并能编译为设备代码。
+
+`matrix_sum_rows`、`softmax_rows` 和 `layer_norm` 在一次 launch 中为每一行启动一个
+block，由 CUDA 自动把这些 block 分配到不同 SM。它们不再把 Matrix 行物化为
+`VectorView`，也不再执行逐行 stream 调度或返回 host 标量的归约。
 
 ### Matrix/Vector 转换
 
@@ -358,6 +364,53 @@ output projection
 `TrainingTransformer::backward` 返回输入梯度，并使用传入 learning rate 更新 Linear
 参数和 position matrix。
 
+## 模型存档
+
+MLP 和 Transformer executor 统一使用两个文件：
+
+```text
+model.toml   版本化模型元数据和参数字节范围
+model.bin    连续 little-endian f32 参数
+```
+
+传入不带扩展名的路径时自动补 `.toml`，显式传入其他扩展名会报错；对应 `.bin` 文件名
+会写进元数据。接口如下：
+
+```rust
+model.dump_to_file("model.toml", &runtime)?;
+
+let linear = Linear::load_from_file("linear.toml", &runtime)?;
+
+let mlp = MlpExecutor::load_from_file("model.toml", &runtime)?;
+let mlp = InferenceMLP::load_from_file("model.toml", &runtime)?;
+let mlp = TrainingMlp::load_from_file("model.toml", &runtime)?;
+
+let model = InferenceTransformer::load_from_file("model.toml", &runtime)?;
+let model = TrainingTransformer::load_from_file("model.toml", &runtime)?;
+```
+
+`Linear`、`MlpExecutor`、两种 MLP 和两种 Transformer 都提供 `dump_to_file` 与
+`load_from_file`。推理版和训练版的持久参数格式完全相同；forward activation cache
+不属于模型参数，不会保存，训练模型加载后的 cache 为空。
+
+TOML 保存以下信息：
+
+- 格式版本、模型类型、标量编码、BIN 文件名和大小；
+- 损失函数和 Transformer block 数量；
+- MLP 层数和可选 residual 范围 `[start,end)`；
+- 每个 Linear 的输入/输出神经元数、activation；
+- Matrix/Vector 形状和参数的 `[byte_start,byte_end)`；
+- Transformer 固定存在的 attention 与 feed-forward residual 连接。
+
+`MlpExecutor::new`、`InferenceMLP::new` 和 `TrainingMlp::new` 默认使用
+`Loss::MeanSquaredError`；需要明确指定要持久化的损失函数时使用 `with_loss`。格式版本
+1 当前只定义均方误差。
+
+dump 直接复用现有 `Matrix::to_host` / `Vector::to_host`。load 根据 TOML 的 byte range
+逐个 `seek + read_exact`，只读取当前参数，再通过 `DeviceBuffer::from_host` 创建显存。
+加载器会先检查格式版本、BIN 大小、范围、tensor 形状、Linear 连接、residual 尺寸和
+Transformer 尺寸。该功能不需要专用 kernel，也没有 Span 传输特例。
+
 ## 同步速查
 
 | 操作 | 行为 |
@@ -366,9 +419,9 @@ output projection
 | Matrix/View 原地元素操作 | 异步提交 |
 | `vector_binary` 及便利封装 | 返回前同步 |
 | `sum/max/map_sum` | 同步，返回 host 标量 |
-| `softmax_rows/layer_norm` | 内部归约同步 |
+| `matrix_sum_rows/softmax_rows/layer_norm` | 单次行并行 kernel，异步提交 |
 | `softmax_rows_backward/layer_norm_backward` | 单次按行 kernel，异步提交 |
-| `binary_assign_by_rows` | extra streams 并行并统一同步 |
+| `binary_assign_by_rows` | 单次全矩阵广播 kernel，异步提交 |
 | `InferenceTransformer::forward` / `TrainingTransformer::forward` | 返回前同步 |
 | `to_host` | host 读取边界 |
 
