@@ -1,6 +1,6 @@
 # OxideForge CUDA Runtime API
 
-本文档对应当前代码。运行时面向固定尺寸、`f32`、row-major Matrix 和 ViT 推理，
+本文档对应当前代码。运行时面向形状明确的神经网络、`f32` 和 row-major Matrix，
 不追求绝对通用性。
 
 ## 设计约定
@@ -298,10 +298,10 @@ let output = mlp.forward(&input, &runtime);
 `InferenceMLP` 只委托 forward；`TrainingMlp` 额外持有 forward activation tape 并委托
 backward。Linear 本身不缓存运行数据。
 
-当前 Transformer FFN 为：
+典型的两层 FFN 可以表示为：
 
 ```text
-768 → 3072（GELU）→ 768（Identity）
+features → hidden（GELU）→ features（Identity）
 ```
 
 Residual range `(start,end)` 表示从第 `start` 层输入到第 `end-1` 层输出的 skip。
@@ -327,15 +327,15 @@ Backward 对 GELU 层按需重算 pre-activation；Identity 层不会重跑 affi
 ### Transformer
 
 ```text
-input                 [1024,768]
-+ position            [1024,768]
-Q/K/V                 [1024,768]
-QKᵀ                   [1024,1024]
-softmax(QKᵀ/√768)     [1024,1024]
-attention             [1024,768]
-residual + LayerNorm  [1024,768]
-MLP + residual + norm [1024,768]
-output projection     [1024,256]
+input                 [sequence,hidden]
++ position            [sequence,hidden]
+Q/K/V                 [sequence,hidden]
+QKᵀ                   [sequence,sequence]
+softmax(QKᵀ/√hidden)  [sequence,sequence]
+attention             [sequence,hidden]
+residual + LayerNorm  [sequence,hidden]
+MLP + residual + norm [sequence,hidden]
+output projection     [sequence,output]
 ```
 
 `InferenceTransformer` 和 `TrainingTransformer` 都采用 Post-LN。训练版本缓存

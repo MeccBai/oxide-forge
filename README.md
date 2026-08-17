@@ -2,8 +2,8 @@
 
 OxideForge 是一个基于
 [CUDA-Oxide](https://nvlabs.github.io/cuda-oxide/index.html) 编写的 Rust/CUDA
-神经网络运行时。它从一个固定尺寸的图像掩码模型起步，但项目的主体已经成为一套独立
-的 GPU 计算、连续内存容器和神经网络执行层。
+神经网络运行时。项目由 GPU 计算、连续内存容器和神经网络执行层组成，为形状明确、
+数据布局可控的模型提供轻量基座。
 
 项目不试图复刻通用张量框架。它面向形状明确、数据布局可控的模型，以手写 CUDA
 kernel 和显式所有权换取可预测的数据流、较低的运行时开销，以及足够贴近硬件的编程
@@ -79,27 +79,6 @@ X ───────────────── residual ── LayerNorm 
 推理层不保存 activation。训练层只保存反向计算所需的数据，并由 MLP 层统一调度 Linear
 参数更新；Linear 自身不持有 tape 或 workspace。
 
-## 第一个使用场景：原尺寸掩码生成
-
-最初的 OCR 需求现在作为 OxideForge 的第一个模型用例存在：将固定 `512×512×3`
-图像切成 `16×16×3` patch，由单头 Transformer 为每个 patch 输出一个
-`16×16` 局部掩码，再按原切分顺序直接拼回整张图像。
-
-```text
-Image                    [512,512,3]
-  → Patchify 16×16×3
-Tokens                   [1024,768]
-  → Position + Transformer + FFN
-Context                  [1024,768]
-  → Output projection 768→256
-Mask patches             [1024,256]
-  → Unpatchify
-Mask                     [512,512]
-```
-
-这个过程不做低分辨率插值：`1024 × 256 = 512 × 512`，输出只是一次布局重排。
-完整的尺寸推导和实现方案见[第一级掩码模型架构](docs/STAGE1_ARCHITECTURE.md)。
-
 ## 环境要求
 
 - 支持 CUDA 的 NVIDIA GPU；
@@ -135,14 +114,14 @@ cargo oxide run --lineinfo
 
 ## 最小示例
 
-下面的示例构造一个 `1024×768` 输入，并通过 Linear 映射为 `1024×256` 输出：
+下面的示例构造一个 `[batch, input_features]` 输入，并通过 Linear 完成特征映射：
 
 ```rust
 let runtime = CudaRuntime::new()?;
 
-let input = runtime.new_matrix(InitType::Random, 1024, 768);
+let input = runtime.new_matrix(InitType::Random, 256, 128);
 let projection = Linear::new(
-    runtime.new_matrix(InitType::Random, 768, 256),
+    runtime.new_matrix(InitType::Random, 128, 64),
     None,
     Activation::Identity,
 );
@@ -150,7 +129,7 @@ let projection = Linear::new(
 let output = projection.forward(&input, None, &runtime);
 runtime.sync();
 
-assert_eq!((output.rows(), output.cols()), (1024, 256));
+assert_eq!((output.rows(), output.cols()), (256, 64));
 ```
 
 项目当前是 binary crate，示例展示的是内部 API 的使用方式；稳定公共 crate 接口不是
