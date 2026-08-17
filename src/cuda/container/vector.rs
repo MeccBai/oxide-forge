@@ -19,6 +19,11 @@ impl Vector {
 }
 
 impl CudaRuntime {
+    /// Consumes a vector and returns its allocation to the runtime pool.
+    pub fn recycle_vector(&self, vector: Vector) {
+        self.recycle_buffer(vector.buffer);
+    }
+
     pub(crate) fn create_vector(&self, buffer: DeviceBuffer<f32>) -> Vector {
         Vector { buffer }
     }
@@ -88,8 +93,7 @@ impl CudaRuntime {
 
     pub fn vector_binary(&self, vec1: &Vector, vec2: &Vector, op: BinaryOp) -> Vector {
         assert_eq!(vec1.buffer.len(), vec2.buffer.len());
-        let mut result_buffer =
-            DeviceBuffer::<f32>::zeroed(&self.stream(), vec1.buffer.len()).unwrap();
+        let mut result_buffer = self.get_uninit_buffer(vec1.buffer.len());
 
         let config = self.get_launch_config(vec1.buffer.len(), DEFAULT_BLOCK_SIZE);
 

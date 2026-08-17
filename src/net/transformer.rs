@@ -45,23 +45,34 @@ impl InferenceTransformer {
         let v = self.v_matrix.forward(&positioned, None, runtime);
 
         let k_t = runtime.matrix_transpose(&k);
+        runtime.recycle_matrix(k);
         let mut scores = runtime.matrix_multiply(&q, &k_t);
+        let attention_scale = 1.0 / (q.cols() as f32).sqrt();
+        runtime.recycle_matrix(q);
+        runtime.recycle_matrix(k_t);
 
-        scores.scale(1.0 / (q.cols() as f32).sqrt(), runtime);
+        scores.scale(attention_scale, runtime);
         scores.softmax_rows(runtime);
 
         let attention = runtime.matrix_multiply(&scores, &v);
+        runtime.recycle_matrix(scores);
+        runtime.recycle_matrix(v);
 
         let mut x = runtime.matrix_add(&positioned, &attention);
+        runtime.recycle_matrix(positioned);
+        runtime.recycle_matrix(attention);
         x.layer_norm(runtime);
 
         let ffn = self.fcs.forward(&x, runtime);
         let mut output = runtime.matrix_add(&x, &ffn);
+        runtime.recycle_matrix(x);
+        runtime.recycle_matrix(ffn);
         output.layer_norm(runtime);
 
-        let output = self.output_matrix.forward(&output, None, runtime);
+        let result = self.output_matrix.forward(&output, None, runtime);
+        runtime.recycle_matrix(output);
         runtime.sync();
-        output
+        result
     }
 
     pub fn dump_to_file<P: AsRef<Path>>(

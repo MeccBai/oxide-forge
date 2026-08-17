@@ -105,6 +105,11 @@ impl Matrix {
 }
 
 impl CudaRuntime {
+    /// Consumes a matrix and returns its allocation to the runtime pool.
+    pub fn recycle_matrix(&self, matrix: Matrix) {
+        self.recycle_buffer(matrix.buffer);
+    }
+
     pub fn matrix_sum_rows(&self, matrix: &Matrix) -> Vector {
         if matrix.rows == 0 {
             return self.create_vector(self.get_uninit_buffer(0));

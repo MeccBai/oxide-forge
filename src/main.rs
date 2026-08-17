@@ -1,6 +1,7 @@
 mod cuda;
 mod net;
 
+use crate::cuda::InitType::Random;
 use crate::net::linear::Activation::{Gelu, Identity};
 use crate::net::linear::Linear;
 use crate::net::mlp::InferenceMLP;
@@ -62,10 +63,25 @@ fn main() {
         output_matrix,
     );
 
-    for i in 0..10 {
+    // InferenceTransformer::forward needs at most five live seq × hidden
+    // workspaces. The other shapes have one live temporary each. The final
+    // seq × output buffer is owned by the caller and recycled below only after
+    // it is no longer needed.
+    runtime.reserve_buffers(1024 * 768, 5);
+    runtime.reserve_buffers(1024 * 1024, 1);
+    runtime.reserve_buffers(1024 * 3072, 1);
+    runtime.reserve_buffers(1024 * 256, 1);
+    runtime.sync();
+
+    let mut average = std::time::Duration::ZERO;
+
+    for _ in 0..100 {
         let time_now = std::time::Instant::now();
         let output = transformer.forward(&input, &runtime);
         let time_duration = time_now.elapsed();
+        average += time_duration;
         println!("Time taken: {:?}", time_duration);
+        runtime.recycle_matrix(output);
     }
+    println!("Average time taken: {:?}", average / 100);
 }

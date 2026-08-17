@@ -46,14 +46,28 @@ impl MlpExecutor {
             if self.res_range.is_some_and(|(start, _)| index == start) {
                 residual_cache = Some(runtime.matrix_copy(layer_input));
             }
-            let residual = if self.res_range.is_some_and(|(_, end)| index + 1 == end) {
+            let consumes_residual = self.res_range.is_some_and(|(_, end)| index + 1 == end);
+            let residual = if consumes_residual {
                 residual_cache.as_ref()
             } else {
                 None
             };
-            output = Some(layer.forward(layer_input, residual, runtime));
+            let next = layer.forward(layer_input, residual, runtime);
+
+            if let Some(previous) = output.take() {
+                runtime.recycle_matrix(previous);
+            }
+            if consumes_residual {
+                runtime.recycle_matrix(
+                    residual_cache
+                        .take()
+                        .expect("residual cache missing at the end of its range"),
+                );
+            }
+            output = Some(next);
         }
 
+        debug_assert!(residual_cache.is_none());
         output.unwrap()
     }
 

@@ -1,5 +1,7 @@
 use crate::cuda::{DeviceSpan, kernels};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D, memory};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub enum InitType {
@@ -26,6 +28,7 @@ pub struct CudaRuntime {
     #[allow(dead_code)]
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
+    buffer_pool: RefCell<HashMap<usize, Vec<DeviceBuffer<f32>>>>,
 }
 
 impl CudaRuntime {
@@ -38,17 +41,77 @@ impl CudaRuntime {
             module,
             ctx,
             stream,
+            buffer_pool: RefCell::new(HashMap::new()),
         })
     }
 
     pub fn get_uninit_buffer(&self, size: usize) -> DeviceBuffer<f32> {
+        if size > 0
+            && let Some(buffer) = self
+                .buffer_pool
+                .borrow_mut()
+                .get_mut(&size)
+                .and_then(Vec::pop)
+        {
+            return buffer;
+        }
+
+        self.allocate_uninit_buffer(size)
+    }
+
+    fn allocate_uninit_buffer(&self, size: usize) -> DeviceBuffer<f32> {
         let buffer = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, size) };
         buffer.unwrap()
     }
 
     pub fn get_zerod_buffer(&self, size: usize) -> DeviceBuffer<f32> {
-        let buffer = DeviceBuffer::<f32>::zeroed(&self.stream, size);
-        buffer.unwrap()
+        let mut buffer = self.get_uninit_buffer(size);
+        buffer.zero_async(&self.stream).unwrap();
+        buffer
+    }
+
+    /// Ensures that at least `count` buffers of exactly `size` elements are
+    /// immediately available from the runtime pool.
+    pub fn reserve_buffers(&self, size: usize, count: usize) {
+        if size == 0 {
+            return;
+        }
+
+        let available = self.buffer_pool.borrow().get(&size).map_or(0, Vec::len);
+        let missing = count.saturating_sub(available);
+        if missing == 0 {
+            return;
+        }
+
+        let mut buffers = Vec::with_capacity(missing);
+        for _ in 0..missing {
+            buffers.push(self.allocate_uninit_buffer(size));
+        }
+        self.buffer_pool
+            .borrow_mut()
+            .entry(size)
+            .or_default()
+            .extend(buffers);
+    }
+
+    /// Returns a buffer to the exact-size pool without invoking its `Drop`.
+    ///
+    /// All pending uses must be ordered on this runtime's stream. The current
+    /// container API satisfies that contract because its kernels are launched
+    /// on this stream.
+    pub fn recycle_buffer(&self, buffer: DeviceBuffer<f32>) {
+        if buffer.is_empty() {
+            return;
+        }
+        assert!(
+            Arc::ptr_eq(buffer.context(), &self.ctx),
+            "cannot recycle a buffer owned by another CUDA context"
+        );
+        self.buffer_pool
+            .borrow_mut()
+            .entry(buffer.len())
+            .or_default()
+            .push(buffer);
     }
 
     pub fn sync(&self) {

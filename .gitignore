@@ -11,3 +11,4 @@
 **/*.target
 /docs/impl
 .idea
+/scripts

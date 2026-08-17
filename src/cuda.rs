@@ -1,5 +1,7 @@
 use cuda_device::{
-    DisjointSlice, convert, kernel, launch_bounds, launch_contract, shared, thread, warp, wmma,
+    DisjointSlice,
+    async_copy::{cp_async_ca_zfill_4, cp_async_commit_group, cp_async_wait_group},
+    convert, kernel, launch_bounds, launch_contract, shared, thread, warp, wmma,
 };
 use cuda_host::cuda_module;
 
@@ -637,8 +639,9 @@ mod kernels {
     const MATMUL_THREAD_TILE_SIZE: usize = 16;
     const MATMUL_SHARED_SIZE: usize = MATMUL_TILE_SIZE * MATMUL_TILE_SIZE;
     const TENSOR_K_TILE_SIZE: usize = 16;
-    const TENSOR_SHARED_STRIDE: usize = TENSOR_K_TILE_SIZE + 1;
-    const TENSOR_SHARED_SIZE: usize = MATMUL_TILE_SIZE * TENSOR_SHARED_STRIDE;
+    const TENSOR_SHARED_STRIDE: usize = 20;
+    const TENSOR_SHARED_STAGE_SIZE: usize = MATMUL_TILE_SIZE * TENSOR_SHARED_STRIDE;
+    const TENSOR_SHARED_SIZE: usize = TENSOR_SHARED_STAGE_SIZE * 2;
     const TRANSPOSE_TILE_SIZE: usize = 16;
     const TRANSPOSE_STRIDE: usize = TRANSPOSE_TILE_SIZE + 1;
     const TRANSPOSE_SHARED_SIZE: usize = TRANSPOSE_TILE_SIZE * TRANSPOSE_STRIDE;
@@ -763,6 +766,79 @@ mod kernels {
         }
     }
 
+    #[inline(always)]
+    unsafe fn prefetch_tensor_tile(
+        matrix1: span::DeviceSliceDescriptor<f32>,
+        matrix2: span::DeviceSliceDescriptor<f32>,
+        shared_matrix1: *mut f32,
+        shared_matrix2: *mut f32,
+        shared_base: usize,
+        tile_k: usize,
+        block_row: usize,
+        block_col: usize,
+        tid: usize,
+        len: usize,
+        rows: usize,
+        cols: usize,
+    ) {
+        for load in 0..4 {
+            let logical_index = tid + load * 128;
+
+            let local_row = logical_index / TENSOR_K_TILE_SIZE;
+            let local_k = logical_index % TENSOR_K_TILE_SIZE;
+            let global_row = block_row + local_row;
+            let a_valid = global_row < rows;
+            let a_source = if a_valid {
+                unsafe {
+                    matrix1
+                        .ptr
+                        .add(global_row * len + tile_k + local_k)
+                        .cast::<u8>()
+                }
+            } else {
+                matrix1.ptr.cast::<u8>()
+            };
+            let a_destination = unsafe {
+                shared_matrix1.add(shared_base + local_row * TENSOR_SHARED_STRIDE + local_k)
+            };
+            unsafe {
+                cp_async_ca_zfill_4(
+                    a_destination.cast::<u32>(),
+                    a_source,
+                    if a_valid { 4 } else { 0 },
+                );
+            }
+
+            // Each warp reads one complete global B row. The individual async
+            // copies transpose that row into the column-major shared layout
+            // consumed by mma.sync.
+            let local_k = logical_index / MATMUL_TILE_SIZE;
+            let local_col = logical_index % MATMUL_TILE_SIZE;
+            let global_col = block_col + local_col;
+            let b_valid = global_col < cols;
+            let b_source = if b_valid {
+                unsafe {
+                    matrix2
+                        .ptr
+                        .add((tile_k + local_k) * cols + global_col)
+                        .cast::<u8>()
+                }
+            } else {
+                matrix2.ptr.cast::<u8>()
+            };
+            let b_destination = unsafe {
+                shared_matrix2.add(shared_base + local_col * TENSOR_SHARED_STRIDE + local_k)
+            };
+            unsafe {
+                cp_async_ca_zfill_4(
+                    b_destination.cast::<u32>(),
+                    b_source,
+                    if b_valid { 4 } else { 0 },
+                );
+            }
+        }
+    }
+
     #[kernel]
     #[launch_bounds(128)]
     #[launch_contract(domain = 2, block = (128, 1, 1))]
@@ -793,39 +869,54 @@ mod kernels {
         let mut accumulator0 = [0.0f32; 4];
         let mut accumulator1 = [0.0f32; 4];
 
-        for tile in 0..len / TENSOR_K_TILE_SIZE {
-            let tile_k = tile * TENSOR_K_TILE_SIZE;
+        let shared_matrix1 = core::ptr::addr_of_mut!(SHARED_MATRIX1) as *mut f32;
+        let shared_matrix2 = core::ptr::addr_of_mut!(SHARED_MATRIX2) as *mut f32;
+        let tile_count = len / TENSOR_K_TILE_SIZE;
 
-            for load in 0..4 {
-                let logical_index = tid + load * 128;
-                let local_row = logical_index / TENSOR_K_TILE_SIZE;
-                let local_k = logical_index % TENSOR_K_TILE_SIZE;
-                let global_row = block_row + local_row;
-                let global_col = block_col + local_row;
+        unsafe {
+            prefetch_tensor_tile(
+                matrix1,
+                matrix2,
+                shared_matrix1,
+                shared_matrix2,
+                0,
+                0,
+                block_row,
+                block_col,
+                tid,
+                len,
+                rows,
+                cols,
+            );
+            cp_async_commit_group();
+            cp_async_wait_group(0);
+        }
+        thread::sync_threads();
 
+        for tile in 0..tile_count {
+            let read_base = (tile % 2) * TENSOR_SHARED_STAGE_SIZE;
+
+            if tile + 1 < tile_count {
+                let next_tile = tile + 1;
+                let write_base = (next_tile % 2) * TENSOR_SHARED_STAGE_SIZE;
                 unsafe {
-                    SHARED_MATRIX1[local_row * TENSOR_SHARED_STRIDE + local_k] =
-                        if global_row < rows {
-                            matrix1.ptr.add(global_row * len + tile_k + local_k).read()
-                        } else {
-                            0.0
-                        };
-
-                    // B is transposed only inside the shared tile. This gives
-                    // mma.sync its required column-major B fragments without
-                    // materializing a second global matrix.
-                    SHARED_MATRIX2[local_row * TENSOR_SHARED_STRIDE + local_k] =
-                        if global_col < cols {
-                            matrix2
-                                .ptr
-                                .add((tile_k + local_k) * cols + global_col)
-                                .read()
-                        } else {
-                            0.0
-                        };
+                    prefetch_tensor_tile(
+                        matrix1,
+                        matrix2,
+                        shared_matrix1,
+                        shared_matrix2,
+                        write_base,
+                        next_tile * TENSOR_K_TILE_SIZE,
+                        block_row,
+                        block_col,
+                        tid,
+                        len,
+                        rows,
+                        cols,
+                    );
+                    cp_async_commit_group();
                 }
             }
-            thread::sync_threads();
 
             for k_half in 0..2 {
                 let local_k = k_half * 8;
@@ -835,23 +926,27 @@ mod kernels {
                 let a = unsafe {
                     [
                         convert::cvt_rna_tf32_f32(
-                            SHARED_MATRIX1[(a_row_base + group) * TENSOR_SHARED_STRIDE
+                            SHARED_MATRIX1[read_base
+                                + (a_row_base + group) * TENSOR_SHARED_STRIDE
                                 + local_k
                                 + thread_in_group],
                         ),
                         convert::cvt_rna_tf32_f32(
-                            SHARED_MATRIX1[(a_row_base + group + 8) * TENSOR_SHARED_STRIDE
+                            SHARED_MATRIX1[read_base
+                                + (a_row_base + group + 8) * TENSOR_SHARED_STRIDE
                                 + local_k
                                 + thread_in_group],
                         ),
                         convert::cvt_rna_tf32_f32(
-                            SHARED_MATRIX1[(a_row_base + group) * TENSOR_SHARED_STRIDE
+                            SHARED_MATRIX1[read_base
+                                + (a_row_base + group) * TENSOR_SHARED_STRIDE
                                 + local_k
                                 + thread_in_group
                                 + 4],
                         ),
                         convert::cvt_rna_tf32_f32(
-                            SHARED_MATRIX1[(a_row_base + group + 8) * TENSOR_SHARED_STRIDE
+                            SHARED_MATRIX1[read_base
+                                + (a_row_base + group + 8) * TENSOR_SHARED_STRIDE
                                 + local_k
                                 + thread_in_group
                                 + 4],
@@ -862,12 +957,14 @@ mod kernels {
                 let b0 = unsafe {
                     [
                         convert::cvt_rna_tf32_f32(
-                            SHARED_MATRIX2[(b_col_base + group) * TENSOR_SHARED_STRIDE
+                            SHARED_MATRIX2[read_base
+                                + (b_col_base + group) * TENSOR_SHARED_STRIDE
                                 + local_k
                                 + thread_in_group],
                         ),
                         convert::cvt_rna_tf32_f32(
-                            SHARED_MATRIX2[(b_col_base + group) * TENSOR_SHARED_STRIDE
+                            SHARED_MATRIX2[read_base
+                                + (b_col_base + group) * TENSOR_SHARED_STRIDE
                                 + local_k
                                 + thread_in_group
                                 + 4],
@@ -877,12 +974,14 @@ mod kernels {
                 let b1 = unsafe {
                     [
                         convert::cvt_rna_tf32_f32(
-                            SHARED_MATRIX2[(b_col_base + group + 8) * TENSOR_SHARED_STRIDE
+                            SHARED_MATRIX2[read_base
+                                + (b_col_base + group + 8) * TENSOR_SHARED_STRIDE
                                 + local_k
                                 + thread_in_group],
                         ),
                         convert::cvt_rna_tf32_f32(
-                            SHARED_MATRIX2[(b_col_base + group + 8) * TENSOR_SHARED_STRIDE
+                            SHARED_MATRIX2[read_base
+                                + (b_col_base + group + 8) * TENSOR_SHARED_STRIDE
                                 + local_k
                                 + thread_in_group
                                 + 4],
@@ -896,7 +995,10 @@ mod kernels {
                 }
             }
 
-            thread::sync_threads();
+            if tile + 1 < tile_count {
+                unsafe { cp_async_wait_group(0) };
+                thread::sync_threads();
+            }
         }
 
         for register in 0..4 {
