@@ -180,7 +180,9 @@ synchronization, and network-layer reference.
 
 - `f32` only;
 - contiguous row-major matrices only; no stride support;
-- matrix M/K/N dimensions must currently be multiples of 16;
+- matrix multiplication uses Tensor Core TF32 products with `f32` accumulation
+  and output, requires SM80+, and currently requires M/K/N dimensions to be
+  multiples of 16;
 - row Softmax and LayerNorm backward currently support at most 1024 elements per
   row;
 - the current Transformer is single-head and Post-LN;

@@ -137,12 +137,16 @@ kernel launch.
 
 | API | Constraint | Output shape |
 | --- | --- | --- |
-| `matrix_multiply(a, b)` | `a.cols == b.rows`; M/K/N must currently be multiples of 16 | `[a.rows, b.cols]` |
+| `matrix_multiply(a, b)` | `a.cols == b.rows`; SM80+; M/K/N must currently be multiples of 16 | `[a.rows, b.cols]` |
 | `matrix_add(a, b)` | Identical shapes | Input shape |
 | `matrix_transpose(a)` | No additional shape constraint | `[a.cols, a.rows]` |
 | `matrix_sum_rows(a)` | At most 1024 columns | Vector with `a.rows` elements |
 | `softmax_rows_backward(p, dy)` | Identical shapes; at most 1024 columns | `dScores`, same shape |
 | `layer_norm_backward(x, dy)` | Identical shapes; at most 1024 columns | `dX`, same shape |
+
+`matrix_multiply` uses Tensor Core TF32 products with `f32` accumulation and
+output. This trades a small amount of input-mantissa precision for substantially
+higher throughput; it is not a strict IEEE FP32 GEMM.
 
 These operations submit work to the primary stream asynchronously. A later
 kernel on the same stream may consume the returned Matrix without an explicit

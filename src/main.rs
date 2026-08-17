@@ -62,12 +62,10 @@ fn main() {
         output_matrix,
     );
 
-    let time_now = std::time::Instant::now();
-
-    let output = transformer.forward(&input, &runtime);
-
-    let time_duration = time_now.elapsed();
-
-    println!("[{}:{}]", output.rows(), output.cols());
-    println!("Time taken: {:?}", time_duration);
+    for i in 0..10 {
+        let time_now = std::time::Instant::now();
+        let output = transformer.forward(&input, &runtime);
+        let time_duration = time_now.elapsed();
+        println!("Time taken: {:?}", time_duration);
+    }
 }

@@ -1,4 +1,6 @@
-use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, shared, thread, warp};
+use cuda_device::{
+    DisjointSlice, convert, kernel, launch_bounds, launch_contract, shared, thread, warp, wmma,
+};
 use cuda_host::cuda_module;
 
 const DEFAULT_BLOCK_SIZE: usize = 1024;
@@ -631,18 +633,23 @@ mod kernels {
         }
     }
 
-    const TILE_SIZE: usize = 16;
-    const SHARED_SIZE: usize = TILE_SIZE * TILE_SIZE;
-    const TRANSPOSE_STRIDE: usize = TILE_SIZE + 1;
-    const TRANSPOSE_SHARED_SIZE: usize = TILE_SIZE * TRANSPOSE_STRIDE;
+    const MATMUL_TILE_SIZE: usize = 32;
+    const MATMUL_THREAD_TILE_SIZE: usize = 16;
+    const MATMUL_SHARED_SIZE: usize = MATMUL_TILE_SIZE * MATMUL_TILE_SIZE;
+    const TENSOR_K_TILE_SIZE: usize = 16;
+    const TENSOR_SHARED_STRIDE: usize = TENSOR_K_TILE_SIZE + 1;
+    const TENSOR_SHARED_SIZE: usize = MATMUL_TILE_SIZE * TENSOR_SHARED_STRIDE;
+    const TRANSPOSE_TILE_SIZE: usize = 16;
+    const TRANSPOSE_STRIDE: usize = TRANSPOSE_TILE_SIZE + 1;
+    const TRANSPOSE_SHARED_SIZE: usize = TRANSPOSE_TILE_SIZE * TRANSPOSE_STRIDE;
 
     #[kernel]
-    #[launch_bounds(256)] // 16 × 16 = 256 threads
+    #[launch_bounds(256)]
     #[launch_contract(domain = 2, block = (16, 16, 1))]
-    pub fn matrix_multiply(
-        matrix1: &[f32],
-        matrix2: &[f32],
-        mut result: DisjointSlice<f32, thread::Runtime2DIndex>,
+    pub fn matrix_multiply_fp32(
+        matrix1: span::DeviceSliceDescriptor<f32>,
+        matrix2: span::DeviceSliceDescriptor<f32>,
+        result: span::DeviceSliceMutDescriptor<f32>,
         len: usize,
         rows: usize,
         cols: usize,
@@ -650,36 +657,264 @@ mod kernels {
         let tx = thread::threadIdx_x() as usize;
         let ty = thread::threadIdx_y() as usize;
 
-        let c_row = thread::blockIdx_y() as usize * TILE_SIZE + ty;
-        let c_col = thread::blockIdx_x() as usize * TILE_SIZE + tx;
+        let row0 = thread::blockIdx_y() as usize * MATMUL_TILE_SIZE + ty;
+        let row1 = row0 + MATMUL_THREAD_TILE_SIZE;
+        let col0 = thread::blockIdx_x() as usize * MATMUL_TILE_SIZE + tx;
+        let col1 = col0 + MATMUL_THREAD_TILE_SIZE;
 
-        static mut SHARED_MATRIX1: shared::SharedArray<f32, SHARED_SIZE> =
+        static mut SHARED_MATRIX1: shared::SharedArray<f32, MATMUL_SHARED_SIZE> =
             shared::SharedArray::UNINIT;
-        static mut SHARED_MATRIX2: shared::SharedArray<f32, SHARED_SIZE> =
+        static mut SHARED_MATRIX2: shared::SharedArray<f32, MATMUL_SHARED_SIZE> =
             shared::SharedArray::UNINIT;
 
-        let mut sum = 0.0;
+        let mut sum00 = 0.0;
+        let mut sum01 = 0.0;
+        let mut sum10 = 0.0;
+        let mut sum11 = 0.0;
 
-        for t in 0..len / TILE_SIZE {
+        for tile in 0..len.div_ceil(MATMUL_TILE_SIZE) {
+            let k0 = tile * MATMUL_TILE_SIZE + tx;
+            let k1 = k0 + MATMUL_THREAD_TILE_SIZE;
+            let b_row0 = tile * MATMUL_TILE_SIZE + ty;
+            let b_row1 = b_row0 + MATMUL_THREAD_TILE_SIZE;
+
             unsafe {
-                SHARED_MATRIX1[ty * TILE_SIZE + tx] = matrix1[c_row * len + t * TILE_SIZE + tx];
-                SHARED_MATRIX2[ty * TILE_SIZE + tx] = matrix2[(t * TILE_SIZE + ty) * cols + c_col];
+                SHARED_MATRIX1[ty * MATMUL_TILE_SIZE + tx] = if row0 < rows && k0 < len {
+                    matrix1.ptr.add(row0 * len + k0).read()
+                } else {
+                    0.0
+                };
+                SHARED_MATRIX1[ty * MATMUL_TILE_SIZE + tx + MATMUL_THREAD_TILE_SIZE] =
+                    if row0 < rows && k1 < len {
+                        matrix1.ptr.add(row0 * len + k1).read()
+                    } else {
+                        0.0
+                    };
+                SHARED_MATRIX1[(ty + MATMUL_THREAD_TILE_SIZE) * MATMUL_TILE_SIZE + tx] =
+                    if row1 < rows && k0 < len {
+                        matrix1.ptr.add(row1 * len + k0).read()
+                    } else {
+                        0.0
+                    };
+                SHARED_MATRIX1[(ty + MATMUL_THREAD_TILE_SIZE) * MATMUL_TILE_SIZE
+                    + tx
+                    + MATMUL_THREAD_TILE_SIZE] = if row1 < rows && k1 < len {
+                    matrix1.ptr.add(row1 * len + k1).read()
+                } else {
+                    0.0
+                };
+
+                SHARED_MATRIX2[ty * MATMUL_TILE_SIZE + tx] = if b_row0 < len && col0 < cols {
+                    matrix2.ptr.add(b_row0 * cols + col0).read()
+                } else {
+                    0.0
+                };
+                SHARED_MATRIX2[ty * MATMUL_TILE_SIZE + tx + MATMUL_THREAD_TILE_SIZE] =
+                    if b_row0 < len && col1 < cols {
+                        matrix2.ptr.add(b_row0 * cols + col1).read()
+                    } else {
+                        0.0
+                    };
+                SHARED_MATRIX2[(ty + MATMUL_THREAD_TILE_SIZE) * MATMUL_TILE_SIZE + tx] =
+                    if b_row1 < len && col0 < cols {
+                        matrix2.ptr.add(b_row1 * cols + col0).read()
+                    } else {
+                        0.0
+                    };
+                SHARED_MATRIX2[(ty + MATMUL_THREAD_TILE_SIZE) * MATMUL_TILE_SIZE
+                    + tx
+                    + MATMUL_THREAD_TILE_SIZE] = if b_row1 < len && col1 < cols {
+                    matrix2.ptr.add(b_row1 * cols + col1).read()
+                } else {
+                    0.0
+                };
             }
             thread::sync_threads();
 
-            for k in 0..TILE_SIZE {
+            for k in 0..MATMUL_TILE_SIZE {
                 unsafe {
-                    sum += SHARED_MATRIX1[ty * TILE_SIZE + k] * SHARED_MATRIX2[k * TILE_SIZE + tx];
+                    let a0 = SHARED_MATRIX1[ty * MATMUL_TILE_SIZE + k];
+                    let a1 = SHARED_MATRIX1[(ty + MATMUL_THREAD_TILE_SIZE) * MATMUL_TILE_SIZE + k];
+                    let b0 = SHARED_MATRIX2[k * MATMUL_TILE_SIZE + tx];
+                    let b1 = SHARED_MATRIX2[k * MATMUL_TILE_SIZE + tx + MATMUL_THREAD_TILE_SIZE];
+                    sum00 += a0 * b0;
+                    sum01 += a0 * b1;
+                    sum10 += a1 * b0;
+                    sum11 += a1 * b1;
                 }
             }
 
             thread::sync_threads();
         }
 
-        if c_row < rows {
-            if let Some(c_index) = thread::index_2d_runtime(&result) {
-                if let Some(element) = result.get_mut(c_index) {
-                    *element = sum;
+        unsafe {
+            if row0 < rows && col0 < cols {
+                result.ptr.add(row0 * cols + col0).write(sum00);
+            }
+            if row0 < rows && col1 < cols {
+                result.ptr.add(row0 * cols + col1).write(sum01);
+            }
+            if row1 < rows && col0 < cols {
+                result.ptr.add(row1 * cols + col0).write(sum10);
+            }
+            if row1 < rows && col1 < cols {
+                result.ptr.add(row1 * cols + col1).write(sum11);
+            }
+        }
+    }
+
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(domain = 2, block = (128, 1, 1))]
+    pub fn matrix_multiply(
+        matrix1: span::DeviceSliceDescriptor<f32>,
+        matrix2: span::DeviceSliceDescriptor<f32>,
+        result: span::DeviceSliceMutDescriptor<f32>,
+        len: usize,
+        rows: usize,
+        cols: usize,
+    ) {
+        static mut SHARED_MATRIX1: shared::SharedArray<f32, TENSOR_SHARED_SIZE> =
+            shared::SharedArray::UNINIT;
+        static mut SHARED_MATRIX2: shared::SharedArray<f32, TENSOR_SHARED_SIZE> =
+            shared::SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        let warp_id = tid / 32;
+        let lane = tid % 32;
+        let group = lane / 4;
+        let thread_in_group = lane % 4;
+        let warp_row = warp_id / 2;
+        let warp_col = warp_id % 2;
+
+        let block_row = thread::blockIdx_y() as usize * MATMUL_TILE_SIZE;
+        let block_col = thread::blockIdx_x() as usize * MATMUL_TILE_SIZE;
+
+        let mut accumulator0 = [0.0f32; 4];
+        let mut accumulator1 = [0.0f32; 4];
+
+        for tile in 0..len / TENSOR_K_TILE_SIZE {
+            let tile_k = tile * TENSOR_K_TILE_SIZE;
+
+            for load in 0..4 {
+                let logical_index = tid + load * 128;
+                let local_row = logical_index / TENSOR_K_TILE_SIZE;
+                let local_k = logical_index % TENSOR_K_TILE_SIZE;
+                let global_row = block_row + local_row;
+                let global_col = block_col + local_row;
+
+                unsafe {
+                    SHARED_MATRIX1[local_row * TENSOR_SHARED_STRIDE + local_k] =
+                        if global_row < rows {
+                            matrix1.ptr.add(global_row * len + tile_k + local_k).read()
+                        } else {
+                            0.0
+                        };
+
+                    // B is transposed only inside the shared tile. This gives
+                    // mma.sync its required column-major B fragments without
+                    // materializing a second global matrix.
+                    SHARED_MATRIX2[local_row * TENSOR_SHARED_STRIDE + local_k] =
+                        if global_col < cols {
+                            matrix2
+                                .ptr
+                                .add((tile_k + local_k) * cols + global_col)
+                                .read()
+                        } else {
+                            0.0
+                        };
+                }
+            }
+            thread::sync_threads();
+
+            for k_half in 0..2 {
+                let local_k = k_half * 8;
+                let a_row_base = warp_row * 16;
+                let b_col_base = warp_col * 16;
+
+                let a = unsafe {
+                    [
+                        convert::cvt_rna_tf32_f32(
+                            SHARED_MATRIX1[(a_row_base + group) * TENSOR_SHARED_STRIDE
+                                + local_k
+                                + thread_in_group],
+                        ),
+                        convert::cvt_rna_tf32_f32(
+                            SHARED_MATRIX1[(a_row_base + group + 8) * TENSOR_SHARED_STRIDE
+                                + local_k
+                                + thread_in_group],
+                        ),
+                        convert::cvt_rna_tf32_f32(
+                            SHARED_MATRIX1[(a_row_base + group) * TENSOR_SHARED_STRIDE
+                                + local_k
+                                + thread_in_group
+                                + 4],
+                        ),
+                        convert::cvt_rna_tf32_f32(
+                            SHARED_MATRIX1[(a_row_base + group + 8) * TENSOR_SHARED_STRIDE
+                                + local_k
+                                + thread_in_group
+                                + 4],
+                        ),
+                    ]
+                };
+
+                let b0 = unsafe {
+                    [
+                        convert::cvt_rna_tf32_f32(
+                            SHARED_MATRIX2[(b_col_base + group) * TENSOR_SHARED_STRIDE
+                                + local_k
+                                + thread_in_group],
+                        ),
+                        convert::cvt_rna_tf32_f32(
+                            SHARED_MATRIX2[(b_col_base + group) * TENSOR_SHARED_STRIDE
+                                + local_k
+                                + thread_in_group
+                                + 4],
+                        ),
+                    ]
+                };
+                let b1 = unsafe {
+                    [
+                        convert::cvt_rna_tf32_f32(
+                            SHARED_MATRIX2[(b_col_base + group + 8) * TENSOR_SHARED_STRIDE
+                                + local_k
+                                + thread_in_group],
+                        ),
+                        convert::cvt_rna_tf32_f32(
+                            SHARED_MATRIX2[(b_col_base + group + 8) * TENSOR_SHARED_STRIDE
+                                + local_k
+                                + thread_in_group
+                                + 4],
+                        ),
+                    ]
+                };
+
+                unsafe {
+                    accumulator0 = wmma::mma_m16n8k8_f32_tf32(accumulator0, a, b0);
+                    accumulator1 = wmma::mma_m16n8k8_f32_tf32(accumulator1, a, b1);
+                }
+            }
+
+            thread::sync_threads();
+        }
+
+        for register in 0..4 {
+            let output_row = block_row + warp_row * 16 + group + if register >= 2 { 8 } else { 0 };
+            let output_col = block_col + warp_col * 16 + thread_in_group * 2 + register % 2;
+
+            unsafe {
+                if output_row < rows && output_col < cols {
+                    result
+                        .ptr
+                        .add(output_row * cols + output_col)
+                        .write(accumulator0[register]);
+                }
+                if output_row < rows && output_col + 8 < cols {
+                    result
+                        .ptr
+                        .add(output_row * cols + output_col + 8)
+                        .write(accumulator1[register]);
                 }
             }
         }
@@ -696,8 +931,8 @@ mod kernels {
     ) {
         let tx = thread::threadIdx_x() as usize;
         let ty = thread::threadIdx_y() as usize;
-        let input_row = thread::blockIdx_y() as usize * TILE_SIZE + ty;
-        let input_col = thread::blockIdx_x() as usize * TILE_SIZE + tx;
+        let input_row = thread::blockIdx_y() as usize * TRANSPOSE_TILE_SIZE + ty;
+        let input_col = thread::blockIdx_x() as usize * TRANSPOSE_TILE_SIZE + tx;
 
         static mut TILE: shared::SharedArray<f32, TRANSPOSE_SHARED_SIZE> =
             shared::SharedArray::UNINIT;
@@ -713,8 +948,8 @@ mod kernels {
 
         thread::sync_threads();
 
-        let output_row = thread::blockIdx_x() as usize * TILE_SIZE + ty;
-        let output_col = thread::blockIdx_y() as usize * TILE_SIZE + tx;
+        let output_row = thread::blockIdx_x() as usize * TRANSPOSE_TILE_SIZE + ty;
+        let output_col = thread::blockIdx_y() as usize * TRANSPOSE_TILE_SIZE + tx;
 
         if output_row < input_cols && output_col < input_rows {
             let output_index = output_row * input_rows + output_col;

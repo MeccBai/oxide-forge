@@ -51,20 +51,29 @@ impl CudaRuntime {
 
         let mut result_buffer = self.get_uninit_buffer(rows * cols);
 
-        let block = (16u32, 16u32);
+        const TILE_SIZE: usize = 32;
+        const BLOCK_SIZE: u32 = 128;
+        let block = (BLOCK_SIZE, 1);
 
-        let grid = (cols.div_ceil(16) as u32, rows.div_ceil(16) as u32);
+        let grid = (
+            cols.div_ceil(TILE_SIZE) as u32,
+            rows.div_ceil(TILE_SIZE) as u32,
+        );
 
         let config = LaunchConfig2D::new(grid, block, 0);
         let prepared = self.module().prepare_matrix_multiply(config).unwrap();
+
+        let lhs = DeviceSpan::from_buffer(&mat1.buffer, 0, mat1.buffer.len());
+        let rhs = DeviceSpan::from_buffer(&mat2.buffer, 0, mat2.buffer.len());
+        let result = DeviceSpanMut::from_buffer(&mut result_buffer, 0, rows * cols);
 
         self.module()
             .matrix_multiply(
                 self.stream(),
                 &prepared,
-                &mat1.buffer,
-                &mat2.buffer,
-                cuda_host::RowWidth::new(&mut result_buffer, cols as u32),
+                lhs.descriptor(),
+                rhs.descriptor(),
+                result.descriptor(),
                 len,
                 rows,
                 cols,

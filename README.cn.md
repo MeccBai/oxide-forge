@@ -165,7 +165,8 @@ src/
 
 - 仅支持 `f32`；
 - 仅支持连续 row-major Matrix，不支持 stride；
-- 当前矩阵乘法要求 M/K/N 为 16 的倍数；
+- 当前矩阵乘法使用 Tensor Core TF32 乘法、`f32` 累加和输出，要求 SM80+，且
+  M/K/N 均须为 16 的倍数；
 - 当前 row Softmax 和 LayerNorm backward 每行最多 1024 个元素；
 - 当前 Transformer 是单头 Post-LN 结构；
 - 当前参数更新为直接 SGD，不包含通用 optimizer；

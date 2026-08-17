@@ -128,12 +128,15 @@ launch 共享的 host 枚举参数，warp 内不会因不同元素选择不同�
 
 | API | 约束 | 输出 |
 | --- | --- | --- |
-| `matrix_multiply(a,b)` | `a.cols == b.rows`，当前 M/K/N 均须为 16 的倍数 | `[a.rows,b.cols]` |
+| `matrix_multiply(a,b)` | `a.cols == b.rows`，要求 SM80+，当前 M/K/N 均须为 16 的倍数 | `[a.rows,b.cols]` |
 | `matrix_add(a,b)` | 形状完全一致 | 输入形状 |
 | `matrix_transpose(a)` | 无额外尺寸约束 | `[a.cols,a.rows]` |
 | `matrix_sum_rows(a)` | 列数不超过 1024 | 长度为 `a.rows` 的 Vector |
 | `softmax_rows_backward(p,dy)` | 两者同形且列数不超过 1024 | `dScores` |
 | `layer_norm_backward(x,dy)` | 两者同形且列数不超过 1024 | `dX` |
+
+`matrix_multiply` 使用 Tensor Core TF32 乘法，并以 `f32` 累加和输出。它用少量输入尾数
+精度换取显著吞吐提升，因此不是严格的 IEEE FP32 GEMM。
 
 三者向主 stream 异步提交。后续同 stream kernel 可以立即使用返回 Matrix，无需手动
 插入同步。
