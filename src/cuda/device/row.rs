@@ -15,8 +15,8 @@ pub(super) fn matrix_sum_rows_device(
     let warp_id = tid / 32;
     let row = thread::blockIdx_x() as usize;
     let index = row * cols + tid;
-    let mut value = if tid < cols && index < matrix.len {
-        unsafe { matrix.ptr.add(index).read() }
+    let mut value = if tid < cols && index < matrix.len() {
+        matrix.read(index)
     } else {
         0.0
     };
@@ -36,8 +36,8 @@ pub(super) fn matrix_sum_rows_device(
         }
     }
 
-    if tid == 0 && row < result.len {
-        unsafe { result.ptr.add(row).write(value) };
+    if tid == 0 && row < result.len() {
+        result.write(row, value);
     }
 }
 
@@ -49,12 +49,8 @@ pub(super) fn matrix_softmax_rows_device(matrix: span::DeviceSliceMutDescriptor<
     let lane = tid % 32;
     let warp_id = tid / 32;
     let index = thread::blockIdx_x() as usize * cols + tid;
-    let active = tid < cols && index < matrix.len;
-    let x = if active {
-        unsafe { matrix.ptr.add(index).read() }
-    } else {
-        f32::MIN
-    };
+    let active = tid < cols && index < matrix.len();
+    let x = if active { matrix.read(index) } else { f32::MIN };
 
     let mut value = x;
     for delta in [1, 2, 4, 8, 16] {
@@ -101,7 +97,7 @@ pub(super) fn matrix_softmax_rows_device(matrix: span::DeviceSliceMutDescriptor<
 
     if active {
         let row_sum = unsafe { SHARED[0] };
-        unsafe { matrix.ptr.add(index).write(exp_value / row_sum) };
+        matrix.write(index, exp_value / row_sum);
     }
 }
 
@@ -117,12 +113,8 @@ pub(super) fn matrix_layer_norm_rows_device(
     let lane = tid % 32;
     let warp_id = tid / 32;
     let index = thread::blockIdx_x() as usize * cols + tid;
-    let active = tid < cols && index < matrix.len;
-    let x = if active {
-        unsafe { matrix.ptr.add(index).read() }
-    } else {
-        0.0
-    };
+    let active = tid < cols && index < matrix.len();
+    let x = if active { matrix.read(index) } else { 0.0 };
 
     let mut value = x;
     for delta in [1, 2, 4, 8, 16] {
@@ -169,7 +161,7 @@ pub(super) fn matrix_layer_norm_rows_device(
 
     if active {
         let inverse_std = unsafe { SHARED[0] };
-        unsafe { matrix.ptr.add(index).write(diff * inverse_std) };
+        matrix.write(index, diff * inverse_std);
     }
 }
 
@@ -181,10 +173,9 @@ pub(super) fn matrix_binary_assign_by_rows_device(
     op: BinaryOp,
 ) {
     let index = thread::index_1d().get();
-    if index < matrix.len {
-        let element = unsafe { matrix.ptr.add(index) };
-        let rhs = unsafe { row.ptr.add(index % cols).read() };
-        unsafe { element.write(apply_binary(element.read(), rhs, op)) };
+    if index < matrix.len() {
+        let rhs = row.read(index % cols);
+        matrix.write(index, apply_binary(matrix.read(index), rhs, op));
     }
 }
 
@@ -200,14 +191,14 @@ pub(super) fn softmax_rows_backward_device(
     let lane = tid % 32;
     let warp_id = tid / 32;
     let index = thread::blockIdx_x() as usize * cols + tid;
-    let active = tid < cols && index < result.len;
+    let active = tid < cols && index < result.len();
     let probability = if active {
-        unsafe { probabilities.ptr.add(index).read() }
+        probabilities.read(index)
     } else {
         0.0
     };
     let gradient = if active {
-        unsafe { output_gradient.ptr.add(index).read() }
+        output_gradient.read(index)
     } else {
         0.0
     };
@@ -230,12 +221,7 @@ pub(super) fn softmax_rows_backward_device(
     }
     thread::sync_threads();
     if active {
-        unsafe {
-            result
-                .ptr
-                .add(index)
-                .write(probability * (gradient - SHARED[0]))
-        };
+        result.write(index, probability * (gradient - unsafe { SHARED[0] }));
     }
 }
 
@@ -252,14 +238,10 @@ pub(super) fn layer_norm_backward_device(
     let lane = tid % 32;
     let warp_id = tid / 32;
     let index = thread::blockIdx_x() as usize * cols + tid;
-    let active = tid < cols && index < result.len;
-    let x = if active {
-        unsafe { input.ptr.add(index).read() }
-    } else {
-        0.0
-    };
+    let active = tid < cols && index < result.len();
+    let x = if active { input.read(index) } else { 0.0 };
     let dy = if active {
-        unsafe { output_gradient.ptr.add(index).read() }
+        output_gradient.read(index)
     } else {
         0.0
     };
@@ -349,6 +331,7 @@ pub(super) fn layer_norm_backward_device(
     if active {
         let dx = inverse_std / cols as f32
             * (cols as f32 * dy - gradient_sum - normalized * gradient_normalized_sum);
-        unsafe { result.ptr.add(index).write(dx) };
+        result.write(index, dx);
     }
 }
+

@@ -158,6 +158,7 @@ usage. A stable public crate interface is not a present goal.
 src/
 ├── cuda.rs                    CUDA types and module routing entry point
 ├── cuda/
+│   ├── device.rs             device-side module routing
 │   ├── device/
 │   │   ├── common.rs         shared device helpers
 │   │   ├── elementwise.rs    elementwise device implementations
@@ -165,8 +166,7 @@ src/
 │   │   ├── row.rs            row-wise device implementations
 │   │   ├── gemm.rs           FP32 and Tensor Core GEMM implementations
 │   │   ├── layout.rs         transpose and tiled-layout implementations
-│   │   ├── module.rs         thin entries in one `#[cuda_module]`
-│   │   └── mod.rs            device-side module routing
+│   │   └── module.rs         thin entries in one `#[cuda_module]`
 │   ├── runtime.rs            context, streams, buffers, synchronization
 │   ├── span.rs               contiguous device-memory borrows
 │   └── container/

@@ -6,8 +6,8 @@ use super::{CudaRuntime, DEFAULT_BLOCK_SIZE};
 
 #[repr(C)]
 pub(super) struct DeviceSliceDescriptor<T> {
-    pub ptr: *const T,
-    pub len: usize,
+    ptr: *const T,
+    len: usize,
 }
 
 impl<T> Copy for DeviceSliceDescriptor<T> {}
@@ -18,10 +18,34 @@ impl<T> Clone for DeviceSliceDescriptor<T> {
     }
 }
 
+impl<T: Copy> DeviceSliceDescriptor<T> {
+    /// Reads an element after the caller has established the device index.
+    ///
+    /// Descriptors are crate-private and may only be constructed from a
+    /// validated span. Device code must keep `index < len()` true.
+    #[inline(always)]
+    pub(super) fn read(&self, index: usize) -> T {
+        debug_assert!(index < self.len);
+        unsafe { self.ptr.add(index).read() }
+    }
+}
+
+impl<T> DeviceSliceDescriptor<T> {
+    #[inline(always)]
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    pub(super) fn as_ptr(&self) -> *const T {
+        self.ptr
+    }
+}
+
 #[repr(C)]
 pub(super) struct DeviceSliceMutDescriptor<T> {
-    pub ptr: *mut T,
-    pub len: usize,
+    ptr: *mut T,
+    len: usize,
 }
 
 impl<T> Copy for DeviceSliceMutDescriptor<T> {}
@@ -29,6 +53,29 @@ impl<T> Copy for DeviceSliceMutDescriptor<T> {}
 impl<T> Clone for DeviceSliceMutDescriptor<T> {
     fn clone(&self) -> Self {
         *self
+    }
+}
+
+impl<T: Copy> DeviceSliceMutDescriptor<T> {
+    /// Reads an element under the same index invariant as [`Self::write`].
+    #[inline(always)]
+    pub(super) fn read(&self, index: usize) -> T {
+        debug_assert!(index < self.len);
+        unsafe { self.ptr.add(index).read() }
+    }
+}
+
+impl<T> DeviceSliceMutDescriptor<T> {
+    #[inline(always)]
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Writes an element after device code has established `index < len()`.
+    #[inline(always)]
+    pub(super) fn write(&self, index: usize, value: T) {
+        debug_assert!(index < self.len);
+        unsafe { self.ptr.add(index).write(value) };
     }
 }
 

@@ -46,51 +46,51 @@ pub(super) fn matrix_multiply_fp32_device(
 
         unsafe {
             SHARED_MATRIX1[ty * MATMUL_TILE_SIZE + tx] = if row0 < rows && k0 < len {
-                matrix1.ptr.add(row0 * len + k0).read()
+                matrix1.read(row0 * len + k0)
             } else {
                 0.0
             };
             SHARED_MATRIX1[ty * MATMUL_TILE_SIZE + tx + MATMUL_THREAD_TILE_SIZE] =
                 if row0 < rows && k1 < len {
-                    matrix1.ptr.add(row0 * len + k1).read()
+                    matrix1.read(row0 * len + k1)
                 } else {
                     0.0
                 };
             SHARED_MATRIX1[(ty + MATMUL_THREAD_TILE_SIZE) * MATMUL_TILE_SIZE + tx] =
                 if row1 < rows && k0 < len {
-                    matrix1.ptr.add(row1 * len + k0).read()
+                    matrix1.read(row1 * len + k0)
                 } else {
                     0.0
                 };
             SHARED_MATRIX1[(ty + MATMUL_THREAD_TILE_SIZE) * MATMUL_TILE_SIZE
                 + tx
                 + MATMUL_THREAD_TILE_SIZE] = if row1 < rows && k1 < len {
-                matrix1.ptr.add(row1 * len + k1).read()
+                matrix1.read(row1 * len + k1)
             } else {
                 0.0
             };
 
             SHARED_MATRIX2[ty * MATMUL_TILE_SIZE + tx] = if b_row0 < len && col0 < cols {
-                matrix2.ptr.add(b_row0 * cols + col0).read()
+                matrix2.read(b_row0 * cols + col0)
             } else {
                 0.0
             };
             SHARED_MATRIX2[ty * MATMUL_TILE_SIZE + tx + MATMUL_THREAD_TILE_SIZE] =
                 if b_row0 < len && col1 < cols {
-                    matrix2.ptr.add(b_row0 * cols + col1).read()
+                    matrix2.read(b_row0 * cols + col1)
                 } else {
                     0.0
                 };
             SHARED_MATRIX2[(ty + MATMUL_THREAD_TILE_SIZE) * MATMUL_TILE_SIZE + tx] =
                 if b_row1 < len && col0 < cols {
-                    matrix2.ptr.add(b_row1 * cols + col0).read()
+                    matrix2.read(b_row1 * cols + col0)
                 } else {
                     0.0
                 };
             SHARED_MATRIX2[(ty + MATMUL_THREAD_TILE_SIZE) * MATMUL_TILE_SIZE
                 + tx
                 + MATMUL_THREAD_TILE_SIZE] = if b_row1 < len && col1 < cols {
-                matrix2.ptr.add(b_row1 * cols + col1).read()
+                matrix2.read(b_row1 * cols + col1)
             } else {
                 0.0
             };
@@ -113,19 +113,17 @@ pub(super) fn matrix_multiply_fp32_device(
         thread::sync_threads();
     }
 
-    unsafe {
-        if row0 < rows && col0 < cols {
-            result.ptr.add(row0 * cols + col0).write(sum00);
-        }
-        if row0 < rows && col1 < cols {
-            result.ptr.add(row0 * cols + col1).write(sum01);
-        }
-        if row1 < rows && col0 < cols {
-            result.ptr.add(row1 * cols + col0).write(sum10);
-        }
-        if row1 < rows && col1 < cols {
-            result.ptr.add(row1 * cols + col1).write(sum11);
-        }
+    if row0 < rows && col0 < cols {
+        result.write(row0 * cols + col0, sum00);
+    }
+    if row0 < rows && col1 < cols {
+        result.write(row0 * cols + col1, sum01);
+    }
+    if row1 < rows && col0 < cols {
+        result.write(row1 * cols + col0, sum10);
+    }
+    if row1 < rows && col1 < cols {
+        result.write(row1 * cols + col1, sum11);
     }
 }
 
@@ -154,12 +152,12 @@ unsafe fn prefetch_tensor_tile(
         let a_source = if a_valid {
             unsafe {
                 matrix1
-                    .ptr
+                    .as_ptr()
                     .add(global_row * len + tile_k + local_k)
                     .cast::<u8>()
             }
         } else {
-            matrix1.ptr.cast::<u8>()
+            matrix1.as_ptr().cast::<u8>()
         };
         let a_destination =
             unsafe { shared_matrix1.add(shared_base + local_row * TENSOR_SHARED_STRIDE + local_k) };
@@ -181,12 +179,12 @@ unsafe fn prefetch_tensor_tile(
         let b_source = if b_valid {
             unsafe {
                 matrix2
-                    .ptr
+                    .as_ptr()
                     .add((tile_k + local_k) * cols + global_col)
                     .cast::<u8>()
             }
         } else {
-            matrix2.ptr.cast::<u8>()
+            matrix2.as_ptr().cast::<u8>()
         };
         let b_destination =
             unsafe { shared_matrix2.add(shared_base + local_col * TENSOR_SHARED_STRIDE + local_k) };
@@ -364,19 +362,11 @@ pub(super) fn matrix_multiply_device(
         let output_row = block_row + warp_row * 16 + group + if register >= 2 { 8 } else { 0 };
         let output_col = block_col + warp_col * 16 + thread_in_group * 2 + register % 2;
 
-        unsafe {
-            if output_row < rows && output_col < cols {
-                result
-                    .ptr
-                    .add(output_row * cols + output_col)
-                    .write(accumulator0[register]);
-            }
-            if output_row < rows && output_col + 8 < cols {
-                result
-                    .ptr
-                    .add(output_row * cols + output_col + 8)
-                    .write(accumulator1[register]);
-            }
+        if output_row < rows && output_col < cols {
+            result.write(output_row * cols + output_col, accumulator0[register]);
+        }
+        if output_row < rows && output_col + 8 < cols {
+            result.write(output_row * cols + output_col + 8, accumulator1[register]);
         }
     }
 }

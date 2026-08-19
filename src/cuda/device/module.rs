@@ -66,11 +66,11 @@ pub(in crate::cuda) mod kernels {
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub unsafe fn slice_sum(
+    pub fn slice_sum(
         span: span::DeviceSliceDescriptor<f32>,
         result: span::DeviceSliceMutDescriptor<f32>,
     ) {
-        unsafe { reduction::slice_sum_device(span, result) };
+        reduction::slice_sum_device(span, result);
     }
 
     #[kernel]
@@ -89,11 +89,11 @@ pub(in crate::cuda) mod kernels {
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub unsafe fn slice_max(
+    pub fn slice_max(
         span: span::DeviceSliceDescriptor<f32>,
         result: span::DeviceSliceMutDescriptor<f32>,
     ) {
-        unsafe { reduction::slice_max_device(span, result) };
+        reduction::slice_max_device(span, result);
     }
 
     #[kernel]

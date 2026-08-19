@@ -143,6 +143,7 @@ assert_eq!((output.rows(), output.cols()), (256, 64));
 src/
 ├── cuda.rs                    CUDA 类型与模块路由入口
 ├── cuda/
+│   ├── device.rs             device 侧模块路由
 │   ├── device/
 │   │   ├── common.rs         device 公共辅助函数
 │   │   ├── elementwise.rs    逐元素 device 实现
@@ -150,8 +151,7 @@ src/
 │   │   ├── row.rs            逐行 device 实现
 │   │   ├── gemm.rs           FP32 与 Tensor Core GEMM 实现
 │   │   ├── layout.rs         转置与分块重排实现
-│   │   ├── module.rs         单一 `#[cuda_module]` 内的薄入口
-│   │   └── mod.rs            device 侧模块路由
+│   │   └── module.rs         单一 `#[cuda_module]` 内的薄入口
 │   ├── runtime.rs            context、stream、buffer 与同步
 │   ├── span.rs               连续设备内存借用
 │   └── container/

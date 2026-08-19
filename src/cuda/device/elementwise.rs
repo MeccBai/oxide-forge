@@ -15,35 +15,30 @@ pub(super) fn apply_binary(lhs: f32, rhs: f32, op: BinaryOp) -> f32 {
 #[device]
 pub(super) fn slice_set_device(target: span::DeviceSliceMutDescriptor<f32>, value: f32) {
     let index = thread::index_1d().get();
-    if index < target.len {
-        unsafe { target.ptr.add(index).write(value) };
+    if index < target.len() {
+        target.write(index, value);
     }
 }
 
 #[device]
 pub(super) fn slice_set_seq_device(target: span::DeviceSliceMutDescriptor<f32>, dir: bool) {
     let index = thread::index_1d().get();
-    if index < target.len {
+    if index < target.len() {
         let value = if dir {
             index as f32
         } else {
-            (target.len - index) as f32
+            (target.len() - index) as f32
         };
-        unsafe { target.ptr.add(index).write(value) };
+        target.write(index, value);
     }
 }
 
 #[device]
 pub(super) fn slice_set_random_device(target: span::DeviceSliceMutDescriptor<f32>, seed: u32) {
     let index = thread::index_1d().get();
-    if index < target.len {
+    if index < target.len() {
         let rand = random(seed + index as u32);
-        unsafe {
-            target
-                .ptr
-                .add(index)
-                .write((rand as f32) / (u32::MAX as f32));
-        }
+        target.write(index, (rand as f32) / (u32::MAX as f32));
     }
 }
 
@@ -55,14 +50,8 @@ pub(super) fn slice_binary_device(
     op: BinaryOp,
 ) {
     let index = thread::index_1d().get();
-    if index < output.len && index < lhs.len && index < rhs.len {
-        unsafe {
-            output.ptr.add(index).write(apply_binary(
-                lhs.ptr.add(index).read(),
-                rhs.ptr.add(index).read(),
-                op,
-            ));
-        }
+    if index < output.len() && index < lhs.len() && index < rhs.len() {
+        output.write(index, apply_binary(lhs.read(index), rhs.read(index), op));
     }
 }
 
@@ -73,11 +62,8 @@ pub(super) fn slice_binary_assign_device(
     op: BinaryOp,
 ) {
     let index = thread::index_1d().get();
-    if index < target.len && index < rhs.len {
-        unsafe {
-            let element = target.ptr.add(index);
-            element.write(apply_binary(element.read(), rhs.ptr.add(index).read(), op));
-        }
+    if index < target.len() && index < rhs.len() {
+        target.write(index, apply_binary(target.read(index), rhs.read(index), op));
     }
 }
 
@@ -87,10 +73,7 @@ where
     F: Fn(f32) -> f32 + Copy,
 {
     let index = thread::index_1d().get();
-    if index < span.len {
-        let element = unsafe { span.ptr.add(index) };
-        unsafe {
-            element.write(f(element.read()));
-        }
+    if index < span.len() {
+        span.write(index, f(span.read(index)));
     }
 }

@@ -2,7 +2,7 @@ use crate::cuda::span;
 use cuda_device::{device, shared, thread, warp};
 
 #[device]
-pub(super) unsafe fn slice_sum_device(
+pub(super) fn slice_sum_device(
     span: span::DeviceSliceDescriptor<f32>,
     result: span::DeviceSliceMutDescriptor<f32>,
 ) {
@@ -11,8 +11,8 @@ pub(super) unsafe fn slice_sum_device(
     let index = thread::index_1d().get();
     let lane = thread::threadIdx_x() as usize % 32;
     let warp_id = thread::threadIdx_x() as usize / 32;
-    let mut value = if index < span.len {
-        unsafe { span.ptr.add(index).read() }
+    let mut value = if index < span.len() {
+        span.read(index)
     } else {
         0.0
     };
@@ -34,8 +34,8 @@ pub(super) unsafe fn slice_sum_device(
 
     if thread::threadIdx_x() == 0 {
         let block_id = thread::blockIdx_x() as usize;
-        if block_id < result.len {
-            unsafe { result.ptr.add(block_id).write(value) };
+        if block_id < result.len() {
+            result.write(block_id, value);
         }
     }
 }
@@ -54,8 +54,8 @@ pub(super) fn slice_map_sum_device<F>(
     let lane = thread::threadIdx_x() as usize % 32;
     let warp_id = thread::threadIdx_x() as usize / 32;
 
-    let mut value = if index < span.len {
-        let x = unsafe { span.ptr.add(index).read() };
+    let mut value = if index < span.len() {
+        let x = span.read(index);
         f(x)
     } else {
         0.0
@@ -84,14 +84,14 @@ pub(super) fn slice_map_sum_device<F>(
     if thread::threadIdx_x() == 0 {
         let block_id = thread::blockIdx_x() as usize;
 
-        if block_id < result.len {
-            unsafe { result.ptr.add(block_id).write(value) };
+        if block_id < result.len() {
+            result.write(block_id, value);
         }
     }
 }
 
 #[device]
-pub(super) unsafe fn slice_max_device(
+pub(super) fn slice_max_device(
     span: span::DeviceSliceDescriptor<f32>,
     result: span::DeviceSliceMutDescriptor<f32>,
 ) {
@@ -100,8 +100,8 @@ pub(super) unsafe fn slice_max_device(
     let index = thread::index_1d().get();
     let lane = thread::threadIdx_x() as usize % 32;
     let warp_id = thread::threadIdx_x() as usize / 32;
-    let mut value = if index < span.len {
-        unsafe { span.ptr.add(index).read() }
+    let mut value = if index < span.len() {
+        span.read(index)
     } else {
         f32::MIN
     };
@@ -123,8 +123,8 @@ pub(super) unsafe fn slice_max_device(
 
     if thread::threadIdx_x() == 0 {
         let block_id = thread::blockIdx_x() as usize;
-        if block_id < result.len {
-            unsafe { result.ptr.add(block_id).write(value) };
+        if block_id < result.len() {
+            result.write(block_id, value);
         }
     }
 }

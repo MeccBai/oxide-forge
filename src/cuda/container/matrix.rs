@@ -184,7 +184,6 @@ impl CudaRuntime {
     pub fn layer_norm_backward(&mut self, input: &Matrix, output_gradient: &Matrix) -> Matrix {
         assert_eq!(input.rows, output_gradient.rows);
         assert_eq!(input.cols, output_gradient.cols);
-
         assert!(input.cols <= DEFAULT_BLOCK_SIZE);
         let mut buffer = self.get_uninit_buffer(input.rows * input.cols);
         let config = LaunchConfig1D::new(input.rows as u32, DEFAULT_BLOCK_SIZE as u32, 0);
