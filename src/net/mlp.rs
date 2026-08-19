@@ -44,7 +44,7 @@ impl MlpExecutor {
         for (index, layer) in self.layers.iter().enumerate() {
             let layer_input = output.as_ref().unwrap_or(input);
             if self.res_range.is_some_and(|(start, _)| index == start) {
-                residual_cache = Some(runtime.matrix_copy(layer_input));
+                residual_cache = Some(runtime.clone_matrix(layer_input));
             }
             let consumes_residual = self.res_range.is_some_and(|(_, end)| index + 1 == end);
             let residual = if consumes_residual {
@@ -92,7 +92,7 @@ impl MlpExecutor {
     ) -> Matrix {
         assert_eq!(layer_inputs.len(), self.layers.len());
 
-        let mut gradient = runtime.matrix_copy(output_gradient);
+        let mut gradient = runtime.clone_matrix(output_gradient);
         let mut residual_gradient: Option<(usize, Matrix)> = None;
         for index in (0..self.layers.len()).rev() {
             let residual_index = self
@@ -107,7 +107,7 @@ impl MlpExecutor {
             let mut input_gradient = self.layers[index].input_gradient(&layer_gradient, runtime);
 
             if let Some(source) = residual_index {
-                residual_gradient = Some((source, runtime.matrix_copy(&layer_gradient)));
+                residual_gradient = Some((source, runtime.clone_matrix(&layer_gradient)));
             }
             if residual_gradient
                 .as_ref()

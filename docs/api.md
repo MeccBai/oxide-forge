@@ -8,7 +8,7 @@ does not aim for unrestricted generality.
 
 ## Conventions
 
-- Operations that create a new buffer or container belong to `CudaRuntime`.
+- Operations that return a new `Matrix` or `Vector` belong to `CudaRuntime`.
 - Operations that mutate an existing value belong to `Matrix`, `Vector`, or
   `VectorView`.
 - `Matrix` and `Vector` own device memory; views and spans borrow it.
@@ -17,6 +17,15 @@ does not aim for unrestricted generality.
 - Device work on the primary stream is submitted asynchronously whenever
   practical.
 - Reductions that return a host scalar must synchronize.
+
+| Result or effect | API owner |
+| --- | --- |
+| Returns a new `Matrix` or `Vector` | `CudaRuntime` |
+| Mutates an existing `Matrix` | `Matrix` |
+| Mutates an existing `Vector` | `Vector` |
+| Mutates a borrowed row/span | `VectorView` |
+| Returns a scalar or host copy | The source container |
+| Recycles owned device storage | `CudaRuntime` |
 
 ## CudaRuntime
 
@@ -105,7 +114,7 @@ The linear row-major index is:
 index = row * cols + col
 ```
 
-### Operations that create a Matrix
+### CudaRuntime: operations that create containers
 
 ```rust
 let product = runtime.matrix_multiply(&a, &b);
@@ -165,18 +174,20 @@ synchronization.
 
 ```rust
 matrix.scale(value, &runtime);
-matrix.add_val(value, &runtime);
+matrix.add_scalar(value, &runtime);
 matrix.for_each(&runtime, move |x| x * 2.0);
 matrix.softmax_rows(&runtime);
 matrix.layer_norm(&runtime);
+matrix.rms_norm(&runtime);
 matrix.binary_assign_by_rows(&bias, BinaryOp::Add, &runtime);
 ```
 
 | API | Synchronization behavior |
 | --- | --- |
-| `scale`, `add_val`, `for_each` | Asynchronous submission |
+| `scale`, `add_scalar`, `for_each` | Asynchronous submission |
 | `softmax_rows` | One block per row in one asynchronous launch |
 | `layer_norm` | One block per row in one asynchronous launch |
+| `rms_norm` | One block per row in one asynchronous launch |
 | `binary_assign` | In-place element-wise operation on equal-shaped matrices; asynchronous |
 | `binary_assign_by_rows` | One asynchronous broadcast kernel over the complete Matrix |
 
@@ -193,15 +204,16 @@ reduction is involved.
 | API | Result | Copies device data |
 | --- | --- | --- |
 | `vector_zip(vectors)` | Equal-length Vectors become Matrix rows | Yes |
-| `split_view(matrix)` | A `Vec<VectorView>` over Matrix rows | No |
+| `matrix.row_views()` | A `Vec<VectorView>` over Matrix rows | No |
 | `matrix_split(matrix)` | Independent Vector for every row | Yes |
 | `broadcast(vector, copies)` | `[copies, vector.len]` Matrix | Yes |
 | `extract_vector(matrix)` | Transfers a single-row buffer; copies the first row otherwise | Depends |
 | `matrix_slice(matrix, cols, rows)` | Physically rearranged contiguous matrix blocks | Yes |
-| `to_vector(matrix)` | Consumes the Matrix and transfers its entire buffer | No |
-| `matrix_copy(matrix)` | Independent Matrix with the same shape | Yes |
+| `matrix_into_vector(matrix)` | Consumes the Matrix and transfers its entire buffer | No |
+| `vector_into_matrix(vector)` | Consumes the Vector and transfers its buffer as one column | No |
+| `clone_matrix(matrix)` | Independent Matrix with the same shape | Yes |
 
-While values returned by `split_view` are alive, the source Matrix remains
+While values returned by `row_views` are alive, the source Matrix remains
 exclusively borrowed. Transpose before column-wise processing.
 
 ## Vector
@@ -223,9 +235,9 @@ not allocate continue to take `&CudaRuntime`.
 ### Computation
 
 ```rust
-vector.add(value, &runtime);
+vector.add_scalar(value, &runtime);
 vector.scale(value, &runtime);
-vector.exp(offset, &runtime); // exp(x - offset)
+vector.exp_shifted(offset, &runtime); // exp(x - offset)
 
 let sum = vector.sum(&mut runtime);
 let max = vector.max(&mut runtime);
@@ -233,15 +245,15 @@ vector.softmax(&mut runtime);
 
 let c = runtime.vector_add(&a, &b);
 let product = runtime.vector_binary(&a, &b, BinaryOp::Mul);
-let dot = runtime.vector_dot_product(&a, &b);
+let dot = a.dot(&b, &mut runtime);
 ```
 
 `vector_add`, `vector_sub`, `vector_mul`, and `vector_div` are thin wrappers over
-`vector_binary`. Dot product first applies element-wise multiplication, then
-reduces the result with `sum`.
+`vector_binary`. `dot` belongs to the source Vector because it returns a scalar;
+its temporary product is still allocated and recycled through `CudaRuntime`.
 
 `vector_binary` and its convenience wrappers currently synchronize before
-returning. `sum`, `max`, and `vector_dot_product` also synchronize because they
+returning. `sum`, `max`, and `dot` also synchronize because they
 return host `f32` values. For an empty input, `sum` returns `0.0` and `max`
 returns `f32::MIN`.
 
@@ -261,14 +273,14 @@ overflow.
 usually created by splitting a Matrix into rows:
 
 ```rust
-let mut rows = runtime.split_view(&mut matrix);
+let mut rows = matrix.row_views();
 ```
 
 Available operations are:
 
 ```rust
 view.len();
-view.add(value, &runtime);
+view.add_scalar(value, &runtime);
 view.scale(value, &runtime);
 view.for_each(&runtime, f);
 view.sum(&mut runtime);
@@ -474,7 +486,7 @@ kernel or Span-specific transfer path exists.
 | Matrix/View in-place element operation | Asynchronous submission |
 | `vector_binary` and convenience wrappers | Synchronize before returning |
 | `sum`, `max`, `map_sum` | Synchronize and return a host scalar |
-| `matrix_sum_rows`, `softmax_rows`, `layer_norm` | One row-parallel kernel; asynchronous submission |
+| `matrix_sum_rows`, `softmax_rows`, `layer_norm`, `rms_norm` | One row-parallel kernel; asynchronous submission |
 | `softmax_rows_backward`, `layer_norm_backward` | One row-wise kernel; asynchronous submission |
 | `binary_assign_by_rows` | One Matrix-wide broadcast kernel; asynchronous submission |
 | Transformer `forward` | Synchronizes before returning |

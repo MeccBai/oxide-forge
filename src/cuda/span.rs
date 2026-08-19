@@ -308,12 +308,10 @@ fn sum_descriptor(span: DeviceSliceDescriptor<f32>, runtime: &mut CudaRuntime) -
     let config = runtime.get_launch_config(span.len, DEFAULT_BLOCK_SIZE);
     let prepared = runtime.module().prepare_slice_sum(config).unwrap();
     let output_span = DeviceSpanMut::from_buffer(&mut output, 0, output_len);
-    unsafe {
-        runtime
-            .module()
-            .slice_sum(runtime.stream(), &prepared, span, output_span.descriptor())
-            .unwrap();
-    }
+    runtime
+        .module()
+        .slice_sum(runtime.stream(), &prepared, span, output_span.descriptor())
+        .unwrap();
     runtime.sync();
     reduce_sum_buffer(output, runtime)
 }
@@ -328,12 +326,10 @@ fn max_descriptor(span: DeviceSliceDescriptor<f32>, runtime: &mut CudaRuntime) -
     let config = runtime.get_launch_config(span.len, DEFAULT_BLOCK_SIZE);
     let prepared = runtime.module().prepare_slice_max(config).unwrap();
     let output_span = DeviceSpanMut::from_buffer(&mut output, 0, output_len);
-    unsafe {
-        runtime
-            .module()
-            .slice_max(runtime.stream(), &prepared, span, output_span.descriptor())
-            .unwrap();
-    }
+    runtime
+        .module()
+        .slice_max(runtime.stream(), &prepared, span, output_span.descriptor())
+        .unwrap();
     runtime.sync();
     reduce_max_buffer(output, runtime)
 }
@@ -373,17 +369,15 @@ fn reduce_sum_buffer(mut input: DeviceBuffer<f32>, runtime: &mut CudaRuntime) ->
         let prepared = runtime.module().prepare_slice_sum(config).unwrap();
         let input_span = DeviceSpan::from_buffer(&input, 0, input.len());
         let output_span = DeviceSpanMut::from_buffer(&mut output, 0, output_len);
-        unsafe {
-            runtime
-                .module()
-                .slice_sum(
-                    runtime.stream(),
-                    &prepared,
-                    input_span.descriptor(),
-                    output_span.descriptor(),
-                )
-                .unwrap();
-        }
+        runtime
+            .module()
+            .slice_sum(
+                runtime.stream(),
+                &prepared,
+                input_span.descriptor(),
+                output_span.descriptor(),
+            )
+            .unwrap();
         runtime.sync();
         runtime.recycle_buffer(input);
         input = output;
@@ -402,17 +396,15 @@ fn reduce_max_buffer(mut input: DeviceBuffer<f32>, runtime: &mut CudaRuntime) ->
         let prepared = runtime.module().prepare_slice_max(config).unwrap();
         let input_span = DeviceSpan::from_buffer(&input, 0, input.len());
         let output_span = DeviceSpanMut::from_buffer(&mut output, 0, output_len);
-        unsafe {
-            runtime
-                .module()
-                .slice_max(
-                    runtime.stream(),
-                    &prepared,
-                    input_span.descriptor(),
-                    output_span.descriptor(),
-                )
-                .unwrap();
-        }
+        runtime
+            .module()
+            .slice_max(
+                runtime.stream(),
+                &prepared,
+                input_span.descriptor(),
+                output_span.descriptor(),
+            )
+            .unwrap();
         runtime.sync();
         runtime.recycle_buffer(input);
         input = output;

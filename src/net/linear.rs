@@ -161,14 +161,14 @@ impl Linear {
         output_gradient: &Matrix,
         runtime: &mut CudaRuntime,
     ) -> (Matrix, Option<Vector>) {
-        let mut gradient = runtime.matrix_copy(output_gradient);
+        let mut gradient = runtime.clone_matrix(output_gradient);
 
         if let Activation::Gelu = self.activation {
             let pre_activation = pre_activation.expect("GELU backward requires pre-activation");
             assert_eq!(pre_activation.rows(), output_gradient.rows());
             assert_eq!(pre_activation.cols(), output_gradient.cols());
             let activation = self.activation;
-            let mut derivative = runtime.matrix_copy(pre_activation);
+            let mut derivative = runtime.clone_matrix(pre_activation);
 
             derivative.for_each(runtime, move |x| activation.derivative(x));
 
@@ -237,12 +237,12 @@ impl Linear {
         assert_eq!(output_gradient.rows(), residual_gradient.rows());
         assert_eq!(output_gradient.cols(), residual_gradient.cols());
 
-        let mut gradient = runtime.matrix_copy(output_gradient);
+        let mut gradient = runtime.clone_matrix(output_gradient);
         gradient.binary_assign(residual_gradient, Add, runtime);
 
         if let Activation::Gelu = self.activation {
             let activation = self.activation;
-            let mut derivative = runtime.matrix_copy(pre_activation);
+            let mut derivative = runtime.clone_matrix(pre_activation);
 
             derivative.for_each(runtime, move |x| activation.derivative(x));
 

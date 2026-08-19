@@ -1,150 +1,97 @@
-use cuda_core::DeviceBuffer;
-
-use crate::cuda::{
-    BinaryOp, CudaRuntime, DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, runtime::InitType,
-};
+use crate::cuda::{BinaryOp, CudaRuntime, DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut};
 
 use super::Vector;
 
 impl Vector {
-    pub fn into_matrix(self) -> super::Matrix {
-        let rows = self.buffer.len();
-        let cols = 1;
-        super::Matrix {
-            buffer: self.buffer,
-            rows,
-            cols,
-        }
-    }
-}
-
-impl CudaRuntime {
-    /// Consumes a vector and returns its allocation to the runtime pool.
-    pub fn recycle_vector(&mut self, vector: Vector) {
-        self.recycle_buffer(vector.buffer);
+    pub fn len(&self) -> usize {
+        self.buffer.len()
     }
 
-    pub(crate) fn create_vector(&self, buffer: DeviceBuffer<f32>) -> Vector {
-        Vector { buffer }
+    pub fn as_span(&self) -> DeviceSpan<'_, f32> {
+        DeviceSpan::from_buffer(&self.buffer, 0, self.buffer.len())
     }
 
-    pub fn new_vector(&mut self, init_type: InitType, size: usize) -> Vector {
-        if init_type.is_zero() {
-            return Vector {
-                buffer: self.get_zerod_buffer(size),
-            };
-        }
-        let mut buffer = self.get_uninit_buffer(size);
-        let config = self.get_launch_config(buffer.len(), DEFAULT_BLOCK_SIZE);
-        match init_type {
-            InitType::Sequence => {
-                let prepared = self.module().prepare_slice_set_seq(config).unwrap();
-                let span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
-                self.module()
-                    .slice_set_seq(self.stream(), &prepared, span.descriptor(), true)
-                    .unwrap();
-                self.sync();
-                Vector { buffer }
-            }
-            InitType::Reserve => {
-                let prepared = self.module().prepare_slice_set_seq(config).unwrap();
-                let span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
-                self.module()
-                    .slice_set_seq(self.stream(), &prepared, span.descriptor(), false)
-                    .unwrap();
-                self.sync();
-                Vector { buffer }
-            }
-            InitType::Random => {
-                let seed = rand::random();
-                let prepared = self.module().prepare_slice_set_random(config).unwrap();
-                let span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
-                self.module()
-                    .slice_set_random(self.stream(), &prepared, span.descriptor(), seed)
-                    .unwrap();
-                self.sync();
-                Vector { buffer }
-            }
-            InitType::Zero => Vector { buffer },
-        }
+    pub fn span(&self, offset: usize, len: usize) -> DeviceSpan<'_, f32> {
+        DeviceSpan::from_buffer(&self.buffer, offset, len)
     }
 
-    pub fn clone_vector(&mut self, vec: &Vector) -> Vector {
-        Vector {
-            buffer: self.clone_buffer(&vec.buffer),
-        }
+    pub fn to_host(&self, runtime: &CudaRuntime) -> Vec<f32> {
+        self.buffer.to_host_vec(runtime.stream()).unwrap()
     }
 
-    pub fn vector_add(&mut self, vec1: &Vector, vec2: &Vector) -> Vector {
-        self.vector_binary(vec1, vec2, BinaryOp::Add)
+    pub fn add_scalar(&mut self, value: f32, runtime: &CudaRuntime) {
+        let len = self.buffer.len();
+        let mut span = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
+        span.for_each(runtime, move |x| x + value);
     }
 
-    pub fn vector_sub(&mut self, vec1: &Vector, vec2: &Vector) -> Vector {
-        self.vector_binary(vec1, vec2, BinaryOp::Sub)
+    pub fn scale(&mut self, value: f32, runtime: &CudaRuntime) {
+        let len = self.buffer.len();
+        let mut span = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
+        span.scale(value, runtime);
     }
 
-    pub fn vector_mul(&mut self, vec1: &Vector, vec2: &Vector) -> Vector {
-        self.vector_binary(vec1, vec2, BinaryOp::Mul)
+    pub fn sum(&self, runtime: &mut CudaRuntime) -> f32 {
+        DeviceSpan::from_buffer(&self.buffer, 0, self.buffer.len()).sum(runtime)
     }
 
-    pub fn vector_div(&mut self, vec1: &Vector, vec2: &Vector) -> Vector {
-        self.vector_binary(vec1, vec2, BinaryOp::Div)
+    pub fn max(&self, runtime: &mut CudaRuntime) -> f32 {
+        DeviceSpan::from_buffer(&self.buffer, 0, self.buffer.len()).max(runtime)
     }
 
-    pub fn vector_binary(&mut self, vec1: &Vector, vec2: &Vector, op: BinaryOp) -> Vector {
-        assert_eq!(vec1.buffer.len(), vec2.buffer.len());
-        let mut result_buffer = self.get_uninit_buffer(vec1.buffer.len());
+    pub fn exp_shifted(&mut self, offset: f32, runtime: &CudaRuntime) {
+        let len = self.buffer.len();
+        let mut span = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
+        span.for_each(runtime, move |x| (x - offset).exp());
+    }
 
-        let config = self.get_launch_config(vec1.buffer.len(), DEFAULT_BLOCK_SIZE);
+    pub fn softmax(&mut self, runtime: &mut CudaRuntime) {
+        let max = self.max(runtime);
+        self.exp_shifted(max, runtime);
+        let sum = self.sum(runtime);
+        self.scale(1.0 / sum, runtime);
+    }
 
-        let prepared = self.module().prepare_slice_binary(config).unwrap();
-        let lhs = DeviceSpan::from_buffer(&vec1.buffer, 0, vec1.buffer.len());
-        let rhs = DeviceSpan::from_buffer(&vec2.buffer, 0, vec2.buffer.len());
-        let result_len = result_buffer.len();
-        let output = DeviceSpanMut::from_buffer(&mut result_buffer, 0, result_len);
+    pub fn binary_assign(&mut self, rhs: &Vector, op: BinaryOp, runtime: &CudaRuntime) {
+        let len = self.buffer.len();
+        assert_eq!(len, rhs.buffer.len());
+        let span = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
+        let rhs_span = DeviceSpan::from_buffer(&rhs.buffer, 0, len);
 
-        self.module()
-            .slice_binary(
-                self.stream(),
+        let config = runtime.get_launch_config(len, DEFAULT_BLOCK_SIZE);
+        let prepared = runtime
+            .module()
+            .prepare_slice_binary_assign(config)
+            .unwrap();
+        runtime
+            .module()
+            .slice_binary_assign(
+                runtime.stream(),
                 &prepared,
-                lhs.descriptor(),
-                rhs.descriptor(),
-                output.descriptor(),
+                span.descriptor(),
+                rhs_span.descriptor(),
                 op,
             )
             .unwrap();
-        self.sync();
-        Vector {
-            buffer: result_buffer,
-        }
+
+        runtime.sync();
     }
 
-    pub fn vector_dot_product(&mut self, vec1: &Vector, vec2: &Vector) -> f32 {
-        assert!(
-            vec1.buffer.len() == vec2.buffer.len(),
-            "Vectors must have the same length for dot product."
-        );
-        let mut buffer = self.get_uninit_buffer(vec1.buffer.len());
-        let config = self.get_launch_config(vec1.buffer.len(), DEFAULT_BLOCK_SIZE);
-        let prepared = self.module().prepare_slice_binary(config).unwrap();
-        let lhs = DeviceSpan::from_buffer(&vec1.buffer, 0, vec1.buffer.len());
-        let rhs = DeviceSpan::from_buffer(&vec2.buffer, 0, vec2.buffer.len());
-        let output_len = buffer.len();
-        let output = DeviceSpanMut::from_buffer(&mut buffer, 0, output_len);
-        self.module()
-            .slice_binary(
-                self.stream(),
-                &prepared,
-                lhs.descriptor(),
-                rhs.descriptor(),
-                output.descriptor(),
-                BinaryOp::Mul,
-            )
-            .unwrap();
-        self.sync();
-        let vector = Vector::new(buffer);
-        let result = vector.sum(self);
-        self.recycle_vector(vector);
+    pub fn for_each<F>(&mut self, runtime: &CudaRuntime, f: F)
+    where
+        F: Fn(f32) -> f32 + Copy,
+    {
+        let len = self.buffer.len();
+        let mut span = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
+        span.for_each(runtime, f);
+        runtime.sync();
+    }
+
+    pub fn dot(&self, rhs: &Vector, runtime: &mut CudaRuntime) -> f32 {
+        assert_eq!(self.len(), rhs.len());
+        let product = runtime.vector_mul(self, rhs);
+        let result = product.sum(runtime);
+        runtime.recycle_vector(product);
         result
     }
 }

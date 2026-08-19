@@ -1,7 +1,9 @@
+mod convert;
 mod matrix;
-mod matrix_compute;
+mod norm;
+mod rows;
 mod vector;
-mod vector_compute;
+mod vector_runtime;
 mod vector_view;
 
 use cuda_core::DeviceBuffer;

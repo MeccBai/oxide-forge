@@ -7,13 +7,22 @@
 
 ## 设计约定
 
-- 创建新 buffer/容器的操作由 `CudaRuntime` 提供；
+- 返回新 `Matrix` 或 `Vector` 的操作由 `CudaRuntime` 提供；
 - 修改自身的操作由 `Matrix`、`Vector`、`VectorView` 提供；
 - `Matrix` 和 `Vector` 拥有显存；View/Span 只借用显存；
 - View/Span 只表示连续区域，不支持 stride；
 - 列方向数据必须先转置或物理重排；
 - 主 stream 上的设备操作尽量异步排队；
 - 返回 host 标量的归约操作必须同步。
+
+| 结果或影响 | API 所属 |
+| --- | --- |
+| 返回新的 `Matrix` 或 `Vector` | `CudaRuntime` |
+| 修改已有 `Matrix` | `Matrix` |
+| 修改已有 `Vector` | `Vector` |
+| 修改借用的行或 Span | `VectorView` |
+| 返回标量或 host 副本 | 源容器自身 |
+| 回收拥有所有权的显存 | `CudaRuntime` |
 
 ## CudaRuntime
 
@@ -98,7 +107,7 @@ let host = matrix.to_host(&runtime);
 index = row * cols + col
 ```
 
-### 创建新 Matrix
+### CudaRuntime：创建新容器
 
 ```rust
 let c = runtime.matrix_multiply(&a, &b);
@@ -152,18 +161,20 @@ API 不需要暴露 stream 选择。
 
 ```rust
 matrix.scale(value, &runtime);
-matrix.add_val(value, &runtime);
+matrix.add_scalar(value, &runtime);
 matrix.for_each(&runtime, move |x| x * 2.0);
 matrix.softmax_rows(&runtime);
 matrix.layer_norm(&runtime);
+matrix.rms_norm(&runtime);
 matrix.binary_assign_by_rows(&bias, BinaryOp::Add, &runtime);
 ```
 
 | API | 同步行为 |
 | --- | --- |
-| `scale/add_val/for_each` | 异步提交 |
+| `scale/add_scalar/for_each` | 异步提交 |
 | `softmax_rows` | 单次异步 launch，每行一个 block |
 | `layer_norm` | 单次异步 launch，每行一个 block |
+| `rms_norm` | 单次异步 launch，每行一个 block |
 | `binary_assign` | 与同形 Matrix 原地逐元素计算，异步提交 |
 | `binary_assign_by_rows` | 对完整 Matrix 启动一次异步广播 kernel |
 
@@ -178,15 +189,16 @@ block，由 CUDA 自动把这些 block 分配到不同 SM。它们不再把 Matr
 | API | 结果 | 复制 |
 | --- | --- | --- |
 | `vector_zip(vectors)` | 将等长 Vector 作为 Matrix 各行 | 是 |
-| `split_view(matrix)` | 按行生成 `Vec<VectorView>` | 否 |
+| `matrix.row_views()` | 按行生成 `Vec<VectorView>` | 否 |
 | `matrix_split(matrix)` | 按行生成独立 Vector | 是 |
 | `broadcast(vector,copies)` | 重复为 `[copies,vector.len]` | 是 |
 | `extract_vector(matrix)` | 单行转移 buffer，多行复制第一行 | 视情况 |
 | `matrix_slice(matrix,cols,rows)` | 二维分块并重排为连续 Matrix | 是 |
-| `to_vector(matrix)` | 消耗 Matrix，把完整 buffer 作为 Vector | 否 |
-| `matrix_copy(matrix)` | 深复制为相同形状的独立 Matrix | 是 |
+| `matrix_into_vector(matrix)` | 消耗 Matrix，把完整 buffer 作为 Vector | 否 |
+| `vector_into_matrix(vector)` | 消耗 Vector，把 buffer 作为单列 Matrix | 否 |
+| `clone_matrix(matrix)` | 深复制为相同形状的独立 Matrix | 是 |
 
-`split_view` 存活期间 Matrix 保持独占可变借用。按列操作应先转置。
+`row_views` 存活期间 Matrix 保持独占可变借用。按列操作应先转置。
 
 ## Vector
 
@@ -207,9 +219,9 @@ vector.to_host(&runtime);
 ### 计算
 
 ```rust
-vector.add(value, &runtime);
+vector.add_scalar(value, &runtime);
 vector.scale(value, &runtime);
-vector.exp(offset, &runtime); // exp(x - offset)
+vector.exp_shifted(offset, &runtime); // exp(x - offset)
 
 let sum = vector.sum(&mut runtime);
 let max = vector.max(&mut runtime);
@@ -217,13 +229,13 @@ vector.softmax(&mut runtime);
 
 let c = runtime.vector_add(&a, &b);
 let product = runtime.vector_binary(&a, &b, BinaryOp::Mul);
-let dot = runtime.vector_dot_product(&a, &b);
+let dot = a.dot(&b, &mut runtime);
 ```
 
-`vector_add/sub/mul/div` 同样是 `vector_binary` 的薄封装。点积内部先使用
-`BinaryOp::Mul` 逐元素相乘，再执行 sum 归约。
+`vector_add/sub/mul/div` 同样是 `vector_binary` 的薄封装。`dot` 返回标量，因此属于
+源 Vector；其临时乘积仍由 `CudaRuntime` 分配和回收。
 
-当前 `vector_binary` 及其四个便利封装在返回前同步。`sum/max/vector_dot_product`
+当前 `vector_binary` 及其四个便利封装在返回前同步。`sum/max/dot`
 返回 host `f32`，同样是同步边界。空输入的 `sum` 返回 `0.0`，`max` 返回
 `f32::MIN`。
 
@@ -241,14 +253,14 @@ let part = vector.span(offset, len);
 `VectorView` 是对连续设备区域的独占可变借用，通常来自：
 
 ```rust
-let mut rows = runtime.split_view(&mut matrix);
+let mut rows = matrix.row_views();
 ```
 
 可用操作：
 
 ```rust
 view.len();
-view.add(value, &runtime);
+view.add_scalar(value, &runtime);
 view.scale(value, &runtime);
 view.for_each(&runtime, f);
 view.sum(&mut runtime);
@@ -435,7 +447,7 @@ Transformer 尺寸。该功能不需要专用 kernel，也没有 Span 传输特�
 | Matrix/View 原地元素操作 | 异步提交 |
 | `vector_binary` 及便利封装 | 返回前同步 |
 | `sum/max/map_sum` | 同步，返回 host 标量 |
-| `matrix_sum_rows/softmax_rows/layer_norm` | 单次行并行 kernel，异步提交 |
+| `matrix_sum_rows/softmax_rows/layer_norm/rms_norm` | 单次行并行 kernel，异步提交 |
 | `softmax_rows_backward/layer_norm_backward` | 单次按行 kernel，异步提交 |
 | `binary_assign_by_rows` | 单次全矩阵广播 kernel，异步提交 |
 | `InferenceTransformer::forward` / `TrainingTransformer::forward` | 返回前同步 |

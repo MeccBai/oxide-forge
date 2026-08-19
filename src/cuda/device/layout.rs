@@ -4,6 +4,7 @@ const TRANSPOSE_TILE_SIZE: usize = 32;
 const TRANSPOSE_BLOCK_ROWS: usize = 8;
 const TRANSPOSE_STRIDE: usize = TRANSPOSE_TILE_SIZE + 1;
 const TRANSPOSE_SHARED_SIZE: usize = TRANSPOSE_TILE_SIZE * TRANSPOSE_STRIDE;
+
 #[device]
 pub(super) fn matrix_transpose_device(
     matrix: &[f32],

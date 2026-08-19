@@ -170,10 +170,12 @@ src/
 │   ├── runtime.rs            context, streams, buffers, synchronization
 │   ├── span.rs               contiguous device-memory borrows
 │   └── container/
-│       ├── matrix.rs         Matrix lifecycle, row operations, conversions
-│       ├── matrix_compute.rs Matrix computation
-│       ├── vector.rs         Vector construction and binary operations
-│       ├── vector_compute.rs in-place Vector operations and reductions
+│       ├── matrix.rs         Matrix basics and matrix-to-matrix operations
+│       ├── convert.rs        layout changes and Matrix/Vector conversions
+│       ├── rows.rs           row-wise operations and reductions
+│       ├── norm.rs           Softmax, LayerNorm, and RMSNorm
+│       ├── vector.rs         Vector queries, reductions, and in-place operations
+│       ├── vector_runtime.rs Vector-producing runtime operations
 │       └── vector_view.rs    contiguous borrowed-view operations
 └── net/
     ├── checkpoint.rs         versioned TOML metadata and binary parameters

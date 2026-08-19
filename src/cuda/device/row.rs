@@ -335,3 +335,51 @@ pub(super) fn layer_norm_backward_device(
     }
 }
 
+#[device]
+pub(super) fn rms_norm_assign_device(
+    input: span::DeviceSliceMutDescriptor<f32>,
+    dim_sqrt: f32,
+    epsilon: f32,
+) {
+    static mut SHARED: shared::SharedArray<f32, 32> = shared::SharedArray::UNINIT;
+    let tid = thread::threadIdx_x() as usize;
+    let block_id = thread::blockIdx_x() as usize;
+    let warp_id = tid / 32;
+    let lane = tid % 32;
+
+    let index = block_id * 1024 + tid;
+
+    let orignal = input.read(index);
+    let mut value = orignal * orignal;
+
+    for delta in [1, 2, 4, 8, 16] {
+        value += warp::shuffle_down_f32(value, delta);
+    }
+
+    if lane == 0 {
+        unsafe { SHARED[warp_id] = value };
+    }
+    thread::sync_threads();
+
+    if tid < 32 {
+        value = unsafe { SHARED[tid] };
+    }
+
+    thread::sync_threads();
+
+    if tid < 32 {
+        for delta in [1, 2, 4, 8, 16] {
+            value += warp::shuffle_down_f32(value, delta);
+        }
+        unsafe { SHARED[tid] = value };
+    }
+
+    thread::sync_threads();
+
+    if index < input.len() {
+        input.write(
+            index,
+            orignal / (unsafe { SHARED[0] } / dim_sqrt + epsilon).sqrt(),
+        );
+    }
+}

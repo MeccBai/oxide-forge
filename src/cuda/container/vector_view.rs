@@ -1,30 +1,10 @@
-use cuda_core::DeviceBuffer;
-
 use crate::cuda::CudaRuntime;
 
-use super::{Vector, VectorView};
-use crate::cuda::span::{DeviceSpan, DeviceSpanMut};
-
-impl Vector {
-    pub fn as_span(&self) -> DeviceSpan<'_, f32> {
-        DeviceSpan::from_buffer(&self.buffer, 0, self.buffer.len())
-    }
-
-    pub fn span(&self, offset: usize, len: usize) -> DeviceSpan<'_, f32> {
-        DeviceSpan::from_buffer(&self.buffer, offset, len)
-    }
-
-    pub fn new(buffer: DeviceBuffer<f32>) -> Self {
-        Vector { buffer }
-    }
-
-    pub fn len(&self) -> usize {
-        self.buffer.len()
-    }
-}
+use super::VectorView;
+use crate::cuda::span::DeviceSpanMut;
 
 impl<'a> VectorView<'a> {
-    pub fn new(span: DeviceSpanMut<'a, f32>) -> Self {
+    pub(crate) fn new(span: DeviceSpanMut<'a, f32>) -> Self {
         VectorView { span }
     }
 
@@ -32,7 +12,7 @@ impl<'a> VectorView<'a> {
         self.span.len()
     }
 
-    pub fn add(&mut self, value: f32, runtime: &CudaRuntime) {
+    pub fn add_scalar(&mut self, value: f32, runtime: &CudaRuntime) {
         self.span.for_each(runtime, move |x| x + value);
     }
 

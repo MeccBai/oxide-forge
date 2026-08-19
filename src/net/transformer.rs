@@ -186,7 +186,7 @@ impl TrainingTransformer {
         runtime.join_streams(&streams[2..]);
         let attention = runtime.matrix_multiply(&probabilities, &v);
         let first_pre_norm = runtime.matrix_add(&positioned, &attention);
-        let mut first_output = runtime.matrix_copy(&first_pre_norm);
+        let mut first_output = runtime.clone_matrix(&first_pre_norm);
         first_output.layer_norm(runtime);
 
         let ffn = self.fcs.forward(first_output, runtime);
@@ -194,7 +194,7 @@ impl TrainingTransformer {
             self.fcs.input().expect("training MLP input cache missing"),
             &ffn,
         );
-        let mut encoded = runtime.matrix_copy(&second_pre_norm);
+        let mut encoded = runtime.clone_matrix(&second_pre_norm);
         encoded.layer_norm(runtime);
 
         let output = self.output_matrix.forward(&encoded, None, runtime);
@@ -283,7 +283,7 @@ impl TrainingTransformer {
             );
         }
 
-        let input_gradient = runtime.matrix_copy(&positioned_gradient);
+        let input_gradient = runtime.clone_matrix(&positioned_gradient);
         let mut position_update = positioned_gradient;
         position_update.scale(learning_rate, runtime);
         self.position_matrix

@@ -155,10 +155,12 @@ src/
 │   ├── runtime.rs            context、stream、buffer 与同步
 │   ├── span.rs               连续设备内存借用
 │   └── container/
-│       ├── matrix.rs         Matrix 生命周期、按行操作与转换
-│       ├── matrix_compute.rs Matrix 计算
-│       ├── vector.rs         Vector 创建和 Vector 间运算
-│       ├── vector_compute.rs Vector 原地计算与归约
+│       ├── matrix.rs         Matrix 基础与矩阵间运算
+│       ├── convert.rs        布局变换及 Matrix/Vector 转换
+│       ├── rows.rs           逐行运算与归约
+│       ├── norm.rs           Softmax、LayerNorm 与 RMSNorm
+│       ├── vector.rs         Vector 查询、归约与原地操作
+│       ├── vector_runtime.rs 创建 Vector 的 Runtime 操作
 │       └── vector_view.rs    连续 View 接口与计算
 └── net/
     ├── checkpoint.rs         版本化 TOML 元数据与二进制参数
