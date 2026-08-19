@@ -11,4 +11,4 @@
 **/*.target
 /docs/impl
 .idea
-/scripts
+/log/

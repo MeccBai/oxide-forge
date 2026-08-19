@@ -228,9 +228,9 @@ pub(in crate::cuda) mod kernels {
     #[launch_contract(domain = 1)]
     pub fn rms_norm_assign(
         input: span::DeviceSliceMutDescriptor<f32>,
-        dim_sqrt: f32,
+        dim: f32,
         epsilon: f32,
     ) {
-        row::rms_norm_assign_device(input, dim_sqrt, epsilon);
+        row::rms_norm_assign_device(input, dim, epsilon);
     }
 }

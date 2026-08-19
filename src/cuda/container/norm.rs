@@ -62,7 +62,7 @@ impl Matrix {
                 runtime.stream(),
                 &prepared,
                 matrix.descriptor(),
-                (self.cols as f32).sqrt(),
+                self.cols as f32,
                 1e-5,
             )
             .unwrap();

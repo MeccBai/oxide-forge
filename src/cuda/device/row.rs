@@ -338,7 +338,7 @@ pub(super) fn layer_norm_backward_device(
 #[device]
 pub(super) fn rms_norm_assign_device(
     input: span::DeviceSliceMutDescriptor<f32>,
-    dim_sqrt: f32,
+    dim: f32,
     epsilon: f32,
 ) {
     static mut SHARED: shared::SharedArray<f32, 32> = shared::SharedArray::UNINIT;
@@ -379,7 +379,7 @@ pub(super) fn rms_norm_assign_device(
     if index < input.len() {
         input.write(
             index,
-            orignal / (unsafe { SHARED[0] } / dim_sqrt + epsilon).sqrt(),
+            orignal / (unsafe { SHARED[0] } / dim + epsilon).sqrt(),
         );
     }
 }
