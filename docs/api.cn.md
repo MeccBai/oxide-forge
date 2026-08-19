@@ -20,7 +20,7 @@
 ### 生命周期与同步
 
 ```rust
-let runtime = CudaRuntime::new()?;
+let mut runtime = CudaRuntime::new()?;
 
 runtime.stream();
 runtime.sync();
@@ -33,6 +33,7 @@ runtime.sync();
 | `module()` | 获取已加载的 CUDA-Oxide module，供内部封装使用 |
 | `sync()` | 等待主 stream |
 | `create_extra_streams(n)` | 从主 stream fork `n` 个非阻塞 stream |
+| `fork_streams(streams)` | 复用已有 stream 前刷新 fork 依赖点 |
 | `join_streams(streams)` | 让主 stream 等待额外 stream，不立即阻塞 CPU |
 | `sync_streams(streams)` | join 后同步主 stream |
 
@@ -43,7 +44,9 @@ runtime.sync_streams(&streams);
 ```
 
 fork 出来的 stream 会等待 fork 前主 stream 上的工作。只调用 `runtime.sync()` 不会
-自动等待尚未 join 的额外 stream。
+自动等待尚未 join 的额外 stream。复用已有 stream 提交下一批任务前，需要调用
+`fork_streams`，使其等待主 stream 上的新输入。`join_streams` 只插入 CUDA event
+依赖，不同步 CPU。
 
 ### DeviceBuffer
 
@@ -138,6 +141,10 @@ launch 共享的 host 枚举参数，warp 内不会因不同元素选择不同�
 `matrix_multiply` 使用 Tensor Core TF32 乘法，并以 `f32` 累加和输出。它用少量输入尾数
 精度换取显著吞吐提升，因此不是严格的 IEEE FP32 GEMM。
 
+会分配结果的 `matrix_multiply` 是内部 `matrix_multiply_into_on` 的薄壳。后者接收
+预分配输出和明确的 stream，让模型执行器可以调度互不依赖的 GEMM，而普通 container
+API 不需要暴露 stream 选择。
+
 三者向主 stream 异步提交。后续同 stream kernel 可以立即使用返回 Matrix，无需手动
 插入同步。
 
@@ -193,7 +200,9 @@ vector.len();
 vector.to_host(&runtime);
 ```
 
-`new_vector` 只需要 `&CudaRuntime`，不要求可变 Runtime。
+分配和回收 API 直接修改按精确长度分类的 buffer pool，因此接收
+`&mut CudaRuntime`。只读访问以及不分配内存的原位 kernel 仍接收
+`&CudaRuntime`。
 
 ### 计算
 
@@ -202,9 +211,9 @@ vector.add(value, &runtime);
 vector.scale(value, &runtime);
 vector.exp(offset, &runtime); // exp(x - offset)
 
-let sum = vector.sum(&runtime);
-let max = vector.max(&runtime);
-vector.softmax(&runtime);
+let sum = vector.sum(&mut runtime);
+let max = vector.max(&mut runtime);
+vector.softmax(&mut runtime);
 
 let c = runtime.vector_add(&a, &b);
 let product = runtime.vector_binary(&a, &b, BinaryOp::Mul);
@@ -242,9 +251,9 @@ view.len();
 view.add(value, &runtime);
 view.scale(value, &runtime);
 view.for_each(&runtime, f);
-view.sum(&runtime);
-view.map_sum(&runtime, f);
-view.softmax(&runtime);
+view.sum(&mut runtime);
+view.map_sum(&mut runtime, f);
+view.softmax(&mut runtime);
 ```
 
 View 直接修改原 Matrix，不拥有或释放内存。
@@ -284,8 +293,8 @@ runtime.concat_buffers_from_span(&spans);
 
 ```rust
 let linear = Linear::new(weights, bias, Activation::Gelu);
-let output = linear.forward(&input, None, &runtime);
-let output = linear.forward(&input, Some(&residual), &runtime);
+let output = linear.forward(&input, None, &mut runtime);
+let output = linear.forward(&input, Some(&residual), &mut runtime);
 ```
 
 `weights` 形状为 `[input_features,output_features]`，bias 长度必须等于输出列数。
@@ -302,7 +311,7 @@ workspace 或梯度生命周期；这些由拥有完整局部数据流的 MLP �
 
 ```rust
 let mlp = InferenceMLP::new(vec![layer1, layer2], None);
-let output = mlp.forward(&input, &runtime);
+let output = mlp.forward(&input, &mut runtime);
 ```
 
 `MlpExecutor` 统一保存 Linear 和 residual 配置，并提供 forward/backward 执行逻辑。
@@ -352,6 +361,10 @@ output projection     [sequence,output]
 `InferenceTransformer` 和 `TrainingTransformer` 都采用 Post-LN。训练版本缓存
 Q/K/V、Softmax probability、两次 LayerNorm 输入以及最终编码结果，并实现完整反传：
 
+两个 forward 执行器都会预分配 Q/K/V 输出，在三条可复用 stream 上独立发射 Linear
+projection。主 stream 在 `QK^T` 前只 join Q/K，让 V 可以继续与 score 路径重叠，并在
+attention GEMM 前才 join V。所有 join 都是 CUDA event 依赖，不会同步 CPU。
+
 ```text
 output projection
 → second LayerNorm
@@ -382,14 +395,14 @@ model.bin    连续 little-endian f32 参数
 ```rust
 model.dump_to_file("model.toml", &runtime)?;
 
-let linear = Linear::load_from_file("linear.toml", &runtime)?;
+let linear = Linear::load_from_file("linear.toml", &mut runtime)?;
 
-let mlp = MlpExecutor::load_from_file("model.toml", &runtime)?;
-let mlp = InferenceMLP::load_from_file("model.toml", &runtime)?;
-let mlp = TrainingMlp::load_from_file("model.toml", &runtime)?;
+let mlp = MlpExecutor::load_from_file("model.toml", &mut runtime)?;
+let mlp = InferenceMLP::load_from_file("model.toml", &mut runtime)?;
+let mlp = TrainingMlp::load_from_file("model.toml", &mut runtime)?;
 
-let model = InferenceTransformer::load_from_file("model.toml", &runtime)?;
-let model = TrainingTransformer::load_from_file("model.toml", &runtime)?;
+let model = InferenceTransformer::load_from_file("model.toml", &mut runtime)?;
+let model = TrainingTransformer::load_from_file("model.toml", &mut runtime)?;
 ```
 
 `Linear`、`MlpExecutor`、两种 MLP 和两种 Transformer 都提供 `dump_to_file` 与

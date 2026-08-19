@@ -23,7 +23,7 @@ does not aim for unrestricted generality.
 ### Lifecycle and synchronization
 
 ```rust
-let runtime = CudaRuntime::new()?;
+let mut runtime = CudaRuntime::new()?;
 
 runtime.stream();
 runtime.sync();
@@ -36,6 +36,7 @@ runtime.sync();
 | `module()` | Borrow the loaded CUDA-Oxide module for internal wrappers |
 | `sync()` | Wait for the primary stream |
 | `create_extra_streams(n)` | Fork `n` non-blocking streams from the primary stream |
+| `fork_streams(streams)` | Refresh the fork point before reusing existing streams |
 | `join_streams(streams)` | Make the primary stream wait for extra streams without immediately blocking the CPU |
 | `sync_streams(streams)` | Join the streams, then synchronize the primary stream |
 
@@ -46,6 +47,9 @@ runtime.sync_streams(&streams);
 ```
 
 A forked stream waits for work submitted to the primary stream before the fork.
+Call `fork_streams` before submitting another reusable batch so it observes the
+new primary-stream inputs. `join_streams` only inserts event dependencies; it
+does not synchronize the CPU.
 Calling `runtime.sync()` alone does not wait for extra streams that have not been
 joined.
 
@@ -148,6 +152,11 @@ kernel launch.
 output. This trades a small amount of input-mantissa precision for substantially
 higher throughput; it is not a strict IEEE FP32 GEMM.
 
+The allocating `matrix_multiply` entry point is a thin wrapper around the
+internal `matrix_multiply_into_on`. The latter accepts a preallocated output and
+an explicit stream, allowing model executors to schedule independent GEMMs
+without exposing stream selection through the ordinary container API.
+
 These operations submit work to the primary stream asynchronously. A later
 kernel on the same stream may consume the returned Matrix without an explicit
 synchronization.
@@ -207,8 +216,9 @@ vector.len();
 vector.to_host(&runtime);
 ```
 
-`new_vector` only needs `&CudaRuntime`; the Runtime itself does not need to be
-mutable.
+Allocation and recycling APIs take `&mut CudaRuntime` because they mutate the
+exact-size buffer pool directly. Read-only access and in-place kernels that do
+not allocate continue to take `&CudaRuntime`.
 
 ### Computation
 
@@ -217,9 +227,9 @@ vector.add(value, &runtime);
 vector.scale(value, &runtime);
 vector.exp(offset, &runtime); // exp(x - offset)
 
-let sum = vector.sum(&runtime);
-let max = vector.max(&runtime);
-vector.softmax(&runtime);
+let sum = vector.sum(&mut runtime);
+let max = vector.max(&mut runtime);
+vector.softmax(&mut runtime);
 
 let c = runtime.vector_add(&a, &b);
 let product = runtime.vector_binary(&a, &b, BinaryOp::Mul);
@@ -261,9 +271,9 @@ view.len();
 view.add(value, &runtime);
 view.scale(value, &runtime);
 view.for_each(&runtime, f);
-view.sum(&runtime);
-view.map_sum(&runtime, f);
-view.softmax(&runtime);
+view.sum(&mut runtime);
+view.map_sum(&mut runtime, f);
+view.softmax(&mut runtime);
 ```
 
 A view mutates its source Matrix directly and neither owns nor frees memory.
@@ -304,8 +314,8 @@ runtime.concat_buffers_from_span(&spans);
 
 ```rust
 let linear = Linear::new(weights, bias, Activation::Gelu);
-let output = linear.forward(&input, None, &runtime);
-let output = linear.forward(&input, Some(&residual), &runtime);
+let output = linear.forward(&input, None, &mut runtime);
+let output = linear.forward(&input, Some(&residual), &mut runtime);
 ```
 
 `weights` has shape `[input_features, output_features]`. If present, the bias
@@ -324,7 +334,7 @@ layer owns scheduling because it sees the complete local data flow.
 
 ```rust
 let mlp = InferenceMLP::new(vec![layer1, layer2], None);
-let output = mlp.forward(&input, &runtime);
+let output = mlp.forward(&input, &mut runtime);
 ```
 
 `MlpExecutor` owns the Linear layers and residual configuration and provides the
@@ -384,6 +394,12 @@ output projection     [sequence, output]
 layout. The training executor caches Q/K/V, Softmax probabilities, both
 LayerNorm inputs, and the final encoded value. Its backward path covers:
 
+Both forward executors preallocate Q/K/V outputs, fork three reusable streams,
+and launch the projection Linear layers independently. The primary stream joins
+Q and K before `QK^T`, while V remains eligible to overlap the score path and is
+joined only before the attention GEMM. The joins are CUDA event dependencies,
+not host synchronization.
+
 ```text
 output projection
 → second LayerNorm
@@ -415,14 +431,14 @@ entry points are:
 ```rust
 model.dump_to_file("model.toml", &runtime)?;
 
-let linear = Linear::load_from_file("linear.toml", &runtime)?;
+let linear = Linear::load_from_file("linear.toml", &mut runtime)?;
 
-let mlp = MlpExecutor::load_from_file("model.toml", &runtime)?;
-let mlp = InferenceMLP::load_from_file("model.toml", &runtime)?;
-let mlp = TrainingMlp::load_from_file("model.toml", &runtime)?;
+let mlp = MlpExecutor::load_from_file("model.toml", &mut runtime)?;
+let mlp = InferenceMLP::load_from_file("model.toml", &mut runtime)?;
+let mlp = TrainingMlp::load_from_file("model.toml", &mut runtime)?;
 
-let model = InferenceTransformer::load_from_file("model.toml", &runtime)?;
-let model = TrainingTransformer::load_from_file("model.toml", &runtime)?;
+let model = InferenceTransformer::load_from_file("model.toml", &mut runtime)?;
+let model = TrainingTransformer::load_from_file("model.toml", &mut runtime)?;
 ```
 
 `Linear`, `MlpExecutor`, both MLP forms, and both Transformer forms provide

@@ -1,4 +1,4 @@
-use cuda_core::{DeviceBuffer, LaunchConfig1D};
+use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
 
 use crate::cuda::{
     BinaryOp, DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, runtime::CudaRuntime,
@@ -68,16 +68,33 @@ impl Matrix {
     where
         F: Fn(f32) -> f32 + Copy,
     {
+        self.for_each_on(runtime, runtime.stream(), f);
+    }
+
+    pub(crate) fn for_each_on<F>(&mut self, runtime: &CudaRuntime, stream: &CudaStream, f: F)
+    where
+        F: Fn(f32) -> f32 + Copy,
+    {
         if self.buffer.is_empty() {
             return;
         }
 
         let len = self.buffer.len();
         let mut span = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
-        span.for_each(runtime, f);
+        span.for_each_on(runtime, stream, f);
     }
 
     pub fn binary_assign_by_rows(&mut self, vec: &Vector, op: BinaryOp, runtime: &CudaRuntime) {
+        self.binary_assign_by_rows_on(vec, op, runtime, runtime.stream());
+    }
+
+    pub(crate) fn binary_assign_by_rows_on(
+        &mut self,
+        vec: &Vector,
+        op: BinaryOp,
+        runtime: &CudaRuntime,
+        stream: &CudaStream,
+    ) {
         assert_eq!(self.cols, vec.len());
         if self.buffer.is_empty() {
             return;
@@ -93,7 +110,7 @@ impl Matrix {
         runtime
             .module()
             .matrix_binary_assign_by_rows(
-                runtime.stream(),
+                stream,
                 &prepared,
                 matrix.descriptor(),
                 rhs.descriptor(),
@@ -106,13 +123,14 @@ impl Matrix {
 
 impl CudaRuntime {
     /// Consumes a matrix and returns its allocation to the runtime pool.
-    pub fn recycle_matrix(&self, matrix: Matrix) {
+    pub fn recycle_matrix(&mut self, matrix: Matrix) {
         self.recycle_buffer(matrix.buffer);
     }
 
-    pub fn matrix_sum_rows(&self, matrix: &Matrix) -> Vector {
+    pub fn matrix_sum_rows(&mut self, matrix: &Matrix) -> Vector {
         if matrix.rows == 0 {
-            return self.create_vector(self.get_uninit_buffer(0));
+            let buffer = self.get_uninit_buffer(0);
+            return self.create_vector(buffer);
         }
         assert!(matrix.cols > 0 && matrix.cols <= DEFAULT_BLOCK_SIZE);
         let mut buffer = self.get_uninit_buffer(matrix.rows);
@@ -134,7 +152,7 @@ impl CudaRuntime {
     }
 
     pub fn softmax_rows_backward(
-        &self,
+        &mut self,
         probabilities: &Matrix,
         output_gradient: &Matrix,
     ) -> Matrix {
@@ -163,7 +181,7 @@ impl CudaRuntime {
         self.create_matrix(buffer, probabilities.rows, probabilities.cols)
     }
 
-    pub fn layer_norm_backward(&self, input: &Matrix, output_gradient: &Matrix) -> Matrix {
+    pub fn layer_norm_backward(&mut self, input: &Matrix, output_gradient: &Matrix) -> Matrix {
         assert_eq!(input.rows, output_gradient.rows);
         assert_eq!(input.cols, output_gradient.cols);
 
@@ -190,7 +208,7 @@ impl CudaRuntime {
         self.create_matrix(buffer, input.rows, input.cols)
     }
 
-    pub fn new_matrix(&self, init_type: InitType, rows: usize, cols: usize) -> Matrix {
+    pub fn new_matrix(&mut self, init_type: InitType, rows: usize, cols: usize) -> Matrix {
         let size = rows * cols;
         if init_type.is_zero() {
             return Matrix {
@@ -230,6 +248,14 @@ impl CudaRuntime {
         Matrix { buffer, rows, cols }
     }
 
+    pub(crate) fn new_uninit_matrix(&mut self, rows: usize, cols: usize) -> Matrix {
+        let len = rows
+            .checked_mul(cols)
+            .expect("matrix element count overflow");
+        let buffer = self.get_uninit_buffer(len);
+        self.create_matrix(buffer, rows, cols)
+    }
+
     pub(crate) fn create_matrix(
         &self,
         buffer: DeviceBuffer<f32>,
@@ -239,7 +265,7 @@ impl CudaRuntime {
         Matrix { buffer, rows, cols }
     }
 
-    pub fn vector_zip(&self, vecs: &[Vector]) -> Matrix {
+    pub fn vector_zip(&mut self, vecs: &[Vector]) -> Matrix {
         let spans = vecs.iter().map(|v| v.as_span()).collect::<Vec<_>>();
         let row = spans.len();
         let col = spans[0].len();
@@ -255,20 +281,23 @@ impl CudaRuntime {
             .collect()
     }
 
-    pub fn matrix_split(&self, matrix: &mut Matrix) -> Vec<Vector> {
-        DeviceSpanMut::chunks(&mut matrix.buffer, matrix.cols)
-            .into_iter()
-            .map(|span| self.create_vector(span.to_buffer(self)))
-            .collect()
+    pub fn matrix_split(&mut self, matrix: &mut Matrix) -> Vec<Vector> {
+        let spans = DeviceSpanMut::chunks(&mut matrix.buffer, matrix.cols);
+        let mut vectors = Vec::with_capacity(spans.len());
+        for span in spans {
+            let buffer = span.to_buffer(self);
+            vectors.push(self.create_vector(buffer));
+        }
+        vectors
     }
 
-    pub fn broadcast(&self, vector: &Vector, copies: usize) -> Matrix {
+    pub fn broadcast(&mut self, vector: &Vector, copies: usize) -> Matrix {
         let spans = vec![vector.as_span(); copies];
         let buffer = self.concat_buffers_from_span(&spans);
         self.create_matrix(buffer, copies, vector.len())
     }
 
-    pub fn extract_vector(&self, matrix: Matrix) -> Vector {
+    pub fn extract_vector(&mut self, matrix: Matrix) -> Vector {
         assert!(
             matrix.rows > 0,
             "cannot extract a vector from an empty matrix"
@@ -279,10 +308,11 @@ impl CudaRuntime {
         }
 
         let span = DeviceSpan::from_buffer(&matrix.buffer, 0, matrix.cols);
-        self.create_vector(span.to_buffer(self))
+        let buffer = span.to_buffer(self);
+        self.create_vector(buffer)
     }
 
-    pub fn matrix_slice(&self, matrix: &Matrix, cols: usize, rows: usize) -> Vec<Matrix> {
+    pub fn matrix_slice(&mut self, matrix: &Matrix, cols: usize, rows: usize) -> Vec<Matrix> {
         assert!(cols > 0, "matrix slice cols must be non-zero");
         assert!(rows > 0, "matrix slice rows must be non-zero");
         assert_eq!(
@@ -324,7 +354,7 @@ impl CudaRuntime {
         self.create_vector(matrix.buffer)
     }
 
-    pub fn matrix_copy(&self, matrix: &Matrix) -> Matrix {
+    pub fn matrix_copy(&mut self, matrix: &Matrix) -> Matrix {
         let buffer = self.clone_buffer(&matrix.buffer);
         self.create_matrix(buffer, matrix.rows, matrix.cols)
     }

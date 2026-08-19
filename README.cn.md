@@ -119,7 +119,7 @@ cargo oxide run --lineinfo
 下面的示例构造一个 `[batch, input_features]` 输入，并通过 Linear 完成特征映射：
 
 ```rust
-let runtime = CudaRuntime::new()?;
+let mut runtime = CudaRuntime::new()?;
 
 let input = runtime.new_matrix(InitType::Random, 256, 128);
 let projection = Linear::new(
@@ -128,7 +128,7 @@ let projection = Linear::new(
     Activation::Identity,
 );
 
-let output = projection.forward(&input, None, &runtime);
+let output = projection.forward(&input, None, &mut runtime);
 runtime.sync();
 
 assert_eq!((output.rows(), output.cols()), (256, 64));
@@ -141,8 +141,17 @@ assert_eq!((output.rows(), output.cols()), (256, 64));
 
 ```text
 src/
-├── cuda.rs                    CUDA kernel 与 module 入口
+├── cuda.rs                    CUDA 类型与模块路由入口
 ├── cuda/
+│   ├── device/
+│   │   ├── common.rs         device 公共辅助函数
+│   │   ├── elementwise.rs    逐元素 device 实现
+│   │   ├── reduction.rs      归约 device 实现
+│   │   ├── row.rs            逐行 device 实现
+│   │   ├── gemm.rs           FP32 与 Tensor Core GEMM 实现
+│   │   ├── layout.rs         转置与分块重排实现
+│   │   ├── module.rs         单一 `#[cuda_module]` 内的薄入口
+│   │   └── mod.rs            device 侧模块路由
 │   ├── runtime.rs            context、stream、buffer 与同步
 │   ├── span.rs               连续设备内存借用
 │   └── container/

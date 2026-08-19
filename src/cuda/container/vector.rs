@@ -20,7 +20,7 @@ impl Vector {
 
 impl CudaRuntime {
     /// Consumes a vector and returns its allocation to the runtime pool.
-    pub fn recycle_vector(&self, vector: Vector) {
+    pub fn recycle_vector(&mut self, vector: Vector) {
         self.recycle_buffer(vector.buffer);
     }
 
@@ -28,7 +28,7 @@ impl CudaRuntime {
         Vector { buffer }
     }
 
-    pub fn new_vector(&self, init_type: InitType, size: usize) -> Vector {
+    pub fn new_vector(&mut self, init_type: InitType, size: usize) -> Vector {
         if init_type.is_zero() {
             return Vector {
                 buffer: self.get_zerod_buffer(size),
@@ -69,29 +69,29 @@ impl CudaRuntime {
         }
     }
 
-    pub fn clone_vector(&self, vec: &Vector) -> Vector {
+    pub fn clone_vector(&mut self, vec: &Vector) -> Vector {
         Vector {
             buffer: self.clone_buffer(&vec.buffer),
         }
     }
 
-    pub fn vector_add(&self, vec1: &Vector, vec2: &Vector) -> Vector {
+    pub fn vector_add(&mut self, vec1: &Vector, vec2: &Vector) -> Vector {
         self.vector_binary(vec1, vec2, BinaryOp::Add)
     }
 
-    pub fn vector_sub(&self, vec1: &Vector, vec2: &Vector) -> Vector {
+    pub fn vector_sub(&mut self, vec1: &Vector, vec2: &Vector) -> Vector {
         self.vector_binary(vec1, vec2, BinaryOp::Sub)
     }
 
-    pub fn vector_mul(&self, vec1: &Vector, vec2: &Vector) -> Vector {
+    pub fn vector_mul(&mut self, vec1: &Vector, vec2: &Vector) -> Vector {
         self.vector_binary(vec1, vec2, BinaryOp::Mul)
     }
 
-    pub fn vector_div(&self, vec1: &Vector, vec2: &Vector) -> Vector {
+    pub fn vector_div(&mut self, vec1: &Vector, vec2: &Vector) -> Vector {
         self.vector_binary(vec1, vec2, BinaryOp::Div)
     }
 
-    pub fn vector_binary(&self, vec1: &Vector, vec2: &Vector, op: BinaryOp) -> Vector {
+    pub fn vector_binary(&mut self, vec1: &Vector, vec2: &Vector, op: BinaryOp) -> Vector {
         assert_eq!(vec1.buffer.len(), vec2.buffer.len());
         let mut result_buffer = self.get_uninit_buffer(vec1.buffer.len());
 
@@ -119,7 +119,7 @@ impl CudaRuntime {
         }
     }
 
-    pub fn vector_dot_product(&self, vec1: &Vector, vec2: &Vector) -> f32 {
+    pub fn vector_dot_product(&mut self, vec1: &Vector, vec2: &Vector) -> f32 {
         assert!(
             vec1.buffer.len() == vec2.buffer.len(),
             "Vectors must have the same length for dot product."
@@ -143,6 +143,8 @@ impl CudaRuntime {
             .unwrap();
         self.sync();
         let vector = Vector::new(buffer);
-        vector.sum(self)
+        let result = vector.sum(self);
+        self.recycle_vector(vector);
+        result
     }
 }

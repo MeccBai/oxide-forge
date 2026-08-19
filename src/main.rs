@@ -7,52 +7,28 @@ use crate::net::linear::Linear;
 use crate::net::mlp::InferenceMLP;
 
 fn main() {
-    let runtime = cuda::CudaRuntime::new().unwrap();
+    let mut runtime = cuda::CudaRuntime::new().unwrap();
 
     // seq × hidden
-    let input = runtime.new_matrix(cuda::InitType::Random, 1024, 768);
+    let input = runtime.new_matrix(Random, 1024, 768);
 
     // hidden × hidden
-    let matrix_q = Linear::new(
-        runtime.new_matrix(cuda::InitType::Random, 768, 768),
-        None,
-        Identity,
-    );
-    let matrix_k = Linear::new(
-        runtime.new_matrix(cuda::InitType::Random, 768, 768),
-        None,
-        Identity,
-    );
-    let matrix_v = Linear::new(
-        runtime.new_matrix(cuda::InitType::Random, 768, 768),
-        None,
-        Identity,
-    );
+    let matrix_q = Linear::new(runtime.new_matrix(Random, 768, 768), None, Identity);
+    let matrix_k = Linear::new(runtime.new_matrix(Random, 768, 768), None, Identity);
+    let matrix_v = Linear::new(runtime.new_matrix(Random, 768, 768), None, Identity);
 
     // seq × hidden
-    let matrix_position = runtime.new_matrix(cuda::InitType::Random, 1024, 768);
+    let matrix_position = runtime.new_matrix(Random, 1024, 768);
 
     let fcs = InferenceMLP::new(
         vec![
-            Linear::new(
-                runtime.new_matrix(cuda::InitType::Random, 768, 3072),
-                None,
-                Gelu,
-            ),
-            Linear::new(
-                runtime.new_matrix(cuda::InitType::Random, 3072, 768),
-                None,
-                Identity,
-            ),
+            Linear::new(runtime.new_matrix(Random, 768, 3072), None, Gelu),
+            Linear::new(runtime.new_matrix(Random, 3072, 768), None, Identity),
         ],
         None,
     );
 
-    let output_matrix = Linear::new(
-        runtime.new_matrix(cuda::InitType::Random, 768, 256),
-        None,
-        Identity,
-    );
+    let output_matrix = Linear::new(runtime.new_matrix(Random, 768, 256), None, Identity);
 
     let mut transformer = net::transformer::InferenceTransformer::new(
         matrix_q,
@@ -77,7 +53,7 @@ fn main() {
 
     for _ in 0..100 {
         let time_now = std::time::Instant::now();
-        let output = transformer.forward(&input, &runtime);
+        let output = transformer.forward(&input, &mut runtime);
         let time_duration = time_now.elapsed();
         average += time_duration;
         println!("Time taken: {:?}", time_duration);

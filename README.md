@@ -134,7 +134,7 @@ The following example maps a `[batch, input_features]` matrix through a Linear
 layer:
 
 ```rust
-let runtime = CudaRuntime::new()?;
+let mut runtime = CudaRuntime::new()?;
 
 let input = runtime.new_matrix(InitType::Random, 256, 128);
 let projection = Linear::new(
@@ -143,7 +143,7 @@ let projection = Linear::new(
     Activation::Identity,
 );
 
-let output = projection.forward(&input, None, &runtime);
+let output = projection.forward(&input, None, &mut runtime);
 runtime.sync();
 
 assert_eq!((output.rows(), output.cols()), (256, 64));
@@ -156,8 +156,17 @@ usage. A stable public crate interface is not a present goal.
 
 ```text
 src/
-├── cuda.rs                    CUDA kernels and module entry point
+├── cuda.rs                    CUDA types and module routing entry point
 ├── cuda/
+│   ├── device/
+│   │   ├── common.rs         shared device helpers
+│   │   ├── elementwise.rs    elementwise device implementations
+│   │   ├── reduction.rs      reduction device implementations
+│   │   ├── row.rs            row-wise device implementations
+│   │   ├── gemm.rs           FP32 and Tensor Core GEMM implementations
+│   │   ├── layout.rs         transpose and tiled-layout implementations
+│   │   ├── module.rs         thin entries in one `#[cuda_module]`
+│   │   └── mod.rs            device-side module routing
 │   ├── runtime.rs            context, streams, buffers, synchronization
 │   ├── span.rs               contiguous device-memory borrows
 │   └── container/

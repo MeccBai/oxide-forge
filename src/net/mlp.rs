@@ -37,7 +37,7 @@ impl MlpExecutor {
         }
     }
 
-    pub fn forward(&self, input: &Matrix, runtime: &CudaRuntime) -> Matrix {
+    pub fn forward(&self, input: &Matrix, runtime: &mut CudaRuntime) -> Matrix {
         let mut output: Option<Matrix> = None;
         let mut residual_cache: Option<Matrix> = None;
 
@@ -88,7 +88,7 @@ impl MlpExecutor {
         layer_inputs: &[Matrix],
         output_gradient: &Matrix,
         learning_rate: f32,
-        runtime: &CudaRuntime,
+        runtime: &mut CudaRuntime,
     ) -> Matrix {
         assert_eq!(layer_inputs.len(), self.layers.len());
 
@@ -140,7 +140,7 @@ impl MlpExecutor {
 
     pub fn load_from_file<P: AsRef<Path>>(
         path: P,
-        runtime: &CudaRuntime,
+        runtime: &mut CudaRuntime,
     ) -> Result<Self, Box<dyn Error>> {
         checkpoint::load_mlp_file(path.as_ref(), runtime)
     }
@@ -161,7 +161,7 @@ impl InferenceMLP {
         }
     }
 
-    pub fn forward(&self, input: &Matrix, runtime: &CudaRuntime) -> Matrix {
+    pub fn forward(&self, input: &Matrix, runtime: &mut CudaRuntime) -> Matrix {
         self.executor.forward(input, runtime)
     }
 
@@ -175,7 +175,7 @@ impl InferenceMLP {
 
     pub fn load_from_file<P: AsRef<Path>>(
         path: P,
-        runtime: &CudaRuntime,
+        runtime: &mut CudaRuntime,
     ) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
             executor: MlpExecutor::load_from_file(path, runtime)?,
@@ -201,7 +201,7 @@ impl TrainingMlp {
         }
     }
 
-    pub fn forward(&mut self, input: Matrix, runtime: &CudaRuntime) -> Matrix {
+    pub fn forward(&mut self, input: Matrix, runtime: &mut CudaRuntime) -> Matrix {
         self.layer_inputs.clear();
         self.layer_inputs.reserve(self.executor.layers.len());
         self.layer_inputs.push(input);
@@ -228,7 +228,7 @@ impl TrainingMlp {
         &mut self,
         output_gradient: &Matrix,
         learning_rate: f32,
-        runtime: &CudaRuntime,
+        runtime: &mut CudaRuntime,
     ) -> Matrix {
         self.executor
             .backward(&self.layer_inputs, output_gradient, learning_rate, runtime)
@@ -248,7 +248,7 @@ impl TrainingMlp {
 
     pub fn load_from_file<P: AsRef<Path>>(
         path: P,
-        runtime: &CudaRuntime,
+        runtime: &mut CudaRuntime,
     ) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
             layer_inputs: Vec::new(),

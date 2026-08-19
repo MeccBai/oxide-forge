@@ -236,7 +236,7 @@ pub(crate) fn dump_linear_file(
     write_metadata(&metadata_path, &metadata)
 }
 
-pub(crate) fn load_linear_file(path: &Path, runtime: &CudaRuntime) -> CheckpointResult<Linear> {
+pub(crate) fn load_linear_file(path: &Path, runtime: &mut CudaRuntime) -> CheckpointResult<Linear> {
     let metadata_path = normalize_metadata_path(path)?;
     let metadata: LinearFileMetadata = read_metadata(&metadata_path)?;
     validate_header(
@@ -252,7 +252,10 @@ pub(crate) fn load_linear_file(path: &Path, runtime: &CudaRuntime) -> Checkpoint
     load_linear(&metadata.linear, &mut reader, runtime)
 }
 
-pub(crate) fn load_mlp_file(path: &Path, runtime: &CudaRuntime) -> CheckpointResult<MlpExecutor> {
+pub(crate) fn load_mlp_file(
+    path: &Path,
+    runtime: &mut CudaRuntime,
+) -> CheckpointResult<MlpExecutor> {
     let metadata_path = normalize_metadata_path(path)?;
     let metadata: MlpFileMetadata = read_metadata(&metadata_path)?;
     validate_header(
@@ -304,7 +307,7 @@ pub(crate) fn dump_training_transformer_file(
 
 pub(crate) fn load_inference_transformer_file(
     path: &Path,
-    runtime: &CudaRuntime,
+    runtime: &mut CudaRuntime,
 ) -> CheckpointResult<InferenceTransformer> {
     let (metadata, mut reader) = open_transformer_file(path)?;
     let q_matrix = load_linear(&metadata.transformer.query, &mut reader, runtime)?;
@@ -331,7 +334,7 @@ pub(crate) fn load_inference_transformer_file(
 
 pub(crate) fn load_training_transformer_file(
     path: &Path,
-    runtime: &CudaRuntime,
+    runtime: &mut CudaRuntime,
 ) -> CheckpointResult<TrainingTransformer> {
     let (metadata, mut reader) = open_transformer_file(path)?;
     let q_matrix = load_linear(&metadata.transformer.query, &mut reader, runtime)?;
@@ -439,7 +442,7 @@ fn load_mlp(
     metadata: &MlpMetadata,
     loss: Loss,
     reader: &mut ParameterReader,
-    runtime: &CudaRuntime,
+    runtime: &mut CudaRuntime,
 ) -> CheckpointResult<MlpExecutor> {
     let layers = metadata
         .layers
@@ -474,7 +477,7 @@ fn dump_linear(
 fn load_linear(
     metadata: &LinearMetadata,
     reader: &mut ParameterReader,
-    runtime: &CudaRuntime,
+    runtime: &mut CudaRuntime,
 ) -> CheckpointResult<Linear> {
     let weights = load_matrix(&metadata.weights, reader, runtime)?;
     let bias = metadata
@@ -503,7 +506,7 @@ fn dump_matrix(
 fn load_matrix(
     metadata: &MatrixMetadata,
     reader: &mut ParameterReader,
-    runtime: &CudaRuntime,
+    runtime: &mut CudaRuntime,
 ) -> CheckpointResult<Matrix> {
     let len = checked_elements(metadata.rows, metadata.cols)?;
     let values = reader.read_f32(metadata.byte_start, metadata.byte_end, len)?;
@@ -528,7 +531,7 @@ fn dump_vector(
 fn load_vector(
     metadata: &VectorMetadata,
     reader: &mut ParameterReader,
-    runtime: &CudaRuntime,
+    runtime: &mut CudaRuntime,
 ) -> CheckpointResult<Vector> {
     let values = reader.read_f32(metadata.byte_start, metadata.byte_end, metadata.len)?;
     let buffer = DeviceBuffer::from_host(runtime.stream(), &values)?;

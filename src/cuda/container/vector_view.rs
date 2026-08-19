@@ -47,18 +47,18 @@ impl<'a> VectorView<'a> {
         self.span.for_each(runtime, f);
     }
 
-    pub fn sum(&self, runtime: &CudaRuntime) -> f32 {
+    pub fn sum(&self, runtime: &mut CudaRuntime) -> f32 {
         self.span.sum(runtime)
     }
 
-    pub fn map_sum<F>(&self, runtime: &CudaRuntime, f: F) -> f32
+    pub fn map_sum<F>(&self, runtime: &mut CudaRuntime, f: F) -> f32
     where
         F: Fn(f32) -> f32 + Copy,
     {
         self.span.map_sum(runtime, f)
     }
 
-    pub fn softmax(&mut self, runtime: &CudaRuntime) {
+    pub fn softmax(&mut self, runtime: &mut CudaRuntime) {
         let max = self.span.max(runtime);
         self.span.for_each(runtime, move |x| (x - max).exp());
         let sum = self.span.sum(runtime);

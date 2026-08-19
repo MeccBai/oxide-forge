@@ -19,11 +19,11 @@ impl Vector {
         span.scale(value, runtime);
     }
 
-    pub fn sum(&self, runtime: &CudaRuntime) -> f32 {
+    pub fn sum(&self, runtime: &mut CudaRuntime) -> f32 {
         DeviceSpan::from_buffer(&self.buffer, 0, self.buffer.len()).sum(runtime)
     }
 
-    pub fn max(&self, runtime: &CudaRuntime) -> f32 {
+    pub fn max(&self, runtime: &mut CudaRuntime) -> f32 {
         DeviceSpan::from_buffer(&self.buffer, 0, self.buffer.len()).max(runtime)
     }
 
@@ -33,7 +33,7 @@ impl Vector {
         span.for_each(runtime, move |x| (x - value).exp());
     }
 
-    pub fn softmax(&mut self, runtime: &CudaRuntime) {
+    pub fn softmax(&mut self, runtime: &mut CudaRuntime) {
         let max = self.max(runtime);
         self.exp(max, runtime);
         let sum = self.sum(runtime);

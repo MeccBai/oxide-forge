@@ -6,8 +6,10 @@ use crate::cuda::{
 use crate::net::checkpoint;
 use crate::net::linear::Linear;
 use crate::net::mlp::{InferenceMLP, TrainingMlp};
+use cuda_core::CudaStream;
 use std::error::Error;
 use std::path::Path;
+use std::sync::Arc;
 
 pub struct InferenceTransformer {
     pub(super) q_matrix: Linear,
@@ -16,6 +18,7 @@ pub struct InferenceTransformer {
     pub(super) position_matrix: Matrix,
     pub(super) fcs: InferenceMLP,
     pub(super) output_matrix: Linear,
+    qkv_streams: Option<Vec<Arc<CudaStream>>>,
 }
 
 impl InferenceTransformer {
@@ -34,15 +37,32 @@ impl InferenceTransformer {
             position_matrix,
             fcs,
             output_matrix,
+            qkv_streams: None,
         }
     }
 
-    pub fn forward(&mut self, input: &Matrix, runtime: &CudaRuntime) -> Matrix {
+    pub fn forward(&mut self, input: &Matrix, runtime: &mut CudaRuntime) -> Matrix {
         let positioned = runtime.matrix_add(input, &self.position_matrix);
 
-        let q = self.q_matrix.forward(&positioned, None, runtime);
-        let k = self.k_matrix.forward(&positioned, None, runtime);
-        let v = self.v_matrix.forward(&positioned, None, runtime);
+        let mut q = runtime.new_uninit_matrix(positioned.rows(), self.q_matrix.weights.cols());
+        let mut k = runtime.new_uninit_matrix(positioned.rows(), self.k_matrix.weights.cols());
+        let mut v = runtime.new_uninit_matrix(positioned.rows(), self.v_matrix.weights.cols());
+
+        if let Some(streams) = &self.qkv_streams {
+            runtime.fork_streams(streams);
+        } else {
+            self.qkv_streams = Some(runtime.create_extra_streams(3));
+        }
+        let streams = self.qkv_streams.as_ref().unwrap();
+
+        self.q_matrix
+            .forward_into_on(&positioned, None, &mut q, runtime, &streams[0]);
+        self.k_matrix
+            .forward_into_on(&positioned, None, &mut k, runtime, &streams[1]);
+        self.v_matrix
+            .forward_into_on(&positioned, None, &mut v, runtime, &streams[2]);
+
+        runtime.join_streams(&streams[..2]);
 
         let k_t = runtime.matrix_transpose(&k);
         runtime.recycle_matrix(k);
@@ -54,6 +74,7 @@ impl InferenceTransformer {
         scores.scale(attention_scale, runtime);
         scores.softmax_rows(runtime);
 
+        runtime.join_streams(&streams[2..]);
         let attention = runtime.matrix_multiply(&scores, &v);
         runtime.recycle_matrix(scores);
         runtime.recycle_matrix(v);
@@ -85,7 +106,7 @@ impl InferenceTransformer {
 
     pub fn load_from_file<P: AsRef<Path>>(
         path: P,
-        runtime: &CudaRuntime,
+        runtime: &mut CudaRuntime,
     ) -> Result<Self, Box<dyn Error>> {
         checkpoint::load_inference_transformer_file(path.as_ref(), runtime)
     }
@@ -99,6 +120,7 @@ pub struct TrainingTransformer {
     pub(super) fcs: TrainingMlp,
     pub(super) output_matrix: Linear,
     cache: Option<TransformerCache>,
+    qkv_streams: Option<Vec<Arc<CudaStream>>>,
 }
 
 struct TransformerCache {
@@ -129,20 +151,39 @@ impl TrainingTransformer {
             fcs,
             output_matrix,
             cache: None,
+            qkv_streams: None,
         }
     }
 
-    pub fn forward(&mut self, input: &Matrix, runtime: &CudaRuntime) -> Matrix {
+    pub fn forward(&mut self, input: &Matrix, runtime: &mut CudaRuntime) -> Matrix {
         let positioned = runtime.matrix_add(input, &self.position_matrix);
-        let q = self.q_matrix.forward(&positioned, None, runtime);
-        let k = self.k_matrix.forward(&positioned, None, runtime);
-        let v = self.v_matrix.forward(&positioned, None, runtime);
+
+        let mut q = runtime.new_uninit_matrix(positioned.rows(), self.q_matrix.weights.cols());
+        let mut k = runtime.new_uninit_matrix(positioned.rows(), self.k_matrix.weights.cols());
+        let mut v = runtime.new_uninit_matrix(positioned.rows(), self.v_matrix.weights.cols());
+
+        if let Some(streams) = &self.qkv_streams {
+            runtime.fork_streams(streams);
+        } else {
+            self.qkv_streams = Some(runtime.create_extra_streams(3));
+        }
+        let streams = self.qkv_streams.as_ref().unwrap();
+
+        self.q_matrix
+            .forward_into_on(&positioned, None, &mut q, runtime, &streams[0]);
+        self.k_matrix
+            .forward_into_on(&positioned, None, &mut k, runtime, &streams[1]);
+        self.v_matrix
+            .forward_into_on(&positioned, None, &mut v, runtime, &streams[2]);
+
+        runtime.join_streams(&streams[..2]);
 
         let k_t = runtime.matrix_transpose(&k);
         let mut probabilities = runtime.matrix_multiply(&q, &k_t);
         probabilities.scale(1.0 / (q.cols() as f32).sqrt(), runtime);
         probabilities.softmax_rows(runtime);
 
+        runtime.join_streams(&streams[2..]);
         let attention = runtime.matrix_multiply(&probabilities, &v);
         let first_pre_norm = runtime.matrix_add(&positioned, &attention);
         let mut first_output = runtime.matrix_copy(&first_pre_norm);
@@ -175,7 +216,7 @@ impl TrainingTransformer {
         &mut self,
         output_gradient: &Matrix,
         learning_rate: f32,
-        runtime: &CudaRuntime,
+        runtime: &mut CudaRuntime,
     ) -> Matrix {
         let cache = self
             .cache
@@ -261,7 +302,7 @@ impl TrainingTransformer {
 
     pub fn load_from_file<P: AsRef<Path>>(
         path: P,
-        runtime: &CudaRuntime,
+        runtime: &mut CudaRuntime,
     ) -> Result<Self, Box<dyn Error>> {
         checkpoint::load_training_transformer_file(path.as_ref(), runtime)
     }
