@@ -1,4 +1,4 @@
-use cuda_core::LaunchConfig2D;
+use cuda_core::{CudaStream, LaunchConfig2D};
 
 use crate::cuda::{DeviceSpan, DeviceSpanMut, runtime::CudaRuntime};
 
@@ -18,9 +18,27 @@ impl CudaRuntime {
         let rows = mat.cols;
         let cols = mat.rows;
         let mut result_buffer = self.get_uninit_buffer(rows * cols);
+        self.matrix_transpose_into_on(self.stream(), mat, &mut result_buffer);
+        self.create_matrix(result_buffer, rows, cols)
+    }
 
+    pub(crate) fn matrix_transpose_on(&mut self, mat: &Matrix, stream: &CudaStream) -> Matrix {
+        let rows = mat.cols;
+        let cols = mat.rows;
+        let mut result_buffer = self.get_uninit_buffer(rows * cols);
+        stream.join(self.stream()).unwrap();
+        self.matrix_transpose_into_on(stream, mat, &mut result_buffer);
+        self.create_matrix(result_buffer, rows, cols)
+    }
+
+    fn matrix_transpose_into_on(
+        &self,
+        stream: &CudaStream,
+        mat: &Matrix,
+        result_buffer: &mut cuda_core::DeviceBuffer<f32>,
+    ) {
         if mat.buffer.is_empty() {
-            return self.create_matrix(result_buffer, rows, cols);
+            return;
         }
 
         const TILE_SIZE: usize = 32;
@@ -34,15 +52,14 @@ impl CudaRuntime {
 
         self.module()
             .matrix_transpose(
-                self.stream(),
+                stream,
                 &prepared,
                 &mat.buffer,
-                cuda_host::RowWidth::new(&mut result_buffer, cols as u32),
+                cuda_host::RowWidth::new(result_buffer, mat.rows as u32),
                 mat.rows,
                 mat.cols,
             )
             .unwrap();
-        self.create_matrix(result_buffer, rows, cols)
     }
 
     pub fn vector_zip(&mut self, vecs: &[Vector]) -> Matrix {

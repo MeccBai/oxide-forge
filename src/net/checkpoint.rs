@@ -2,7 +2,7 @@ use crate::cuda::container::{Matrix, Vector};
 use crate::cuda::runtime::CudaRuntime;
 use crate::net::linear::{Activation, Linear};
 use crate::net::mlp::{InferenceMLP, Loss, MlpExecutor, TrainingMlp};
-use crate::net::transformer::{InferenceTransformer, TrainingTransformer};
+use crate::net::transformer::{InferenceTransformer, NormType, TrainingTransformer};
 use cuda_core::DeviceBuffer;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -95,6 +95,8 @@ struct TransformerMetadata {
     block_count: usize,
     attention_residual: bool,
     feed_forward_residual: bool,
+    #[serde(default)]
+    normalization: NormType,
     position: MatrixMetadata,
     query: LinearMetadata,
     key: LinearMetadata,
@@ -283,6 +285,7 @@ pub(crate) fn dump_inference_transformer_file(
         &model.position_matrix,
         &model.fcs.executor,
         &model.output_matrix,
+        model.norm_type,
         path,
         runtime,
     )
@@ -300,6 +303,7 @@ pub(crate) fn dump_training_transformer_file(
         &model.position_matrix,
         &model.fcs.executor,
         &model.output_matrix,
+        NormType::Layer,
         path,
         runtime,
     )
@@ -329,6 +333,8 @@ pub(crate) fn load_inference_transformer_file(
         position_matrix,
         InferenceMLP { executor },
         output_matrix,
+        None,
+        metadata.transformer.normalization,
     ))
 }
 
@@ -337,6 +343,9 @@ pub(crate) fn load_training_transformer_file(
     runtime: &mut CudaRuntime,
 ) -> CheckpointResult<TrainingTransformer> {
     let (metadata, mut reader) = open_transformer_file(path)?;
+    if metadata.transformer.normalization != NormType::Layer {
+        return Err(invalid_data("TrainingTransformer only supports LayerNorm backward").into());
+    }
     let q_matrix = load_linear(&metadata.transformer.query, &mut reader, runtime)?;
     let k_matrix = load_linear(&metadata.transformer.key, &mut reader, runtime)?;
     let v_matrix = load_linear(&metadata.transformer.value, &mut reader, runtime)?;
@@ -348,7 +357,6 @@ pub(crate) fn load_training_transformer_file(
         runtime,
     )?;
     let output_matrix = load_linear(&metadata.transformer.output, &mut reader, runtime)?;
-
     Ok(TrainingTransformer::new(
         q_matrix,
         k_matrix,
@@ -370,6 +378,7 @@ fn dump_transformer_file(
     position_matrix: &Matrix,
     fcs: &MlpExecutor,
     output_matrix: &Linear,
+    normalization: NormType,
     path: &Path,
     runtime: &CudaRuntime,
 ) -> CheckpointResult<()> {
@@ -381,6 +390,7 @@ fn dump_transformer_file(
         block_count: 1,
         attention_residual: true,
         feed_forward_residual: true,
+        normalization,
         query: dump_linear(q_matrix, &mut writer, runtime)?,
         key: dump_linear(k_matrix, &mut writer, runtime)?,
         value: dump_linear(v_matrix, &mut writer, runtime)?,

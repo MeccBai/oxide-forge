@@ -52,7 +52,7 @@ impl MlpExecutor {
             } else {
                 None
             };
-            let next = layer.forward(layer_input, residual, runtime);
+            let next = layer.forward(layer_input, residual, runtime, None);
 
             if let Some(previous) = output.take() {
                 runtime.recycle_matrix(previous);
@@ -100,11 +100,12 @@ impl MlpExecutor {
                 .and_then(|(start, end)| (index + 1 == end).then_some(start));
             let pre_activation = self.layers[index].needs_pre_activation().then(|| {
                 let residual = residual_index.map(|source| &layer_inputs[source]);
-                self.layers[index].affine(&layer_inputs[index], residual, runtime)
+                self.layers[index].affine(&layer_inputs[index], residual, runtime, None)
             });
             let (layer_gradient, bias_gradient) =
-                self.layers[index].backward(pre_activation.as_ref(), &gradient, runtime);
-            let mut input_gradient = self.layers[index].input_gradient(&layer_gradient, runtime);
+                self.layers[index].backward(pre_activation.as_ref(), &gradient, runtime, None);
+            let mut input_gradient =
+                self.layers[index].input_gradient(&layer_gradient, runtime, None);
 
             if let Some(source) = residual_index {
                 residual_gradient = Some((source, runtime.clone_matrix(&layer_gradient)));
@@ -123,6 +124,7 @@ impl MlpExecutor {
                 bias_gradient.as_ref(),
                 learning_rate,
                 runtime,
+                None,
             );
             gradient = input_gradient;
         }
@@ -214,7 +216,7 @@ impl TrainingMlp {
             let output = {
                 let layer_input = &self.layer_inputs[index];
                 let residual = residual_index.map(|source| &self.layer_inputs[source]);
-                self.executor.layers[index].forward(layer_input, residual, runtime)
+                self.executor.layers[index].forward(layer_input, residual, runtime, None)
             };
             if index + 1 == self.executor.layers.len() {
                 return output;

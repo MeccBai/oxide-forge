@@ -37,6 +37,8 @@ fn main() {
         matrix_position,
         fcs,
         output_matrix,
+        None,
+        net::transformer::NormType::Layer,
     );
 
     // InferenceTransformer::forward needs at most five live seq × hidden
@@ -54,6 +56,7 @@ fn main() {
     for _ in 0..100 {
         let time_now = std::time::Instant::now();
         let output = transformer.forward(&input, &mut runtime);
+        runtime.sync();
         let time_duration = time_now.elapsed();
         average += time_duration;
         println!("Time taken: {:?}", time_duration);

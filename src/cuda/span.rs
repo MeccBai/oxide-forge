@@ -312,7 +312,6 @@ fn sum_descriptor(span: DeviceSliceDescriptor<f32>, runtime: &mut CudaRuntime) -
         .module()
         .slice_sum(runtime.stream(), &prepared, span, output_span.descriptor())
         .unwrap();
-    runtime.sync();
     reduce_sum_buffer(output, runtime)
 }
 
@@ -330,7 +329,6 @@ fn max_descriptor(span: DeviceSliceDescriptor<f32>, runtime: &mut CudaRuntime) -
         .module()
         .slice_max(runtime.stream(), &prepared, span, output_span.descriptor())
         .unwrap();
-    runtime.sync();
     reduce_max_buffer(output, runtime)
 }
 
@@ -357,7 +355,6 @@ where
             f,
         )
         .unwrap();
-    runtime.sync();
     reduce_sum_buffer(output, runtime)
 }
 
@@ -378,7 +375,6 @@ fn reduce_sum_buffer(mut input: DeviceBuffer<f32>, runtime: &mut CudaRuntime) ->
                 output_span.descriptor(),
             )
             .unwrap();
-        runtime.sync();
         runtime.recycle_buffer(input);
         input = output;
     }
@@ -405,7 +401,6 @@ fn reduce_max_buffer(mut input: DeviceBuffer<f32>, runtime: &mut CudaRuntime) ->
                 output_span.descriptor(),
             )
             .unwrap();
-        runtime.sync();
         runtime.recycle_buffer(input);
         input = output;
     }
@@ -461,7 +456,6 @@ fn copy_to_buffer(src: u64, len: usize, runtime: &mut CudaRuntime) -> DeviceBuff
         )
         .unwrap();
     }
-    runtime.sync();
     result
 }
 
@@ -524,9 +518,6 @@ impl CudaRuntime {
                 .expect("concatenated device span offset overflow");
         }
 
-        if total_len > 0 {
-            self.sync();
-        }
         result
     }
 }

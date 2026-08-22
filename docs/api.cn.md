@@ -69,7 +69,7 @@ runtime.span_to_buffer_async(&span);
 
 - `get_uninit_buffer` 的内容未初始化，读取前必须完全写入；
 - clone、concat 和 Span 转 buffer 都产生独立所有权；
-- `_async` 接口只提交复制，不主动同步。
+- Device-to-device clone、concat 和 Span copy 都只提交工作，不主动同步 CPU。
 
 ## InitType
 
@@ -235,9 +235,8 @@ let dot = a.dot(&b, &mut runtime);
 `vector_add/sub/mul/div` 同样是 `vector_binary` 的薄封装。`dot` 返回标量，因此属于
 源 Vector；其临时乘积仍由 `CudaRuntime` 分配和回收。
 
-当前 `vector_binary` 及其四个便利封装在返回前同步。`sum/max/dot`
-返回 host `f32`，同样是同步边界。空输入的 `sum` 返回 `0.0`，`max` 返回
-`f32::MIN`。
+`vector_binary` 及其四个便利封装异步提交。`sum/max/dot` 因为返回 host `f32`，
+仍然是同步边界。空输入的 `sum` 返回 `0.0`，`max` 返回 `f32::MIN`。
 
 ### 连续 Span
 
@@ -305,9 +304,14 @@ runtime.concat_buffers_from_span(&spans);
 
 ```rust
 let linear = Linear::new(weights, bias, Activation::Gelu);
-let output = linear.forward(&input, None, &mut runtime);
-let output = linear.forward(&input, Some(&residual), &mut runtime);
+let output = linear.forward(&input, None, &mut runtime, None);
+let output = linear.forward(&input, Some(&residual), &mut runtime, Some(stream));
 ```
+
+所有 Linear 计算入口的最后一个参数统一为 `Option<&CudaStream>`：`None` 使用 runtime
+主 stream，`Some(stream)` 使用指定 stream。对外只提供 `forward`、`affine`、
+`backward` 这类直接返回结果的接口，不暴露预分配的 `*_into` 变体。所有返回设备对象的
+Linear 运算都只异步提交。
 
 `weights` 形状为 `[input_features,output_features]`，bias 长度必须等于输出列数。
 `residual` 必须与 Linear 输出形状一致。执行顺序为：
@@ -353,7 +357,8 @@ let input_gradient = training_mlp.backward(
 );
 ```
 
-Backward 对 GELU 层按需重算 pre-activation；Identity 层不会重跑 affine GEMM。每层先
+Backward 对非 Identity activation 层按需重算 pre-activation；Identity 层不会重跑
+affine GEMM。每层先
 用旧权重计算 `dX`，再执行 SGD 参数更新。Residual 梯度在 source activation 处累加。
 
 ### Transformer
@@ -365,17 +370,35 @@ Q/K/V                 [sequence,hidden]
 QKᵀ                   [sequence,sequence]
 softmax(QKᵀ/√hidden)  [sequence,sequence]
 attention             [sequence,hidden]
-residual + LayerNorm  [sequence,hidden]
+residual + norm       [sequence,hidden]
 MLP + residual + norm [sequence,hidden]
 output projection     [sequence,output]
 ```
 
-`InferenceTransformer` 和 `TrainingTransformer` 都采用 Post-LN。训练版本缓存
-Q/K/V、Softmax probability、两次 LayerNorm 输入以及最终编码结果，并实现完整反传：
+`InferenceTransformer` 在构造时选择 `NormType::Layer` 或 `NormType::Rms`，同时可以传入
+三条可复用的 Q/K/V stream；传入的 Vec 必须正好包含三条 stream。传入 `None` 时会在
+第一次 forward 中延迟创建：
 
-两个 forward 执行器都会预分配 Q/K/V 输出，在三条可复用 stream 上独立发射 Linear
-projection。主 stream 在 `QK^T` 前只 join Q/K，让 V 可以继续与 score 路径重叠，并在
-attention GEMM 前才 join V。所有 join 都是 CUDA event 依赖，不会同步 CPU。
+```rust
+let transformer = InferenceTransformer::new(
+    query,
+    key,
+    value,
+    position,
+    feed_forward,
+    output,
+    None,
+    NormType::Layer,
+);
+```
+
+两种执行器都采用 Post-Norm。由于 RMSNorm backward 尚未实现，`TrainingTransformer`
+目前仍固定使用 LayerNorm。训练版本缓存 Q/K/V、Softmax probability、两次 LayerNorm
+输入以及最终编码结果，并实现完整反传：
+
+两个 forward 执行器都会 fork 三条可复用 stream，并通过独立的 Linear `forward`
+直接取得 Q/K/V。主 stream 在 `QK^T` 前只 join Q/K，让 V 可以继续与 score 路径重叠，
+并在 attention GEMM 前才 join V。所有 join 都是 CUDA event 依赖，不会同步 CPU。
 
 ```text
 output projection
@@ -418,13 +441,16 @@ let model = TrainingTransformer::load_from_file("model.toml", &mut runtime)?;
 ```
 
 `Linear`、`MlpExecutor`、两种 MLP 和两种 Transformer 都提供 `dump_to_file` 与
-`load_from_file`。推理版和训练版的持久参数格式完全相同；forward activation cache
-不属于模型参数，不会保存，训练模型加载后的 cache 为空。
+`load_from_file`。推理版和训练版使用相同的持久参数表示；Transformer 元数据还会保存
+normalization type，旧元数据缺少该字段时默认使用 LayerNorm。forward activation cache
+和 Q/K/V stream 都属于运行时状态，不会保存；推理模型加载后延迟重建 stream，训练模型
+加载后的 cache 为空。在 RMSNorm backward 完成前，把 RMSNorm Transformer 作为训练执行器
+加载会返回错误。
 
 TOML 保存以下信息：
 
 - 格式版本、模型类型、标量编码、BIN 文件名和大小；
-- 损失函数和 Transformer block 数量；
+- 损失函数、Transformer block 数量和 normalization type；
 - MLP 层数和可选 residual 范围 `[start,end)`；
 - 每个 Linear 的输入/输出神经元数、activation；
 - Matrix/Vector 形状和参数的 `[byte_start,byte_end)`；
@@ -445,13 +471,13 @@ Transformer 尺寸。该功能不需要专用 kernel，也没有 Span 传输特�
 | --- | --- |
 | Matrix multiply/add/transpose | 异步提交 |
 | Matrix/View 原地元素操作 | 异步提交 |
-| `vector_binary` 及便利封装 | 返回前同步 |
+| Device clone/concat 与 `vector_binary` | 异步提交 |
 | `sum/max/map_sum` | 同步，返回 host 标量 |
 | `matrix_sum_rows/softmax_rows/layer_norm/rms_norm` | 单次行并行 kernel，异步提交 |
 | `softmax_rows_backward/layer_norm_backward` | 单次按行 kernel，异步提交 |
 | `binary_assign_by_rows` | 单次全矩阵广播 kernel，异步提交 |
-| `InferenceTransformer::forward` / `TrainingTransformer::forward` | 返回前同步 |
+| Linear/MLP/Transformer 返回设备对象的运算 | 异步提交 |
 | `to_host` | host 读取边界 |
 
-不要为了连接同一主 stream 上的两个 kernel 手动同步；CUDA stream 顺序已经保证前一个
-kernel 的输出对后一个可见。
+不要为了连接同一 stream 上的两个 kernel 手动同步；CUDA stream 顺序已经保证前一个
+kernel 的输出对后一个可见。只在调用方需要观察 host 结果或计时时同步。

@@ -11,6 +11,7 @@ const TENSOR_K_TILE_SIZE: usize = 16;
 const TENSOR_SHARED_STRIDE: usize = 20;
 const TENSOR_SHARED_STAGE_SIZE: usize = MATMUL_TILE_SIZE * TENSOR_SHARED_STRIDE;
 const TENSOR_SHARED_SIZE: usize = TENSOR_SHARED_STAGE_SIZE * 2;
+
 #[device]
 pub(super) fn matrix_multiply_fp32_device(
     matrix1: span::DeviceSliceDescriptor<f32>,

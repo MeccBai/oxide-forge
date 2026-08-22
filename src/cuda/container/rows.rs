@@ -48,22 +48,42 @@ impl CudaRuntime {
             let buffer = self.get_uninit_buffer(0);
             return self.create_vector(buffer);
         }
-        assert!(matrix.cols > 0 && matrix.cols <= DEFAULT_BLOCK_SIZE);
         let mut buffer = self.get_uninit_buffer(matrix.rows);
+        self.matrix_sum_rows_into_on(matrix, &mut buffer, self.stream());
+        self.create_vector(buffer)
+    }
+
+    pub(crate) fn matrix_sum_rows_on(&mut self, matrix: &Matrix, stream: &CudaStream) -> Vector {
+        if matrix.rows == 0 {
+            let buffer = self.get_uninit_buffer(0);
+            return self.create_vector(buffer);
+        }
+        let mut buffer = self.get_uninit_buffer(matrix.rows);
+        stream.join(self.stream()).unwrap();
+        self.matrix_sum_rows_into_on(matrix, &mut buffer, stream);
+        self.create_vector(buffer)
+    }
+
+    fn matrix_sum_rows_into_on(
+        &self,
+        matrix: &Matrix,
+        buffer: &mut cuda_core::DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) {
+        assert!(matrix.cols > 0 && matrix.cols <= DEFAULT_BLOCK_SIZE);
         let config = LaunchConfig1D::new(matrix.rows as u32, DEFAULT_BLOCK_SIZE as u32, 0);
         let prepared = self.module().prepare_matrix_sum_rows(config).unwrap();
         let input = DeviceSpan::from_buffer(&matrix.buffer, 0, matrix.buffer.len());
         let result_len = buffer.len();
-        let result = DeviceSpanMut::from_buffer(&mut buffer, 0, result_len);
+        let result = DeviceSpanMut::from_buffer(buffer, 0, result_len);
         self.module()
             .matrix_sum_rows(
-                self.stream(),
+                stream,
                 &prepared,
                 input.descriptor(),
                 result.descriptor(),
                 matrix.cols,
             )
             .unwrap();
-        self.create_vector(buffer)
     }
 }

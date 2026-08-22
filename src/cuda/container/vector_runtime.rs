@@ -1,4 +1,4 @@
-use cuda_core::DeviceBuffer;
+use cuda_core::{CudaStream, DeviceBuffer};
 
 use crate::cuda::{
     BinaryOp, CudaRuntime, DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, runtime::InitType,
@@ -31,7 +31,6 @@ impl CudaRuntime {
                 self.module()
                     .slice_set_seq(self.stream(), &prepared, span.descriptor(), true)
                     .unwrap();
-                self.sync();
                 Vector { buffer }
             }
             InitType::Reserve => {
@@ -40,7 +39,6 @@ impl CudaRuntime {
                 self.module()
                     .slice_set_seq(self.stream(), &prepared, span.descriptor(), false)
                     .unwrap();
-                self.sync();
                 Vector { buffer }
             }
             InitType::Random => {
@@ -50,7 +48,6 @@ impl CudaRuntime {
                 self.module()
                     .slice_set_random(self.stream(), &prepared, span.descriptor(), seed)
                     .unwrap();
-                self.sync();
                 Vector { buffer }
             }
             InitType::Zero => Vector { buffer },
@@ -61,6 +58,13 @@ impl CudaRuntime {
         Vector {
             buffer: self.clone_buffer(&vec.buffer),
         }
+    }
+
+    pub(crate) fn clone_vector_on(&mut self, vec: &Vector, stream: &CudaStream) -> Vector {
+        let mut buffer = self.get_uninit_buffer(vec.buffer.len());
+        stream.join(self.stream()).unwrap();
+        buffer.copy_from_device_async(&vec.buffer, stream).unwrap();
+        Vector { buffer }
     }
 
     pub fn vector_add(&mut self, vec1: &Vector, vec2: &Vector) -> Vector {
@@ -101,7 +105,6 @@ impl CudaRuntime {
                 op,
             )
             .unwrap();
-        self.sync();
         Vector {
             buffer: result_buffer,
         }

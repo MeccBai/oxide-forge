@@ -1,4 +1,5 @@
 use crate::cuda::{BinaryOp, CudaRuntime, DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut};
+use cuda_core::CudaStream;
 
 use super::Vector;
 
@@ -26,9 +27,13 @@ impl Vector {
     }
 
     pub fn scale(&mut self, value: f32, runtime: &CudaRuntime) {
+        self.scale_on(value, runtime, runtime.stream());
+    }
+
+    pub(crate) fn scale_on(&mut self, value: f32, runtime: &CudaRuntime, stream: &CudaStream) {
         let len = self.buffer.len();
         let mut span = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
-        span.scale(value, runtime);
+        span.for_each_on(runtime, stream, move |x| x * value);
     }
 
     pub fn sum(&self, runtime: &mut CudaRuntime) -> f32 {
@@ -53,6 +58,16 @@ impl Vector {
     }
 
     pub fn binary_assign(&mut self, rhs: &Vector, op: BinaryOp, runtime: &CudaRuntime) {
+        self.binary_assign_on(rhs, op, runtime, runtime.stream());
+    }
+
+    pub(crate) fn binary_assign_on(
+        &mut self,
+        rhs: &Vector,
+        op: BinaryOp,
+        runtime: &CudaRuntime,
+        stream: &CudaStream,
+    ) {
         let len = self.buffer.len();
         assert_eq!(len, rhs.buffer.len());
         let span = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
@@ -66,25 +81,29 @@ impl Vector {
         runtime
             .module()
             .slice_binary_assign(
-                runtime.stream(),
+                stream,
                 &prepared,
                 span.descriptor(),
                 rhs_span.descriptor(),
                 op,
             )
             .unwrap();
-
-        runtime.sync();
     }
 
     pub fn for_each<F>(&mut self, runtime: &CudaRuntime, f: F)
     where
         F: Fn(f32) -> f32 + Copy,
     {
+        self.for_each_on(runtime, runtime.stream(), f);
+    }
+
+    pub(crate) fn for_each_on<F>(&mut self, runtime: &CudaRuntime, stream: &CudaStream, f: F)
+    where
+        F: Fn(f32) -> f32 + Copy,
+    {
         let len = self.buffer.len();
         let mut span = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
-        span.for_each(runtime, f);
-        runtime.sync();
+        span.for_each_on(runtime, stream, f);
     }
 
     pub fn dot(&self, rhs: &Vector, runtime: &mut CudaRuntime) -> f32 {

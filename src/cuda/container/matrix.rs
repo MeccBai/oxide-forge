@@ -85,6 +85,19 @@ impl CudaRuntime {
         result
     }
 
+    pub(crate) fn matrix_multiply_on(
+        &mut self,
+        stream: &CudaStream,
+        mat1: &Matrix,
+        mat2: &Matrix,
+    ) -> Matrix {
+        assert_eq!(mat1.cols, mat2.rows);
+        let mut result = self.new_uninit_matrix(mat1.rows, mat2.cols);
+        stream.join(self.stream()).unwrap();
+        self.matrix_multiply_into_on(stream, mat1, mat2, &mut result);
+        result
+    }
+
     pub(crate) fn matrix_multiply_into_on(
         &self,
         stream: &CudaStream,
@@ -173,6 +186,40 @@ impl CudaRuntime {
         self.create_matrix(result_buffer, rows, cols)
     }
 
+    pub(crate) fn matrix_binary_on(
+        &mut self,
+        stream: &CudaStream,
+        mat1: &Matrix,
+        mat2: &Matrix,
+        op: BinaryOp,
+    ) -> Matrix {
+        assert_eq!(mat1.rows, mat2.rows);
+        assert_eq!(mat1.cols, mat2.cols);
+
+        let rows = mat1.rows;
+        let cols = mat1.cols;
+        let mut result_buffer = self.get_uninit_buffer(rows * cols);
+        stream.join(self.stream()).unwrap();
+
+        let config = self.get_launch_config(mat1.buffer.len(), DEFAULT_BLOCK_SIZE);
+        let prepared = self.module().prepare_slice_binary(config).unwrap();
+        let lhs = DeviceSpan::from_buffer(&mat1.buffer, 0, mat1.buffer.len());
+        let rhs = DeviceSpan::from_buffer(&mat2.buffer, 0, mat2.buffer.len());
+        let output = DeviceSpanMut::from_buffer(&mut result_buffer, 0, rows * cols);
+
+        self.module()
+            .slice_binary(
+                stream,
+                &prepared,
+                lhs.descriptor(),
+                rhs.descriptor(),
+                output.descriptor(),
+                op,
+            )
+            .unwrap();
+        self.create_matrix(result_buffer, rows, cols)
+    }
+
     /// Consumes a matrix and returns its allocation to the runtime pool.
     pub fn recycle_matrix(&mut self, matrix: Matrix) {
         self.recycle_buffer(matrix.buffer);
@@ -211,7 +258,6 @@ impl CudaRuntime {
             }
             InitType::Zero => {}
         }
-        self.sync();
         self.create_matrix(buffer, rows, cols)
     }
 
@@ -234,6 +280,15 @@ impl CudaRuntime {
 
     pub fn clone_matrix(&mut self, matrix: &Matrix) -> Matrix {
         let buffer = self.clone_buffer(&matrix.buffer);
+        self.create_matrix(buffer, matrix.rows, matrix.cols)
+    }
+
+    pub(crate) fn clone_matrix_on(&mut self, matrix: &Matrix, stream: &CudaStream) -> Matrix {
+        let mut buffer = self.get_uninit_buffer(matrix.buffer.len());
+        stream.join(self.stream()).unwrap();
+        buffer
+            .copy_from_device_async(&matrix.buffer, stream)
+            .unwrap();
         self.create_matrix(buffer, matrix.rows, matrix.cols)
     }
 }

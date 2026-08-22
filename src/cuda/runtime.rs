@@ -165,7 +165,6 @@ impl CudaRuntime {
             offset += buffer.len();
         }
 
-        self.sync();
         result
     }
 
@@ -174,7 +173,6 @@ impl CudaRuntime {
         new_buffer
             .copy_from_device_async(buffer, &self.stream())
             .unwrap();
-        self.sync();
         new_buffer
     }
 

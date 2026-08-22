@@ -29,9 +29,11 @@ Implemented capabilities include:
 - device-owning `Vector` and row-major `Matrix` containers;
 - element-wise arithmetic, mapping, scaling, reduction, and row broadcasting;
 - tiled matrix multiplication and shared-memory matrix transpose;
-- row-wise Softmax and LayerNorm, including backward kernels;
+- row-wise Softmax, LayerNorm, and RMSNorm, with backward kernels for Softmax
+  and LayerNorm;
 - Linear, GELU, MLP, residual connections, and their backward paths;
-- inference and training executors for a single-head Post-LN Transformer;
+- single-head Post-Norm Transformer executors with selectable LayerNorm/RMSNorm
+  inference and LayerNorm training;
 - parameter checkpoint save/load for MLP and Transformer executors;
 - asynchronous submission on the primary stream and explicit fork/join for
   additional streams.
@@ -64,8 +66,9 @@ value so the parent model controls whether they remain alive.
 ### Synchronization is explicit
 
 Dependent operations are queued on the same CUDA stream without synchronizing
-after every kernel launch. Host-valued reductions and model boundaries form the
-main synchronization points. Additional streams are reserved for genuinely
+after every kernel launch. Device-returning model APIs are asynchronous; the
+caller chooses model boundaries with `runtime.sync()`. Host-valued reductions
+remain synchronization points. Additional streams are reserved for genuinely
 independent work and are explicitly rejoined.
 
 ### Specialized implementations over illusory generality
@@ -84,14 +87,17 @@ X = input + position
     ├── K ──┴── QKᵀ / √hidden ── row softmax ──┐
     └── V ─────────────────────────────────────┴── attention value
                                                        │
-X ───────────────── residual ── LayerNorm ── FFN ── residual ── LayerNorm
-                                                                       │
-                                                              output projection
+X ───────────────── residual ── Norm ── FFN ── residual ── Norm
+                                                               │
+                                                      output projection
 ```
 
-Inference executors do not retain activations. Training executors keep only the
-data required by backward, while the MLP owns scheduling for Linear parameter
-updates. Individual Linear layers do not own a tape or workspace.
+Inference selects `NormType::Layer` or `NormType::Rms` when it is constructed.
+Training currently remains on LayerNorm because RMSNorm backward has not been
+implemented. Inference executors do not retain activations. Training executors
+keep only the data required by backward, while the MLP owns scheduling for
+Linear parameter updates. Individual Linear layers do not own a tape or
+workspace.
 
 ## Requirements
 
@@ -143,7 +149,7 @@ let projection = Linear::new(
     Activation::Identity,
 );
 
-let output = projection.forward(&input, None, &mut runtime);
+let output = projection.forward(&input, None, &mut runtime, None);
 runtime.sync();
 
 assert_eq!((output.rows(), output.cols()), (256, 64));
@@ -196,7 +202,8 @@ synchronization, and network-layer reference.
   multiples of 16;
 - row Softmax and LayerNorm backward currently support at most 1024 elements per
   row;
-- the current Transformer is single-head and Post-LN;
+- the current Transformer is single-head and Post-Norm; inference supports
+  LayerNorm or RMSNorm, while training currently supports LayerNorm only;
 - parameter updates use direct SGD rather than a general optimizer abstraction;
 - checkpoint format version 1 stores little-endian `f32` parameters; unsupported
   versions are rejected explicitly.

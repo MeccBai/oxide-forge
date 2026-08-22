@@ -25,9 +25,9 @@ OxideForge 目前处于实验性开发阶段，API 会继续调整。核心前�
 - 拥有显存的 `Vector` 和 row-major `Matrix`；
 - 元素级四则运算、映射、缩放、归约和广播；
 - tiled matrix multiplication 和 shared-memory transpose；
-- row Softmax、LayerNorm 及其 backward kernel；
+- row Softmax、LayerNorm 和 RMSNorm，其中 Softmax 与 LayerNorm 提供 backward kernel；
 - Linear、GELU、MLP、残差连接和对应反向传播；
-- 单头 Post-LN Transformer 的推理与训练执行器；
+- 单头 Post-Norm Transformer 执行器，推理可选 LayerNorm/RMSNorm，训练使用 LayerNorm；
 - MLP 与 Transformer 参数的 checkpoint 保存和加载；
 - 主 stream 异步提交，以及额外 stream 的 fork/join。
 
@@ -54,9 +54,9 @@ OxideForge 目前处于实验性开发阶段，API 会继续调整。核心前�
 
 ### 显式同步
 
-能够连续执行的操作进入同一个 CUDA stream，不在每次 kernel launch 后等待。返回 host
-标量的归约和模型边界才形成同步点。额外 stream 只用于确实彼此独立的工作，并通过
-fork/join 明确汇合。
+能够连续执行的操作进入同一个 CUDA stream，不在每次 kernel launch 后等待。返回设备
+对象的模型接口保持异步，模型边界由调用方通过 `runtime.sync()` 决定；返回 host 标量的
+归约仍是同步点。额外 stream 只用于确实彼此独立的工作，并通过 fork/join 明确汇合。
 
 ### 专用实现胜过无成本假象
 
@@ -73,13 +73,15 @@ X = input + position
     ├── K ──┴── QKᵀ / √hidden ── row softmax ──┐
     └── V ─────────────────────────────────────┴── attention value
                                                        │
-X ───────────────── residual ── LayerNorm ── FFN ── residual ── LayerNorm
-                                                                       │
-                                                              output projection
+X ───────────────── residual ── Norm ── FFN ── residual ── Norm
+                                                               │
+                                                      output projection
 ```
 
-推理层不保存 activation。训练层只保存反向计算所需的数据，并由 MLP 层统一调度 Linear
-参数更新；Linear 自身不持有 tape 或 workspace。
+推理执行器在构造时选择 `NormType::Layer` 或 `NormType::Rms`。由于 RMSNorm backward
+尚未实现，训练执行器目前仍固定使用 LayerNorm。推理层不保存 activation；训练层只保存
+反向计算所需的数据，并由 MLP 层统一调度 Linear 参数更新；Linear 自身不持有 tape 或
+workspace。
 
 ## 环境要求
 
@@ -128,7 +130,7 @@ let projection = Linear::new(
     Activation::Identity,
 );
 
-let output = projection.forward(&input, None, &mut runtime);
+let output = projection.forward(&input, None, &mut runtime, None);
 runtime.sync();
 
 assert_eq!((output.rows(), output.cols()), (256, 64));
@@ -179,7 +181,8 @@ src/
 - 当前矩阵乘法使用 Tensor Core TF32 乘法、`f32` 累加和输出，要求 SM80+，且
   M/K/N 均须为 16 的倍数；
 - 当前 row Softmax 和 LayerNorm backward 每行最多 1024 个元素；
-- 当前 Transformer 是单头 Post-LN 结构；
+- 当前 Transformer 是单头 Post-Norm 结构；推理支持 LayerNorm 或 RMSNorm，训练目前仅
+  支持 LayerNorm；
 - 当前参数更新为直接 SGD，不包含通用 optimizer；
 - checkpoint 格式版本 1 固定保存 little-endian `f32` 参数；加载器会明确拒绝不支持的版本。
 

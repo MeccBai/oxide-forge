@@ -76,7 +76,8 @@ runtime.span_to_buffer_async(&span);
   written before it is read.
 - Clone, concatenation, and span-to-buffer conversion create independent
   ownership.
-- An `_async` operation only submits the copy and does not synchronize.
+- Device-to-device clone, concatenation, and span-copy APIs only submit work;
+  they do not synchronize the CPU.
 
 ## InitType
 
@@ -252,10 +253,10 @@ let dot = a.dot(&b, &mut runtime);
 `vector_binary`. `dot` belongs to the source Vector because it returns a scalar;
 its temporary product is still allocated and recycled through `CudaRuntime`.
 
-`vector_binary` and its convenience wrappers currently synchronize before
-returning. `sum`, `max`, and `dot` also synchronize because they
-return host `f32` values. For an empty input, `sum` returns `0.0` and `max`
-returns `f32::MIN`.
+`vector_binary` and its convenience wrappers submit asynchronously. `sum`,
+`max`, and `dot` still form synchronization boundaries because they return host
+`f32` values. For an empty input, `sum` returns `0.0` and `max` returns
+`f32::MIN`.
 
 ### Contiguous spans
 
@@ -326,9 +327,15 @@ runtime.concat_buffers_from_span(&spans);
 
 ```rust
 let linear = Linear::new(weights, bias, Activation::Gelu);
-let output = linear.forward(&input, None, &mut runtime);
-let output = linear.forward(&input, Some(&residual), &mut runtime);
+let output = linear.forward(&input, None, &mut runtime, None);
+let output = linear.forward(&input, Some(&residual), &mut runtime, Some(stream));
 ```
+
+Every Linear compute entry ends in `Option<&CudaStream>`. `None` selects the
+runtime's primary stream; `Some(stream)` selects that stream. The public surface
+contains only result-returning operations such as `forward`, `affine`, and
+`backward`; preallocated `*_into` variants are internal implementation details.
+All device-returning Linear operations submit asynchronously.
 
 `weights` has shape `[input_features, output_features]`. If present, the bias
 length must equal the output column count. A residual Matrix must have exactly
@@ -383,8 +390,9 @@ let input_gradient = training_mlp.backward(
 );
 ```
 
-Backward recomputes pre-activation only for GELU layers; Identity layers do not
-repeat the affine GEMM. Each layer computes `dX` using the old weights before
+Backward recomputes pre-activation only for non-Identity activation layers;
+Identity layers do not repeat the affine GEMM. Each layer computes `dX` using
+the old weights before
 applying its SGD update. Residual gradients are accumulated at the source
 activation.
 
@@ -397,18 +405,37 @@ Q/K/V                 [sequence, hidden]
 QKᵀ                   [sequence, sequence]
 softmax(QKᵀ/√hidden)  [sequence, sequence]
 attention             [sequence, hidden]
-residual + LayerNorm  [sequence, hidden]
+residual + norm       [sequence, hidden]
 MLP + residual + norm [sequence, hidden]
 output projection     [sequence, output]
 ```
 
-`InferenceTransformer` and `TrainingTransformer` both implement a Post-LN
-layout. The training executor caches Q/K/V, Softmax probabilities, both
-LayerNorm inputs, and the final encoded value. Its backward path covers:
+`InferenceTransformer` selects `NormType::Layer` or `NormType::Rms` at
+construction. It also accepts an optional set of three reusable Q/K/V streams;
+the supplied vector must contain exactly three streams. Passing `None` creates
+them lazily on the first forward call:
 
-Both forward executors preallocate Q/K/V outputs, fork three reusable streams,
-and launch the projection Linear layers independently. The primary stream joins
-Q and K before `QK^T`, while V remains eligible to overlap the score path and is
+```rust
+let transformer = InferenceTransformer::new(
+    query,
+    key,
+    value,
+    position,
+    feed_forward,
+    output,
+    None,
+    NormType::Layer,
+);
+```
+
+Both executors use a Post-Norm layout. `TrainingTransformer` currently remains
+fixed to LayerNorm because RMSNorm backward is not implemented. It caches Q/K/V,
+Softmax probabilities, both LayerNorm inputs, and the final encoded value. Its
+backward path covers:
+
+Both forward executors fork three reusable streams and obtain Q/K/V directly
+from independent projection Linear `forward` calls. The primary stream joins Q
+and K before `QK^T`, while V remains eligible to overlap the score path and is
 joined only before the attention GEMM. The joins are CUDA event dependencies,
 not host synchronization.
 
@@ -454,14 +481,18 @@ let model = TrainingTransformer::load_from_file("model.toml", &mut runtime)?;
 ```
 
 `Linear`, `MlpExecutor`, both MLP forms, and both Transformer forms provide
-`dump_to_file` and `load_from_file`. The inference/training forms share identical
-persistent parameters. Training activation caches are intentionally excluded
-and are empty after loading.
+`dump_to_file` and `load_from_file`. The inference/training forms share the same
+persistent parameter representation; Transformer metadata also stores its
+normalization type. Older metadata without this field defaults to LayerNorm.
+Forward activation caches and Q/K/V streams are runtime state and are not saved.
+A loaded inference Transformer recreates streams lazily, while a loaded training
+wrapper starts with an empty cache. Loading an RMSNorm Transformer as a training
+executor is rejected until RMSNorm backward exists.
 
 The TOML document records:
 
 - format version, model type, scalar encoding, binary file name and size;
-- loss function and Transformer block count;
+- loss function, Transformer block count, and normalization type;
 - MLP layer count and optional residual range `[start, end)`;
 - the input/output neuron count and activation of each Linear layer;
 - Matrix/Vector shapes and each parameter's `[byte_start, byte_end)` range;
@@ -484,14 +515,15 @@ kernel or Span-specific transfer path exists.
 | --- | --- |
 | Matrix multiply/add/transpose | Asynchronous submission |
 | Matrix/View in-place element operation | Asynchronous submission |
-| `vector_binary` and convenience wrappers | Synchronize before returning |
+| Device clone/concatenation and `vector_binary` | Asynchronous submission |
 | `sum`, `max`, `map_sum` | Synchronize and return a host scalar |
 | `matrix_sum_rows`, `softmax_rows`, `layer_norm`, `rms_norm` | One row-parallel kernel; asynchronous submission |
 | `softmax_rows_backward`, `layer_norm_backward` | One row-wise kernel; asynchronous submission |
 | `binary_assign_by_rows` | One Matrix-wide broadcast kernel; asynchronous submission |
-| Transformer `forward` | Synchronizes before returning |
+| Linear/MLP/Transformer device-returning operations | Asynchronous submission |
 | `to_host` | Host-read synchronization boundary |
 
 Do not add a manual synchronization merely to connect two kernels submitted to
-the same primary stream. CUDA stream ordering already makes the first kernel's
-output visible to the second.
+the same stream. CUDA stream ordering already makes the first kernel's output
+visible to the second. Synchronize at a caller-owned host observation or timing
+boundary.

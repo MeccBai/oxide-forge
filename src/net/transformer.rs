@@ -7,9 +7,18 @@ use crate::net::checkpoint;
 use crate::net::linear::Linear;
 use crate::net::mlp::{InferenceMLP, TrainingMlp};
 use cuda_core::CudaStream;
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormType {
+    Rms,
+    #[default]
+    Layer,
+}
 
 pub struct InferenceTransformer {
     pub(super) q_matrix: Linear,
@@ -19,6 +28,7 @@ pub struct InferenceTransformer {
     pub(super) fcs: InferenceMLP,
     pub(super) output_matrix: Linear,
     qkv_streams: Option<Vec<Arc<CudaStream>>>,
+    pub(super) norm_type: NormType,
 }
 
 impl InferenceTransformer {
@@ -29,7 +39,12 @@ impl InferenceTransformer {
         position_matrix: Matrix,
         fcs: InferenceMLP,
         output_matrix: Linear,
+        qkv_streams: Option<Vec<Arc<CudaStream>>>,
+        norm_type: NormType,
     ) -> Self {
+        if let Some(streams) = &qkv_streams {
+            assert_eq!(streams.len(), 3, "Q/K/V execution requires three streams");
+        }
         Self {
             q_matrix,
             k_matrix,
@@ -37,16 +52,13 @@ impl InferenceTransformer {
             position_matrix,
             fcs,
             output_matrix,
-            qkv_streams: None,
+            qkv_streams,
+            norm_type,
         }
     }
 
     pub fn forward(&mut self, input: &Matrix, runtime: &mut CudaRuntime) -> Matrix {
         let positioned = runtime.matrix_add(input, &self.position_matrix);
-
-        let mut q = runtime.new_uninit_matrix(positioned.rows(), self.q_matrix.weights.cols());
-        let mut k = runtime.new_uninit_matrix(positioned.rows(), self.k_matrix.weights.cols());
-        let mut v = runtime.new_uninit_matrix(positioned.rows(), self.v_matrix.weights.cols());
 
         if let Some(streams) = &self.qkv_streams {
             runtime.fork_streams(streams);
@@ -55,12 +67,15 @@ impl InferenceTransformer {
         }
         let streams = self.qkv_streams.as_ref().unwrap();
 
-        self.q_matrix
-            .forward_into_on(&positioned, None, &mut q, runtime, &streams[0]);
-        self.k_matrix
-            .forward_into_on(&positioned, None, &mut k, runtime, &streams[1]);
-        self.v_matrix
-            .forward_into_on(&positioned, None, &mut v, runtime, &streams[2]);
+        let q = self
+            .q_matrix
+            .forward(&positioned, None, runtime, Some(streams[0].as_ref()));
+        let k = self
+            .k_matrix
+            .forward(&positioned, None, runtime, Some(streams[1].as_ref()));
+        let v = self
+            .v_matrix
+            .forward(&positioned, None, runtime, Some(streams[2].as_ref()));
 
         runtime.join_streams(&streams[..2]);
 
@@ -82,17 +97,23 @@ impl InferenceTransformer {
         let mut x = runtime.matrix_add(&positioned, &attention);
         runtime.recycle_matrix(positioned);
         runtime.recycle_matrix(attention);
-        x.layer_norm(runtime);
+        match self.norm_type {
+            NormType::Rms => x.rms_norm(runtime),
+            NormType::Layer => x.layer_norm(runtime),
+        }
 
         let ffn = self.fcs.forward(&x, runtime);
         let mut output = runtime.matrix_add(&x, &ffn);
         runtime.recycle_matrix(x);
         runtime.recycle_matrix(ffn);
-        output.layer_norm(runtime);
 
-        let result = self.output_matrix.forward(&output, None, runtime);
+        match self.norm_type {
+            NormType::Rms => output.rms_norm(runtime),
+            NormType::Layer => output.layer_norm(runtime),
+        }
+
+        let result = self.output_matrix.forward(&output, None, runtime, None);
         runtime.recycle_matrix(output);
-        runtime.sync();
         result
     }
 
@@ -158,10 +179,6 @@ impl TrainingTransformer {
     pub fn forward(&mut self, input: &Matrix, runtime: &mut CudaRuntime) -> Matrix {
         let positioned = runtime.matrix_add(input, &self.position_matrix);
 
-        let mut q = runtime.new_uninit_matrix(positioned.rows(), self.q_matrix.weights.cols());
-        let mut k = runtime.new_uninit_matrix(positioned.rows(), self.k_matrix.weights.cols());
-        let mut v = runtime.new_uninit_matrix(positioned.rows(), self.v_matrix.weights.cols());
-
         if let Some(streams) = &self.qkv_streams {
             runtime.fork_streams(streams);
         } else {
@@ -169,12 +186,15 @@ impl TrainingTransformer {
         }
         let streams = self.qkv_streams.as_ref().unwrap();
 
-        self.q_matrix
-            .forward_into_on(&positioned, None, &mut q, runtime, &streams[0]);
-        self.k_matrix
-            .forward_into_on(&positioned, None, &mut k, runtime, &streams[1]);
-        self.v_matrix
-            .forward_into_on(&positioned, None, &mut v, runtime, &streams[2]);
+        let q = self
+            .q_matrix
+            .forward(&positioned, None, runtime, Some(streams[0].as_ref()));
+        let k = self
+            .k_matrix
+            .forward(&positioned, None, runtime, Some(streams[1].as_ref()));
+        let v = self
+            .v_matrix
+            .forward(&positioned, None, runtime, Some(streams[2].as_ref()));
 
         runtime.join_streams(&streams[..2]);
 
@@ -197,7 +217,7 @@ impl TrainingTransformer {
         let mut encoded = runtime.clone_matrix(&second_pre_norm);
         encoded.layer_norm(runtime);
 
-        let output = self.output_matrix.forward(&encoded, None, runtime);
+        let output = self.output_matrix.forward(&encoded, None, runtime, None);
         self.cache = Some(TransformerCache {
             positioned,
             q,
@@ -208,7 +228,6 @@ impl TrainingTransformer {
             second_pre_norm,
             encoded,
         });
-        runtime.sync();
         output
     }
 
@@ -223,20 +242,26 @@ impl TrainingTransformer {
             .as_ref()
             .expect("forward must run before backward");
 
-        let output_pre_activation = self
-            .output_matrix
-            .needs_pre_activation()
-            .then(|| self.output_matrix.affine(&cache.encoded, None, runtime));
-        let (output_gradient, output_bias_gradient) =
+        let output_pre_activation = self.output_matrix.needs_pre_activation().then(|| {
             self.output_matrix
-                .backward(output_pre_activation.as_ref(), output_gradient, runtime);
-        let encoded_gradient = self.output_matrix.input_gradient(&output_gradient, runtime);
+                .affine(&cache.encoded, None, runtime, None)
+        });
+        let (output_gradient, output_bias_gradient) = self.output_matrix.backward(
+            output_pre_activation.as_ref(),
+            output_gradient,
+            runtime,
+            None,
+        );
+        let encoded_gradient = self
+            .output_matrix
+            .input_gradient(&output_gradient, runtime, None);
         self.output_matrix.learn(
             &cache.encoded,
             &output_gradient,
             output_bias_gradient.as_ref(),
             learning_rate,
             runtime,
+            None,
         );
 
         let second_gradient =
@@ -269,10 +294,10 @@ impl TrainingTransformer {
         ] {
             let pre_activation = linear
                 .needs_pre_activation()
-                .then(|| linear.affine(&cache.positioned, None, runtime));
+                .then(|| linear.affine(&cache.positioned, None, runtime, None));
             let (gradient, bias_gradient) =
-                linear.backward(pre_activation.as_ref(), projected_gradient, runtime);
-            let input_gradient = linear.input_gradient(&gradient, runtime);
+                linear.backward(pre_activation.as_ref(), projected_gradient, runtime, None);
+            let input_gradient = linear.input_gradient(&gradient, runtime, None);
             positioned_gradient.binary_assign(&input_gradient, Add, runtime);
             linear.learn(
                 &cache.positioned,
@@ -280,6 +305,7 @@ impl TrainingTransformer {
                 bias_gradient.as_ref(),
                 learning_rate,
                 runtime,
+                None,
             );
         }
 
@@ -288,7 +314,6 @@ impl TrainingTransformer {
         position_update.scale(learning_rate, runtime);
         self.position_matrix
             .binary_assign(&position_update, Sub, runtime);
-        runtime.sync();
         input_gradient
     }
 
