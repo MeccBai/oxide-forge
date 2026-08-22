@@ -1,11 +1,9 @@
 use crate::cuda::BinaryOp::Add;
 use crate::cuda::container::Matrix;
 use crate::cuda::runtime::CudaRuntime;
-use crate::net::checkpoint;
-use crate::net::linear::Linear;
+use crate::net::linear::{Linear, LinearMetadata};
+use crate::net::metadata::{HostData, MetadataCursor};
 use serde::{Deserialize, Serialize};
-use std::error::Error;
-use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -14,10 +12,25 @@ pub enum Loss {
 }
 
 pub struct MlpExecutor {
-    pub(super) layers: Vec<Linear>,
+    layers: Vec<Linear>,
     /// A residual from the input of `start` to the output of `end - 1`.
-    pub(super) res_range: Option<(usize, usize)>,
-    pub(super) loss: Loss,
+    res_range: Option<(usize, usize)>,
+    loss: Loss,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MlpMetadata {
+    pub layer_count: usize,
+    pub loss: Loss,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residual: Option<ResidualMetadata>,
+    pub layers: Vec<LinearMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResidualMetadata {
+    pub start: usize,
+    pub end: usize,
 }
 
 impl MlpExecutor {
@@ -83,6 +96,28 @@ impl MlpExecutor {
         self.loss
     }
 
+    pub fn get_meta_data(&self, cursor: &mut MetadataCursor) -> MlpMetadata {
+        MlpMetadata {
+            layer_count: self.layers.len(),
+            loss: self.loss,
+            residual: self
+                .res_range
+                .map(|(start, end)| ResidualMetadata { start, end }),
+            layers: self
+                .layers
+                .iter()
+                .map(|layer| layer.get_meta_data(cursor))
+                .collect(),
+        }
+    }
+
+    pub fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
+        self.layers
+            .iter()
+            .flat_map(|layer| layer.get_data(runtime))
+            .collect()
+    }
+
     pub fn backward(
         &mut self,
         layer_inputs: &[Matrix],
@@ -131,25 +166,10 @@ impl MlpExecutor {
         assert!(residual_gradient.is_none(), "unresolved residual gradient");
         gradient
     }
-
-    pub fn dump_to_file<P: AsRef<Path>>(
-        &self,
-        path: P,
-        runtime: &CudaRuntime,
-    ) -> Result<(), Box<dyn Error>> {
-        checkpoint::dump_mlp_file(self, path.as_ref(), runtime)
-    }
-
-    pub fn load_from_file<P: AsRef<Path>>(
-        path: P,
-        runtime: &mut CudaRuntime,
-    ) -> Result<Self, Box<dyn Error>> {
-        checkpoint::load_mlp_file(path.as_ref(), runtime)
-    }
 }
 
 pub struct InferenceMLP {
-    pub(super) executor: MlpExecutor,
+    executor: MlpExecutor,
 }
 
 impl InferenceMLP {
@@ -163,32 +183,27 @@ impl InferenceMLP {
         }
     }
 
+    pub fn get_meta_data(&self, cursor: &mut MetadataCursor) -> MlpMetadata {
+        self.executor.get_meta_data(cursor)
+    }
+
+    pub fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
+        self.executor.get_data(runtime)
+    }
+
+    pub fn loss(&self) -> Loss {
+        self.executor.loss()
+    }
+
     pub fn forward(&self, input: &Matrix, runtime: &mut CudaRuntime) -> Matrix {
         self.executor.forward(input, runtime)
-    }
-
-    pub fn dump_to_file<P: AsRef<Path>>(
-        &self,
-        path: P,
-        runtime: &CudaRuntime,
-    ) -> Result<(), Box<dyn Error>> {
-        self.executor.dump_to_file(path, runtime)
-    }
-
-    pub fn load_from_file<P: AsRef<Path>>(
-        path: P,
-        runtime: &mut CudaRuntime,
-    ) -> Result<Self, Box<dyn Error>> {
-        Ok(Self {
-            executor: MlpExecutor::load_from_file(path, runtime)?,
-        })
     }
 }
 
 pub struct TrainingMlp {
     /// `layer_inputs[i]` owns the input consumed by layer `i`.
-    pub(super) layer_inputs: Vec<Matrix>,
-    pub(super) executor: MlpExecutor,
+    layer_inputs: Vec<Matrix>,
+    executor: MlpExecutor,
 }
 
 impl TrainingMlp {
@@ -201,6 +216,18 @@ impl TrainingMlp {
             layer_inputs: Vec::new(),
             executor: MlpExecutor::with_loss(layers, res_range, loss),
         }
+    }
+
+    pub fn get_meta_data(&self, cursor: &mut MetadataCursor) -> MlpMetadata {
+        self.executor.get_meta_data(cursor)
+    }
+
+    pub fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
+        self.executor.get_data(runtime)
+    }
+
+    pub fn loss(&self) -> Loss {
+        self.executor.loss()
     }
 
     pub fn forward(&mut self, input: Matrix, runtime: &mut CudaRuntime) -> Matrix {
@@ -238,23 +265,5 @@ impl TrainingMlp {
 
     pub fn input(&self) -> Option<&Matrix> {
         self.layer_inputs.first()
-    }
-
-    pub fn dump_to_file<P: AsRef<Path>>(
-        &self,
-        path: P,
-        runtime: &CudaRuntime,
-    ) -> Result<(), Box<dyn Error>> {
-        self.executor.dump_to_file(path, runtime)
-    }
-
-    pub fn load_from_file<P: AsRef<Path>>(
-        path: P,
-        runtime: &mut CudaRuntime,
-    ) -> Result<Self, Box<dyn Error>> {
-        Ok(Self {
-            layer_inputs: Vec::new(),
-            executor: MlpExecutor::load_from_file(path, runtime)?,
-        })
     }
 }

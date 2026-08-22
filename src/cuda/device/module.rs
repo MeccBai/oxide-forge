@@ -226,7 +226,38 @@ pub(in crate::cuda) mod kernels {
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn rms_norm_assign(input: span::DeviceSliceMutDescriptor<f32>, dim: f32, epsilon: f32) {
-        row::rms_norm_assign_device(input, dim, epsilon);
+    pub fn rms_norm_assign(input: span::DeviceSliceMutDescriptor<f32>, cols: usize, epsilon: f32) {
+        row::rms_norm_assign_device(input, cols, epsilon);
+    }
+
+    #[kernel]
+    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
+    #[launch_contract(domain = 1)]
+    pub fn compare_vectors(
+        lhs: span::DeviceSliceDescriptor<f32>,
+        rhs: span::DeviceSliceDescriptor<f32>,
+        result: span::DeviceSliceMutDescriptor<u32>,
+    ) {
+        reduction::compare_vectors_device(lhs, rhs, result);
+    }
+
+    #[kernel]
+    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
+    #[launch_contract(domain = 1)]
+    pub fn matrix_causal_mask(matrix: span::DeviceSliceMutDescriptor<f32>, cols: usize) {
+        row::matrix_causal_mask_device(matrix, cols);
+    }
+
+    #[kernel]
+    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
+    #[launch_contract(domain = 1)]
+    pub fn matrix_rms_norm_backward(
+        input: span::DeviceSliceDescriptor<f32>,
+        output_gradient: span::DeviceSliceDescriptor<f32>,
+        result: span::DeviceSliceMutDescriptor<f32>,
+        cols: usize,
+        epsilon: f32,
+    ) {
+        row::rms_norm_backward_device(input, output_gradient, result, cols, epsilon);
     }
 }

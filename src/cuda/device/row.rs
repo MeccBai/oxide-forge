@@ -3,6 +3,17 @@ use crate::cuda::{BinaryOp, span};
 use cuda_device::{device, shared, thread, warp};
 
 #[device]
+pub(super) fn matrix_causal_mask_device(matrix: span::DeviceSliceMutDescriptor<f32>, cols: usize) {
+    let row = thread::blockIdx_x() as usize;
+    let col = thread::threadIdx_x() as usize;
+    let index = row * cols + col;
+
+    if col < cols && index < matrix.len() && col > row {
+        matrix.write(index, f32::NEG_INFINITY);
+    }
+}
+
+#[device]
 pub(super) fn matrix_sum_rows_device(
     matrix: span::DeviceSliceDescriptor<f32>,
     result: span::DeviceSliceMutDescriptor<f32>,
@@ -338,7 +349,7 @@ pub(super) fn layer_norm_backward_device(
 #[device]
 pub(super) fn rms_norm_assign_device(
     input: span::DeviceSliceMutDescriptor<f32>,
-    dim: f32,
+    cols: usize,
     epsilon: f32,
 ) {
     static mut SHARED: shared::SharedArray<f32, 32> = shared::SharedArray::UNINIT;
@@ -347,10 +358,10 @@ pub(super) fn rms_norm_assign_device(
     let warp_id = tid / 32;
     let lane = tid % 32;
 
-    let index = block_id * 1024 + tid;
-
-    let orignal = input.read(index);
-    let mut value = orignal * orignal;
+    let index = block_id * cols + tid;
+    let active = tid < cols && index < input.len();
+    let original = if active { input.read(index) } else { 0.0 };
+    let mut value = original * original;
 
     for delta in [1, 2, 4, 8, 16] {
         value += warp::shuffle_down_f32(value, delta);
@@ -376,10 +387,82 @@ pub(super) fn rms_norm_assign_device(
 
     thread::sync_threads();
 
-    if index < input.len() {
+    if active {
         input.write(
             index,
-            orignal / (unsafe { SHARED[0] } / dim + epsilon).sqrt(),
+            original / (unsafe { SHARED[0] } / cols as f32 + epsilon).sqrt(),
         );
+    }
+}
+
+#[device]
+pub fn rms_norm_backward_device(
+    input: span::DeviceSliceDescriptor<f32>,
+    output_gradient: span::DeviceSliceDescriptor<f32>,
+    result: span::DeviceSliceMutDescriptor<f32>,
+    cols: usize,
+    epsilon: f32,
+) {
+    static mut SUM_REDUCE: shared::SharedArray<f32, 32> = shared::SharedArray::UNINIT;
+    static mut DOT_REDUCE: shared::SharedArray<f32, 32> = shared::SharedArray::UNINIT;
+
+    let tid = thread::threadIdx_x() as usize;
+    let block_id = thread::blockIdx_x() as usize;
+    let warp_id = tid / 32;
+    let lane = tid % 32;
+    let index = block_id * cols + tid;
+    let active =
+        tid < cols && index < input.len() && index < output_gradient.len() && index < result.len();
+    let (original, mut dot) = if active {
+        let val = input.read(index);
+        (val, val * output_gradient.read(index))
+    } else {
+        (0.0, 0.0)
+    };
+    let mut value = original * original;
+    for delta in [1, 2, 4, 8, 16] {
+        value += warp::shuffle_down_f32(value, delta);
+        dot += warp::shuffle_down_f32(dot, delta);
+    }
+    if lane == 0 {
+        unsafe {
+            SUM_REDUCE[warp_id] = value;
+            DOT_REDUCE[warp_id] = dot;
+        };
+    }
+    thread::sync_threads();
+
+    if tid < 32 {
+        value = unsafe { SUM_REDUCE[tid] };
+        dot = unsafe { DOT_REDUCE[tid] };
+    }
+
+    thread::sync_threads();
+
+    if tid < 32 {
+        for delta in [1, 2, 4, 8, 16] {
+            value += warp::shuffle_down_f32(value, delta);
+            dot += warp::shuffle_down_f32(dot, delta);
+        }
+        unsafe {
+            SUM_REDUCE[tid] = value;
+            DOT_REDUCE[tid] = dot;
+        };
+    }
+
+    thread::sync_threads();
+    let sum = unsafe { SUM_REDUCE[0] };
+    let dot_reduce = unsafe { DOT_REDUCE[0] };
+    thread::sync_threads();
+
+    let rms = (sum / cols as f32 + epsilon).sqrt();
+
+    let inv_rms = 1.0 / rms;
+    let correction = dot_reduce / cols as f32 * inv_rms * inv_rms * inv_rms;
+
+    if active {
+        let gradient = output_gradient.read(index);
+        let dx = gradient * inv_rms - original * correction;
+        result.write(index, dx);
     }
 }

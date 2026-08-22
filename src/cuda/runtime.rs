@@ -54,6 +54,11 @@ impl CudaRuntime {
         self.allocate_uninit_buffer(size)
     }
 
+    pub fn get_u32_uninit_buffer(&mut self, size: usize) -> DeviceBuffer<u32> {
+        let buffer = unsafe { DeviceBuffer::<u32>::uninitialized_async(&self.stream, size) };
+        buffer.unwrap()
+    }
+
     fn allocate_uninit_buffer(&self, size: usize) -> DeviceBuffer<f32> {
         let buffer = unsafe { DeviceBuffer::<f32>::uninitialized_async(&self.stream, size) };
         buffer.unwrap()

@@ -30,7 +30,7 @@ fn main() {
 
     let output_matrix = Linear::new(runtime.new_matrix(Random, 768, 256), None, Identity);
 
-    let mut transformer = net::transformer::InferenceTransformer::new(
+    let mut transformer = net::transformer::encoder::InferenceTransformer::new(
         matrix_q,
         matrix_k,
         matrix_v,

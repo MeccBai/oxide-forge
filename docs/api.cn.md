@@ -392,19 +392,21 @@ let transformer = InferenceTransformer::new(
 );
 ```
 
-两种执行器都采用 Post-Norm。由于 RMSNorm backward 尚未实现，`TrainingTransformer`
-目前仍固定使用 LayerNorm。训练版本缓存 Q/K/V、Softmax probability、两次 LayerNorm
-输入以及最终编码结果，并实现完整反传：
+两种执行器都采用 Post-Norm。LayerNorm 与 RMSNorm 均已提供 forward 和 backward。
+`QkvProjection` 统一持有三个 Linear 投影和可复用 stream，并支持 query 与
+key/value 使用不同输入，因此后续 decoder cross-attention 可直接复用。`Attention`
+负责 scaled score、row Softmax、value GEMM、residual norm 和训练 cache，encoder
+的 inference/training 不再各自实现调度逻辑。
 
-两个 forward 执行器都会 fork 三条可复用 stream，并通过独立的 Linear `forward`
-直接取得 Q/K/V。主 stream 在 `QK^T` 前只 join Q/K，让 V 可以继续与 score 路径重叠，
-并在 attention GEMM 前才 join V。所有 join 都是 CUDA event 依赖，不会同步 CPU。
+主 stream 在 `QK^T` 前只 join Q/K，V 继续与 score 路径重叠，并在 attention GEMM
+前才 join V。这些 join 都是 CUDA event 依赖，不会同步 CPU。后续多头实现可以复用
+`QkvProjection`，只替换投影结果的 head 布局与逐头 score 计算。
 
 ```text
 output projection
-→ second LayerNorm
+→ second normalization backward
 → FFN + residual
-→ first LayerNorm
+→ first normalization backward
 → attention matmul
 → row Softmax
 → scaled QKᵀ
@@ -428,24 +430,28 @@ model.bin    连续 little-endian f32 参数
 会写进元数据。接口如下：
 
 ```rust
-model.dump_to_file("model.toml", &runtime)?;
+use crate::net::checkpoint;
 
-let linear = Linear::load_from_file("linear.toml", &mut runtime)?;
+checkpoint::dump_linear(&linear, "linear.toml", &runtime)?;
+let linear = checkpoint::load_linear("linear.toml", &runtime)?;
 
-let mlp = MlpExecutor::load_from_file("model.toml", &mut runtime)?;
-let mlp = InferenceMLP::load_from_file("model.toml", &mut runtime)?;
-let mlp = TrainingMlp::load_from_file("model.toml", &mut runtime)?;
+checkpoint::dump_mlp(&mlp, "mlp.toml", &runtime)?;
+let mlp = checkpoint::load_mlp("mlp.toml", &runtime)?;
 
-let model = InferenceTransformer::load_from_file("model.toml", &mut runtime)?;
-let model = TrainingTransformer::load_from_file("model.toml", &mut runtime)?;
+checkpoint::dump_transformer(&model, "model.toml", &runtime)?;
+let model = checkpoint::load_transformer("model.toml", &runtime)?;
 ```
 
-`Linear`、`MlpExecutor`、两种 MLP 和两种 Transformer 都提供 `dump_to_file` 与
-`load_from_file`。推理版和训练版使用相同的持久参数表示；Transformer 元数据还会保存
-normalization type，旧元数据缺少该字段时默认使用 LayerNorm。forward activation cache
-和 Q/K/V stream 都属于运行时状态，不会保存；推理模型加载后延迟重建 stream，训练模型
-加载后的 cache 为空。在 RMSNorm backward 完成前，把 RMSNorm Transformer 作为训练执行器
-加载会返回错误。
+所有文件操作都只存在于 `net::checkpoint`；`Linear`、MLP 和 Transformer 不提供
+文件方法。该模块另外提供明确的 inference/training MLP 以及 training Transformer
+变体。推理版和训练版使用相同的持久参数表示。forward cache 与 Q/K/V stream
+属于运行时状态，不会保存。推理模型加载后延迟重建 stream，训练模型的 cache 从空状态
+开始；加载训练 checkpoint 时会保留其选择的 LayerNorm 或 RMSNorm 类型。
+
+模型关联层的完整入口为 `dump_linear/load_linear`、`dump_mlp/load_mlp`、
+`dump_inference_mlp/load_inference_mlp`、`dump_training_mlp/load_training_mlp`、
+`dump_transformer/load_transformer` 和
+`dump_training_transformer/load_training_transformer`。
 
 TOML 保存以下信息：
 
@@ -460,10 +466,12 @@ TOML 保存以下信息：
 `Loss::MeanSquaredError`；需要明确指定要持久化的损失函数时使用 `with_loss`。格式版本
 1 当前只定义均方误差。
 
-dump 直接复用现有 `Matrix::to_host` / `Vector::to_host`。load 根据 TOML 的 byte range
-逐个 `seek + read_exact`，只读取当前参数，再通过 `DeviceBuffer::from_host` 创建显存。
-加载器会先检查格式版本、BIN 大小、范围、tensor 形状、Linear 连接、residual 尺寸和
-Transformer 尺寸。该功能不需要专用 kernel，也没有 Span 传输特例。
+每个模型只公开 `get_meta_data` 和 `get_data`，执行字段保持私有。checkpoint 的 I/O 层
+负责通用 TOML/BIN 转换，模型关联层负责验证元数据，并通过公开构造器组装具体
+模型。D2H 复用 `Matrix::to_host` / `Vector::to_host`，H2D 使用公开的
+`matrix_from_host` / `vector_from_host` Runtime API。加载器会检查格式、BIN 大小、连续
+byte range、tensor 形状、Linear 连接、residual 尺寸和 Transformer 尺寸。整个流程
+不需要 checkpoint kernel、Span 传输特例或特权访问。
 
 ## 同步速查
 

@@ -6,10 +6,8 @@ use crate::cuda::{
 use cuda::container::{Matrix, Vector};
 use cuda_core::CudaStream;
 use serde::{Deserialize, Serialize};
-use std::error::Error;
-use std::path::Path;
 
-use crate::net::checkpoint;
+use crate::net::metadata::{HostData, MatrixMetadata, MetadataCursor, VectorMetadata};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,9 +70,19 @@ impl Activation {
 }
 
 pub struct Linear {
-    pub(super) weights: Matrix,
-    pub(super) bias: Option<Vector>,
-    pub(super) activation: Activation,
+    weights: Matrix,
+    bias: Option<Vector>,
+    activation: Activation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinearMetadata {
+    pub input_neurons: usize,
+    pub output_neurons: usize,
+    pub activation: Activation,
+    pub weights: MatrixMetadata,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bias: Option<VectorMetadata>,
 }
 
 impl Linear {
@@ -86,19 +94,23 @@ impl Linear {
         }
     }
 
-    pub fn dump_to_file<P: AsRef<Path>>(
-        &self,
-        path: P,
-        runtime: &CudaRuntime,
-    ) -> Result<(), Box<dyn Error>> {
-        checkpoint::dump_linear_file(self, path.as_ref(), runtime)
+    pub fn get_meta_data(&self, cursor: &mut MetadataCursor) -> LinearMetadata {
+        LinearMetadata {
+            input_neurons: self.weights.rows(),
+            output_neurons: self.weights.cols(),
+            activation: self.activation,
+            weights: cursor.matrix(self.weights.rows(), self.weights.cols()),
+            bias: self.bias.as_ref().map(|bias| cursor.vector(bias.len())),
+        }
     }
 
-    pub fn load_from_file<P: AsRef<Path>>(
-        path: P,
-        runtime: &mut CudaRuntime,
-    ) -> Result<Self, Box<dyn Error>> {
-        checkpoint::load_linear_file(path.as_ref(), runtime)
+    pub fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
+        let mut data = Vec::with_capacity(1 + usize::from(self.bias.is_some()));
+        data.push(HostData::new(self.weights.to_host(runtime)));
+        if let Some(bias) = &self.bias {
+            data.push(HostData::new(bias.to_host(runtime)));
+        }
+        data
     }
 
     pub fn forward(

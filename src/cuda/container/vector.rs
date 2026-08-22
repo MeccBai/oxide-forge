@@ -1,4 +1,4 @@
-use crate::cuda::{BinaryOp, CudaRuntime, DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut};
+use crate::cuda::{BinaryOp, CudaRuntime, DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, span};
 use cuda_core::CudaStream;
 
 use super::Vector;
@@ -112,5 +112,26 @@ impl Vector {
         let result = product.sum(runtime);
         runtime.recycle_vector(product);
         result
+    }
+
+    pub fn equals(&self, rhs: &Vector, runtime: &mut CudaRuntime) -> bool {
+        assert_eq!(self.len(), rhs.len());
+        let config = runtime.get_launch_config(self.len(), DEFAULT_BLOCK_SIZE);
+        let prepared = runtime.module().prepare_compare_vectors(config).unwrap();
+        let mut result = runtime.get_u32_uninit_buffer(1);
+        let view = span::DeviceSpanMut::from_buffer(&mut result, 0, 1);
+        runtime
+            .module()
+            .compare_vectors(
+                runtime.stream(),
+                &prepared,
+                self.as_span().descriptor(),
+                rhs.as_span().descriptor(),
+                view.descriptor(),
+            )
+            .unwrap();
+
+        let host_result = result.to_host_vec(runtime.stream()).unwrap();
+        host_result[0] != 0
     }
 }

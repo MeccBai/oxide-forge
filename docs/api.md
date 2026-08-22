@@ -428,22 +428,24 @@ let transformer = InferenceTransformer::new(
 );
 ```
 
-Both executors use a Post-Norm layout. `TrainingTransformer` currently remains
-fixed to LayerNorm because RMSNorm backward is not implemented. It caches Q/K/V,
-Softmax probabilities, both LayerNorm inputs, and the final encoded value. Its
-backward path covers:
+Both executors use a Post-Norm layout. LayerNorm and RMSNorm both provide forward
+and backward paths. `QkvProjection` owns the three
+Linear projections and reusable streams. It accepts separate query and key/value
+inputs, so decoder cross-attention can reuse it. `Attention` owns scaled score
+calculation, row Softmax, the value GEMM, residual normalization, and its training
+cache. Encoder inference and training therefore share the same scheduling code.
 
-Both forward executors fork three reusable streams and obtain Q/K/V directly
-from independent projection Linear `forward` calls. The primary stream joins Q
-and K before `QK^T`, while V remains eligible to overlap the score path and is
-joined only before the attention GEMM. The joins are CUDA event dependencies,
-not host synchronization.
+The primary stream joins Q and K before `QK^T`, while V remains eligible to
+overlap the score path and is joined only before the attention GEMM. These joins
+are CUDA event dependencies, not host synchronization. A future multi-head path
+can reuse `QkvProjection` and replace only the projected-matrix head layout and
+per-head score calculation.
 
 ```text
 output projection
-→ second LayerNorm
+→ second normalization backward
 → FFN + residual
-→ first LayerNorm
+→ first normalization backward
 → attention matrix products
 → row Softmax
 → scaled QKᵀ
@@ -468,26 +470,30 @@ rejected. The corresponding `.bin` name is written into the metadata. Available
 entry points are:
 
 ```rust
-model.dump_to_file("model.toml", &runtime)?;
+use crate::net::checkpoint;
 
-let linear = Linear::load_from_file("linear.toml", &mut runtime)?;
+checkpoint::dump_linear(&linear, "linear.toml", &runtime)?;
+let linear = checkpoint::load_linear("linear.toml", &runtime)?;
 
-let mlp = MlpExecutor::load_from_file("model.toml", &mut runtime)?;
-let mlp = InferenceMLP::load_from_file("model.toml", &mut runtime)?;
-let mlp = TrainingMlp::load_from_file("model.toml", &mut runtime)?;
+checkpoint::dump_mlp(&mlp, "mlp.toml", &runtime)?;
+let mlp = checkpoint::load_mlp("mlp.toml", &runtime)?;
 
-let model = InferenceTransformer::load_from_file("model.toml", &mut runtime)?;
-let model = TrainingTransformer::load_from_file("model.toml", &mut runtime)?;
+checkpoint::dump_transformer(&model, "model.toml", &runtime)?;
+let model = checkpoint::load_transformer("model.toml", &runtime)?;
 ```
 
-`Linear`, `MlpExecutor`, both MLP forms, and both Transformer forms provide
-`dump_to_file` and `load_from_file`. The inference/training forms share the same
-persistent parameter representation; Transformer metadata also stores its
-normalization type. Older metadata without this field defaults to LayerNorm.
-Forward activation caches and Q/K/V streams are runtime state and are not saved.
-A loaded inference Transformer recreates streams lazily, while a loaded training
-wrapper starts with an empty cache. Loading an RMSNorm Transformer as a training
-executor is rejected until RMSNorm backward exists.
+All file operations live in `net::checkpoint`; `Linear`, MLP, and Transformer do
+not expose file methods. The module also provides explicit inference/training MLP
+and training Transformer variants. Inference and training forms share the same
+persistent parameter representation. Forward caches and Q/K/V streams are runtime
+state and are not saved. A loaded inference Transformer recreates streams lazily,
+while a loaded training wrapper starts with an empty cache. Training checkpoints
+retain their selected LayerNorm or RMSNorm type when loaded.
+
+The complete association-layer entry points are `dump_linear/load_linear`,
+`dump_mlp/load_mlp`, `dump_inference_mlp/load_inference_mlp`,
+`dump_training_mlp/load_training_mlp`, `dump_transformer/load_transformer`, and
+`dump_training_transformer/load_training_transformer`.
 
 The TOML document records:
 
@@ -502,12 +508,14 @@ The TOML document records:
 `Loss::MeanSquaredError`. Use `with_loss` when selecting the persisted loss
 explicitly. Version 1 currently defines only mean squared error.
 
-Dump uses the existing `Matrix::to_host` and `Vector::to_host` paths. Load seeks
-directly to each declared range, reads only that parameter, and creates its
-device allocation with `DeviceBuffer::from_host`. It validates the format,
-binary size, ranges, tensor shapes, Linear connectivity, residual dimensions,
-and Transformer dimensions before constructing the executor. No checkpoint
-kernel or Span-specific transfer path exists.
+Each model exposes `get_meta_data` and `get_data`; its execution fields remain
+private. The checkpoint I/O layer handles generic TOML and BIN conversion, while
+the model-association layer validates metadata and constructs concrete models
+through their public constructors. D2H uses `Matrix::to_host`/`Vector::to_host`;
+H2D uses the public `matrix_from_host`/`vector_from_host` runtime APIs. Loading
+validates the format, binary size, contiguous ranges, tensor shapes, Linear
+connectivity, residual dimensions, and Transformer dimensions. No checkpoint
+kernel, Span-specific transfer path, or privileged access exists.
 
 ## Synchronization Summary
 

@@ -29,11 +29,10 @@ Implemented capabilities include:
 - device-owning `Vector` and row-major `Matrix` containers;
 - element-wise arithmetic, mapping, scaling, reduction, and row broadcasting;
 - tiled matrix multiplication and shared-memory matrix transpose;
-- row-wise Softmax, LayerNorm, and RMSNorm, with backward kernels for Softmax
-  and LayerNorm;
+- row-wise Softmax, LayerNorm, and RMSNorm, all with backward kernels;
 - Linear, GELU, MLP, residual connections, and their backward paths;
 - single-head Post-Norm Transformer executors with selectable LayerNorm/RMSNorm
-  inference and LayerNorm training;
+  inference and training;
 - parameter checkpoint save/load for MLP and Transformer executors;
 - asynchronous submission on the primary stream and explicit fork/join for
   additional streams.
@@ -92,12 +91,12 @@ X ───────────────── residual ── Norm ─�
                                                       output projection
 ```
 
-Inference selects `NormType::Layer` or `NormType::Rms` when it is constructed.
-Training currently remains on LayerNorm because RMSNorm backward has not been
-implemented. Inference executors do not retain activations. Training executors
-keep only the data required by backward, while the MLP owns scheduling for
-Linear parameter updates. Individual Linear layers do not own a tape or
-workspace.
+Inference and training select `NormType::Layer` or `NormType::Rms` when they are
+constructed. Both normalization types provide forward and backward paths. Q/K/V
+projections, their reusable streams, scaled
+attention, Softmax, residual normalization, and the attention training cache are
+owned by one shared Attention module. Inference executors do not retain
+activations. Individual Linear layers do not own a tape or workspace.
 
 ## Requirements
 
@@ -184,10 +183,19 @@ src/
 │       ├── vector_runtime.rs Vector-producing runtime operations
 │       └── vector_view.rs    contiguous borrowed-view operations
 └── net/
-    ├── checkpoint.rs         versioned TOML metadata and binary parameters
+    ├── checkpoint.rs         public checkpoint routing
+    ├── checkpoint/
+    │   ├── io.rs             metadata/parameter file tools
+    │   └── model.rs          model-specific dump/load assembly
     ├── linear.rs             Linear, activation, and parameter updates
+    ├── metadata.rs           public parameter metadata and host data
     ├── mlp.rs                inference/training MLP executors
-    └── transformer.rs        single-head Transformer executors
+    ├── transformer.rs        Transformer types and module routing
+    └── transformer/
+        ├── attention.rs      reusable Q/K/V, streams, attention, and norm
+        ├── decoder.rs        decoder assembly
+        ├── encoder.rs        single-head encoder executors
+        └── inference.rs      shared encoder/decoder inference block
 ```
 
 See the [CUDA Runtime API](docs/api.md) for the complete container, span,
@@ -200,10 +208,10 @@ synchronization, and network-layer reference.
 - matrix multiplication uses Tensor Core TF32 products with `f32` accumulation
   and output, requires SM80+, and currently requires M/K/N dimensions to be
   multiples of 16;
-- row Softmax and LayerNorm backward currently support at most 1024 elements per
-  row;
-- the current Transformer is single-head and Post-Norm; inference supports
-  LayerNorm or RMSNorm, while training currently supports LayerNorm only;
+- row Softmax, LayerNorm, and RMSNorm backward currently support at most 1024
+  elements per row;
+- the current Transformer is single-head and Post-Norm; inference and training
+  support LayerNorm or RMSNorm;
 - parameter updates use direct SGD rather than a general optimizer abstraction;
 - checkpoint format version 1 stores little-endian `f32` parameters; unsupported
   versions are rejected explicitly.

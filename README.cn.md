@@ -25,9 +25,9 @@ OxideForge 目前处于实验性开发阶段，API 会继续调整。核心前�
 - 拥有显存的 `Vector` 和 row-major `Matrix`；
 - 元素级四则运算、映射、缩放、归约和广播；
 - tiled matrix multiplication 和 shared-memory transpose；
-- row Softmax、LayerNorm 和 RMSNorm，其中 Softmax 与 LayerNorm 提供 backward kernel；
+- row Softmax、LayerNorm 和 RMSNorm，三者均提供 backward kernel；
 - Linear、GELU、MLP、残差连接和对应反向传播；
-- 单头 Post-Norm Transformer 执行器，推理可选 LayerNorm/RMSNorm，训练使用 LayerNorm；
+- 单头 Post-Norm Transformer 执行器，推理和训练均可选 LayerNorm/RMSNorm；
 - MLP 与 Transformer 参数的 checkpoint 保存和加载；
 - 主 stream 异步提交，以及额外 stream 的 fork/join。
 
@@ -78,10 +78,10 @@ X ───────────────── residual ── Norm ─�
                                                       output projection
 ```
 
-推理执行器在构造时选择 `NormType::Layer` 或 `NormType::Rms`。由于 RMSNorm backward
-尚未实现，训练执行器目前仍固定使用 LayerNorm。推理层不保存 activation；训练层只保存
-反向计算所需的数据，并由 MLP 层统一调度 Linear 参数更新；Linear 自身不持有 tape 或
-workspace。
+推理和训练执行器在构造时选择 `NormType::Layer` 或 `NormType::Rms`，两种归一化均已
+提供 forward 和 backward。Q/K/V 投影、可复用 stream、scaled
+attention、Softmax、residual norm 以及 attention 训练 cache 统一属于共享
+Attention 模块。推理层不保存 activation；Linear 自身不持有 tape 或 workspace。
 
 ## 环境要求
 
@@ -165,10 +165,19 @@ src/
 │       ├── vector_runtime.rs 创建 Vector 的 Runtime 操作
 │       └── vector_view.rs    连续 View 接口与计算
 └── net/
-    ├── checkpoint.rs         版本化 TOML 元数据与二进制参数
+    ├── checkpoint.rs         公开 checkpoint 路由
+    ├── checkpoint/
+    │   ├── io.rs             元数据/参数文件工具层
+    │   └── model.rs          具体模型 dump/load 组装层
     ├── linear.rs             Linear、activation 与参数更新
+    ├── metadata.rs           公开参数元数据与 host data
     ├── mlp.rs                inference/training MLP executor
-    └── transformer.rs        single-head Transformer
+    ├── transformer.rs        Transformer 类型与模块路由
+    └── transformer/
+        ├── attention.rs      可复用 Q/K/V、stream、attention 与 norm
+        ├── decoder.rs        decoder 组装层
+        ├── encoder.rs        single-head encoder executor
+        └── inference.rs      encoder/decoder 共用推理块
 ```
 
 更完整的容器、Span、同步及网络接口说明见
@@ -180,9 +189,8 @@ src/
 - 仅支持连续 row-major Matrix，不支持 stride；
 - 当前矩阵乘法使用 Tensor Core TF32 乘法、`f32` 累加和输出，要求 SM80+，且
   M/K/N 均须为 16 的倍数；
-- 当前 row Softmax 和 LayerNorm backward 每行最多 1024 个元素；
-- 当前 Transformer 是单头 Post-Norm 结构；推理支持 LayerNorm 或 RMSNorm，训练目前仅
-  支持 LayerNorm；
+- 当前 row Softmax、LayerNorm 和 RMSNorm backward 每行最多 1024 个元素；
+- 当前 Transformer 是单头 Post-Norm 结构；推理和训练均支持 LayerNorm 或 RMSNorm；
 - 当前参数更新为直接 SGD，不包含通用 optimizer；
 - checkpoint 格式版本 1 固定保存 little-endian `f32` 参数；加载器会明确拒绝不支持的版本。
 

@@ -1,4 +1,4 @@
-use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig2D};
+use cuda_core::{CudaStream, DeviceBuffer, DriverError, LaunchConfig1D, LaunchConfig2D};
 
 use crate::cuda::{
     BinaryOp, DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut,
@@ -75,9 +75,41 @@ impl Matrix {
         let mut span = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
         span.for_each_on(runtime, stream, f);
     }
+
+    pub fn causal_mask(&mut self, runtime: &CudaRuntime) {
+        if self.rows == 0 {
+            return;
+        }
+        assert!(self.cols > 0 && self.cols <= DEFAULT_BLOCK_SIZE);
+        let config = LaunchConfig1D::new(self.rows as u32, self.cols as u32, 0);
+        let prepared = runtime.module().prepare_matrix_causal_mask(config).unwrap();
+        let len = self.buffer.len();
+        let matrix = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
+        runtime
+            .module()
+            .matrix_causal_mask(runtime.stream(), &prepared, matrix.descriptor(), self.cols)
+            .unwrap();
+    }
 }
 
 impl CudaRuntime {
+    pub fn matrix_from_host(
+        &self,
+        values: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<Matrix, DriverError> {
+        let len = rows
+            .checked_mul(cols)
+            .expect("matrix element count overflow");
+        assert_eq!(values.len(), len);
+        Ok(Matrix {
+            buffer: DeviceBuffer::from_host(self.stream(), values)?,
+            rows,
+            cols,
+        })
+    }
+
     pub fn matrix_multiply(&mut self, mat1: &Matrix, mat2: &Matrix) -> Matrix {
         assert_eq!(mat1.cols, mat2.rows);
         let mut result = self.new_uninit_matrix(mat1.rows, mat2.cols);

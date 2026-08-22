@@ -1,4 +1,4 @@
-use cuda_core::{CudaStream, DeviceBuffer};
+use cuda_core::{CudaStream, DeviceBuffer, DriverError};
 
 use crate::cuda::{
     BinaryOp, CudaRuntime, DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, runtime::InitType,
@@ -7,6 +7,12 @@ use crate::cuda::{
 use super::Vector;
 
 impl CudaRuntime {
+    pub fn vector_from_host(&self, values: &[f32]) -> Result<Vector, DriverError> {
+        Ok(Vector {
+            buffer: DeviceBuffer::from_host(self.stream(), values)?,
+        })
+    }
+
     /// Consumes a vector and returns its allocation to the runtime pool.
     pub fn recycle_vector(&mut self, vector: Vector) {
         self.recycle_buffer(vector.buffer);
