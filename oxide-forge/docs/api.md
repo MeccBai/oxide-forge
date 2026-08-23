@@ -1,6 +1,6 @@
 # OxideForge CUDA Runtime API
 
-English | [简体中文](api.cn.md)
+[Runtime README](../README.md) | English | [简体中文](api.cn.md)
 
 This document describes the current implementation. The runtime targets
 shape-controlled neural networks, `f32`, and contiguous row-major matrices. It

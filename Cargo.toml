@@ -1,15 +1,17 @@
-[package]
-name = "oxide-forge"
+[workspace]
+members = ["oxide-forge", "examples/ocr"]
+default-members = ["examples/ocr"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "A purpose-built Rust/CUDA neural network runtime powered by CUDA-Oxide"
 
-[workspace]
-
-[dependencies]
+[workspace.dependencies]
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git" }
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git" }
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git" }
 rand = "0.10.2"
 toml = "1.1.4"
 serde = { version = "1.0.229", features = ["derive"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }

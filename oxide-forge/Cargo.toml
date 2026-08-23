@@ -1,0 +1,13 @@
+[package]
+name = "oxide-forge"
+version.workspace = true
+edition.workspace = true
+description = "A purpose-built Rust/CUDA neural network runtime powered by CUDA-Oxide"
+
+[dependencies]
+cuda-device.workspace = true
+cuda-host.workspace = true
+cuda-core.workspace = true
+rand.workspace = true
+toml.workspace = true
+serde.workspace = true

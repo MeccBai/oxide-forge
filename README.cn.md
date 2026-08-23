@@ -1,201 +1,23 @@
-# OxideForge
+# OxideForge Workspace
 
-[English](README.md) | 中文
+[English](README.md) | 简体中文
 
-OxideForge 是一个基于
-[CUDA-Oxide](https://nvlabs.github.io/cuda-oxide/index.html) 编写的 Rust/CUDA
-神经网络运行时。项目由 GPU 计算、连续内存容器和神经网络执行层组成，为形状明确、
-数据布局可控的模型提供轻量基座。
+workspace 包含两个职责明确、彼此分离的成员：
 
-项目不试图复刻通用张量框架。它面向形状明确、数据布局可控的模型，以手写 CUDA
-kernel 和显式所有权换取可预测的数据流、较低的运行时开销，以及足够贴近硬件的编程
-体验。
-
-> 追求最大程度的无额外成本抽象，而不是最大程度的抽象。
-
-## 项目状态
-
-OxideForge 目前处于实验性开发阶段，API 会继续调整。核心前向与反向路径已经完成，
-同时提供版本化 TOML + BIN 模型存档；数据集接入和端到端训练程序仍在开发。
-
-当前实现包括：
-
-- CUDA context、module、stream、buffer 分配和同步；
-- 连续只读/可变 Device Span，以及基于借用的 VectorView；
-- 拥有显存的 `Vector` 和 row-major `Matrix`；
-- 元素级四则运算、映射、缩放、归约和广播；
-- tiled matrix multiplication 和 shared-memory transpose；
-- row Softmax、LayerNorm 和 RMSNorm，三者均提供 backward kernel；
-- Linear、GELU、MLP、残差连接和对应反向传播；
-- 单头 Post-Norm Transformer 执行器，推理和训练均可选 LayerNorm/RMSNorm；
-- MLP 与 Transformer 参数的 checkpoint 保存和加载；
-- 主 stream 异步提交，以及额外 stream 的 fork/join。
-
-尚未完成的主要工程闭环：
-
-- 输入和 label 的数据管线；
-- 模型级 forward/backward 与训练循环；
-- 小尺寸数值梯度测试与 optimizer 状态持久化。
-
-## 设计原则
-
-### 连续内存优先
-
-`Matrix` 固定使用 row-major 连续布局，Span 只表示一段连续设备内存，不支持 stride。
-需要按列访问或把不连续区域变为独立对象时，先执行转置或显式重排。项目不会为了表面
-上的通用性，把不连续布局的成本扩散到后续所有 kernel。
-
-### 所有权表达数据生命周期
-
-`Matrix` 和 `Vector` 拥有显存，Span 和 View 只借用显存。创建新容器的操作由
-`CudaRuntime` 提供，原地修改由容器自身提供。训练执行器拥有 backward 真正需要的
-中间结果；每层产生的新矩阵直接 move 到下一层缓存，不为缓存额外执行 device copy。
-最终输出按所有权返回，由上级模型决定是否保留。
-
-### 显式同步
-
-能够连续执行的操作进入同一个 CUDA stream，不在每次 kernel launch 后等待。返回设备
-对象的模型接口保持异步，模型边界由调用方通过 `runtime.sync()` 决定；返回 host 标量的
-归约仍是同步点。额外 stream 只用于确实彼此独立的工作，并通过 fork/join 明确汇合。
-
-### 专用实现胜过无成本假象
-
-当前运行时固定使用 `f32`，并针对已知模型尺寸提供实现。只有在不会显著增加复杂度或
-损害性能时才提升通用性。热点优化以 profiler 结果为依据，而不是预先堆叠抽象层。
-
-## 计算模型
-
-当前 Transformer 接收 `[sequence, hidden]` 矩阵：
+- [`oxide-forge`](oxide-forge/README.cn.md)：可复用的 Rust/CUDA 运行时、容器、kernel
+  和神经网络执行层；
+- [`examples/ocr`](examples/ocr/README.cn.md)：OCR 专用的数据管线、模型组装、训练程序
+  和推理程序。
 
 ```text
-X = position_encoding(input)
-    ├── Q ──┐
-    ├── K ──┴── QKᵀ / √hidden ── row softmax ──┐
-    └── V ─────────────────────────────────────┴── attention value
-                                                       │
-X ───────────────── residual ── Norm ── FFN ── residual ── Norm
-                                                               │
-                                                      output projection
+oxide-forge/       基础运行时库
+examples/ocr/      OCR 使用方及可执行示例
 ```
 
-推理和训练执行器在构造时选择 `NormType::Layer` 或 `NormType::Rms`，两种归一化均已
-提供 forward 和 backward。位置编码是 Transformer 持有的 `Matrix -> Matrix` 闭包，
-可以通过 `move` 捕获自己的 device 侧状态，而不再耦合到 Transformer 参数结构。Q/K/V
-投影、可复用 stream、scaled
-attention、Softmax、residual norm 以及 attention 训练 cache 统一属于共享
-Attention 模块。推理层不保存 activation；Linear 自身不持有 tape 或 workspace。
-
-## 环境要求
-
-- 支持 CUDA 的 NVIDIA GPU；
-- 可用的 NVIDIA Driver 和 CUDA 开发环境；
-- `rust-toolchain.toml` 指定的 Rust nightly toolchain；
-- 已安装 `cargo oxide`。
-
-首先检查 CUDA-Oxide 环境：
-
-```bash
-cargo oxide doctor
-```
-
-构建并运行：
+OCR package 是默认 workspace member，因此可以在仓库根目录直接启动训练：
 
 ```bash
 cargo oxide run
 ```
 
-普通 `cargo build` 不能替代这个流程，因为设备端代码需要由 CUDA-Oxide 单独生成并链接。
-
-设备调试构建：
-
-```bash
-cargo oxide run --device-debug
-```
-
-保留优化并为 Compute Sanitizer 或 profiler 生成行号：
-
-```bash
-cargo oxide run --lineinfo
-```
-
-## 最小示例
-
-下面的示例构造一个 `[batch, input_features]` 输入，并通过 Linear 完成特征映射：
-
-```rust
-let mut runtime = CudaRuntime::new()?;
-
-let input = runtime.new_matrix(InitType::Random, 256, 128);
-let projection = Linear::new(
-    runtime.new_matrix(InitType::Random, 128, 64),
-    None,
-    Activation::Identity,
-);
-
-let output = projection.forward(&input, None, &mut runtime, None);
-runtime.sync();
-
-assert_eq!((output.rows(), output.cols()), (256, 64));
-```
-
-项目当前是 binary crate，示例展示的是内部 API 的使用方式；稳定公共 crate 接口不是
-现阶段的目标。
-
-## 代码结构
-
-```text
-src/
-├── cuda.rs                    CUDA 类型与模块路由入口
-├── cuda/
-│   ├── device.rs             device 侧模块路由
-│   ├── device/
-│   │   ├── common.rs         device 公共辅助函数
-│   │   ├── elementwise.rs    逐元素 device 实现
-│   │   ├── reduction.rs      归约 device 实现
-│   │   ├── row.rs            逐行 device 实现
-│   │   ├── gemm.rs           FP32 与 Tensor Core GEMM 实现
-│   │   ├── layout.rs         转置与分块重排实现
-│   │   └── module.rs         单一 `#[cuda_module]` 内的薄入口
-│   ├── runtime.rs            context、stream、buffer 与同步
-│   ├── span.rs               连续设备内存借用
-│   └── container/
-│       ├── matrix.rs         Matrix 基础与矩阵间运算
-│       ├── convert.rs        布局变换及 Matrix/Vector 转换
-│       ├── rows.rs           逐行运算与归约
-│       ├── norm.rs           Softmax、LayerNorm 与 RMSNorm
-│       ├── vector.rs         Vector 查询、归约与原地操作
-│       ├── vector_runtime.rs 创建 Vector 的 Runtime 操作
-│       └── vector_view.rs    连续 View 接口与计算
-└── net/
-    ├── checkpoint.rs         公开 checkpoint 路由
-    ├── checkpoint/
-    │   ├── io.rs             元数据/参数文件工具层
-    │   └── model.rs          具体模型 dump/load 组装层
-    ├── linear.rs             Linear、activation 与参数更新
-    ├── metadata.rs           公开参数元数据与 host data
-    ├── mlp.rs                inference/training MLP executor
-    ├── transformer.rs        Transformer 类型与模块路由
-    └── transformer/
-        ├── attention.rs      可复用 Q/K/V、stream、attention 与 norm
-        ├── decoder.rs        decoder 组装层
-        ├── encoder.rs        single-head encoder executor
-        ├── inference.rs      encoder/decoder 共用推理块
-        └── position.rs       持有式位置编码闭包类型
-```
-
-更完整的容器、Span、同步及网络接口说明见
-[CUDA Runtime API](docs/api.md)。
-
-## 当前约束
-
-- 仅支持 `f32`；
-- 仅支持连续 row-major Matrix，不支持 stride；
-- 当前矩阵乘法使用 Tensor Core TF32 乘法、`f32` 累加和输出，要求 SM80+，且
-  M/K/N 均须为 16 的倍数；
-- 当前 row Softmax、LayerNorm 和 RMSNorm backward 每行最多 1024 个元素；
-- 当前 Transformer 是单头 Post-Norm 结构；推理和训练均支持 LayerNorm 或 RMSNorm；
-- 当前参数更新为直接 SGD，不包含通用 optimizer；
-- checkpoint 格式版本 1 固定保存 little-endian `f32` 参数；加载器会明确拒绝不支持的版本。
-
-这些约束是当前实现边界，不是对通用框架接口的模拟。随着实际模型需要和 profiling
-结果出现，项目会在明确成本的前提下扩展。
+API、约束和具体命令分别记录在各成员自己的 README 中。

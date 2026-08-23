@@ -9,6 +9,8 @@
 **/*.options
 **/*.ptx
 **/*.target
-/docs/impl
 .idea
 /log/
+dataset/
+model/
+/oxide-forge/docs/impl

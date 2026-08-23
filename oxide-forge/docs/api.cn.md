@@ -1,6 +1,6 @@
 # OxideForge CUDA Runtime API
 
-[English](api.md) | 中文
+[运行时 README](../README.cn.md) | [English](api.md) | 中文
 
 本文档对应当前代码。运行时面向形状明确的神经网络、`f32` 和 row-major Matrix，
 不追求绝对通用性。

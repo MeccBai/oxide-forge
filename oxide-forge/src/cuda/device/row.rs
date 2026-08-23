@@ -1,5 +1,3 @@
-
-
 use super::elementwise::apply_binary;
 use crate::cuda::{BinaryOp, span};
 use cuda_device::{__internal::index_1d, blockIdx_x, device, shared, thread, warp};
