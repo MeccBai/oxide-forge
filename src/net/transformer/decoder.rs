@@ -15,22 +15,25 @@ pub struct InferenceTransformer {
 }
 
 impl InferenceTransformer {
-    pub fn new(
+    pub fn new<F>(
         q_matrix: Linear,
         k_matrix: Linear,
         v_matrix: Linear,
-        position_matrix: Matrix,
+        position_encoding: F,
         fcs: InferenceMLP,
         output_matrix: Linear,
         qkv_streams: Option<Vec<Arc<CudaStream>>>,
         norm_type: NormType,
-    ) -> Self {
+    ) -> Self
+    where
+        F: Fn(&Matrix, &mut CudaRuntime) -> Matrix + 'static,
+    {
         Self {
             block: InferenceBlock::new(
                 q_matrix,
                 k_matrix,
                 v_matrix,
-                position_matrix,
+                Box::new(position_encoding),
                 fcs,
                 output_matrix,
                 qkv_streams,

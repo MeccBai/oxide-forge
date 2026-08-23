@@ -12,13 +12,23 @@ fn main() {
     // seq × hidden
     let input = runtime.new_matrix(Random, 1024, 768);
 
+    // The closure owns its positional state; Transformer only depends on its
+    // Matrix -> Matrix behavior.
+    //let position = runtime.new_matrix(Random, 1024, 768);
+
+    let position_encoding = move |input: &cuda::container::Matrix,
+                                  runtime: &mut cuda::CudaRuntime| {
+        let mut output = runtime.clone_matrix(&input);
+        output.rope_encoding(runtime);
+        output
+
+        //runtime.matrix_add(input, &position)
+    };
+
     // hidden × hidden
     let matrix_q = Linear::new(runtime.new_matrix(Random, 768, 768), None, Identity);
     let matrix_k = Linear::new(runtime.new_matrix(Random, 768, 768), None, Identity);
     let matrix_v = Linear::new(runtime.new_matrix(Random, 768, 768), None, Identity);
-
-    // seq × hidden
-    let matrix_position = runtime.new_matrix(Random, 1024, 768);
 
     let fcs = InferenceMLP::new(
         vec![
@@ -34,11 +44,11 @@ fn main() {
         matrix_q,
         matrix_k,
         matrix_v,
-        matrix_position,
+        position_encoding,
         fcs,
         output_matrix,
         None,
-        net::transformer::NormType::Layer,
+        net::transformer::NormType::Rms,
     );
 
     // InferenceTransformer::forward needs at most five live seq × hidden

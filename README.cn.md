@@ -68,7 +68,7 @@ OxideForge 目前处于实验性开发阶段，API 会继续调整。核心前�
 当前 Transformer 接收 `[sequence, hidden]` 矩阵：
 
 ```text
-X = input + position
+X = position_encoding(input)
     ├── Q ──┐
     ├── K ──┴── QKᵀ / √hidden ── row softmax ──┐
     └── V ─────────────────────────────────────┴── attention value
@@ -79,7 +79,9 @@ X ───────────────── residual ── Norm ─�
 ```
 
 推理和训练执行器在构造时选择 `NormType::Layer` 或 `NormType::Rms`，两种归一化均已
-提供 forward 和 backward。Q/K/V 投影、可复用 stream、scaled
+提供 forward 和 backward。位置编码是 Transformer 持有的 `Matrix -> Matrix` 闭包，
+可以通过 `move` 捕获自己的 device 侧状态，而不再耦合到 Transformer 参数结构。Q/K/V
+投影、可复用 stream、scaled
 attention、Softmax、residual norm 以及 attention 训练 cache 统一属于共享
 Attention 模块。推理层不保存 activation；Linear 自身不持有 tape 或 workspace。
 
@@ -177,7 +179,8 @@ src/
         ├── attention.rs      可复用 Q/K/V、stream、attention 与 norm
         ├── decoder.rs        decoder 组装层
         ├── encoder.rs        single-head encoder executor
-        └── inference.rs      encoder/decoder 共用推理块
+        ├── inference.rs      encoder/decoder 共用推理块
+        └── position.rs       持有式位置编码闭包类型
 ```
 
 更完整的容器、Span、同步及网络接口说明见

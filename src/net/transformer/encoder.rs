@@ -1,8 +1,4 @@
-use crate::cuda::{
-    BinaryOp::{Add, Sub},
-    container::Matrix,
-    runtime::CudaRuntime,
-};
+use crate::cuda::{BinaryOp::Add, container::Matrix, runtime::CudaRuntime};
 use crate::net::linear::Linear;
 use crate::net::metadata::{HostData, MetadataCursor};
 use crate::net::mlp::{InferenceMLP, TrainingMlp};
@@ -11,29 +7,32 @@ use cuda_core::CudaStream;
 use std::sync::Arc;
 
 pub use super::inference::TransformerMetadata;
-use super::{NormType, attention::Attention, inference::InferenceBlock};
+use super::{NormType, PositionEncoding, attention::Attention, inference::InferenceBlock};
 
 pub struct InferenceTransformer {
     block: InferenceBlock,
 }
 
 impl InferenceTransformer {
-    pub fn new(
+    pub fn new<F>(
         q_matrix: Linear,
         k_matrix: Linear,
         v_matrix: Linear,
-        position_matrix: Matrix,
+        position_encoding: F,
         fcs: InferenceMLP,
         output_matrix: Linear,
         qkv_streams: Option<Vec<Arc<CudaStream>>>,
         norm_type: NormType,
-    ) -> Self {
+    ) -> Self
+    where
+        F: Fn(&Matrix, &mut CudaRuntime) -> Matrix + 'static,
+    {
         Self {
             block: InferenceBlock::new(
                 q_matrix,
                 k_matrix,
                 v_matrix,
-                position_matrix,
+                Box::new(position_encoding),
                 fcs,
                 output_matrix,
                 qkv_streams,
@@ -57,7 +56,7 @@ impl InferenceTransformer {
 
 pub struct TrainingTransformer {
     attention: Attention,
-    position_matrix: Matrix,
+    position_encoding: PositionEncoding,
     fcs: TrainingMlp,
     output_matrix: Linear,
     cache: Option<TransformerCache>,
@@ -69,18 +68,21 @@ struct TransformerCache {
 }
 
 impl TrainingTransformer {
-    pub fn new(
+    pub fn new<F>(
         q_matrix: Linear,
         k_matrix: Linear,
         v_matrix: Linear,
-        position_matrix: Matrix,
+        position_encoding: F,
         fcs: TrainingMlp,
         output_matrix: Linear,
         norm_type: NormType,
-    ) -> Self {
+    ) -> Self
+    where
+        F: Fn(&Matrix, &mut CudaRuntime) -> Matrix + 'static,
+    {
         Self {
             attention: Attention::new(q_matrix, k_matrix, v_matrix, None, norm_type),
-            position_matrix,
+            position_encoding: Box::new(position_encoding),
             fcs,
             output_matrix,
             cache: None,
@@ -97,7 +99,6 @@ impl TrainingTransformer {
             query: qkv.query,
             key: qkv.key,
             value: qkv.value,
-            position: cursor.matrix(self.position_matrix.rows(), self.position_matrix.cols()),
             feed_forward: self.fcs.get_meta_data(cursor),
             output: self.output_matrix.get_meta_data(cursor),
         }
@@ -105,14 +106,15 @@ impl TrainingTransformer {
 
     pub fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
         let mut data = self.attention.get_data(runtime);
-        data.push(HostData::new(self.position_matrix.to_host(runtime)));
         data.extend(self.fcs.get_data(runtime));
         data.extend(self.output_matrix.get_data(runtime));
         data
     }
 
     pub fn forward(&mut self, input: &Matrix, runtime: &mut CudaRuntime) -> Matrix {
-        let positioned = runtime.matrix_add(input, &self.position_matrix);
+        let positioned = (self.position_encoding)(input, runtime);
+        assert_eq!(positioned.rows(), input.rows());
+        assert_eq!(positioned.cols(), input.cols());
         let first_output = self.attention.forward_self_training(positioned, runtime);
         let ffn = self.fcs.forward(first_output, runtime);
         let second_pre_norm = runtime.matrix_add(
@@ -177,11 +179,6 @@ impl TrainingTransformer {
             self.attention
                 .backward_self(&first_output_gradient, learning_rate, runtime);
 
-        let input_gradient = runtime.clone_matrix(&positioned_gradient);
-        let mut position_update = positioned_gradient;
-        position_update.scale(learning_rate, runtime);
-        self.position_matrix
-            .binary_assign(&position_update, Sub, runtime);
-        input_gradient
+        positioned_gradient
     }
 }

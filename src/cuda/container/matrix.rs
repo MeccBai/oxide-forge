@@ -90,6 +90,24 @@ impl Matrix {
             .matrix_causal_mask(runtime.stream(), &prepared, matrix.descriptor(), self.cols)
             .unwrap();
     }
+
+    pub fn rope_encoding(&mut self, runtime: &CudaRuntime) {
+        if self.rows == 0 {
+            return;
+        }
+        assert!(self.cols > 0 && self.cols % 2 == 0);
+        let config = LaunchConfig1D::new(self.rows as u32, self.cols as u32 / 2, 0);
+        let prepared = runtime
+            .module()
+            .prepare_matrix_rope_encoding(config)
+            .unwrap();
+        let len = self.buffer.len();
+        let matrix = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
+        runtime
+            .module()
+            .matrix_rope_encoding(runtime.stream(), &prepared, matrix.descriptor(), self.cols)
+            .unwrap();
+    }
 }
 
 impl CudaRuntime {

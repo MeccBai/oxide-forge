@@ -1,6 +1,8 @@
+
+
 use super::elementwise::apply_binary;
 use crate::cuda::{BinaryOp, span};
-use cuda_device::{device, shared, thread, warp};
+use cuda_device::{__internal::index_1d, blockIdx_x, device, shared, thread, warp};
 
 #[device]
 pub(super) fn matrix_causal_mask_device(matrix: span::DeviceSliceMutDescriptor<f32>, cols: usize) {
@@ -464,5 +466,27 @@ pub fn rms_norm_backward_device(
         let gradient = output_gradient.read(index);
         let dx = gradient * inv_rms - original * correction;
         result.write(index, dx);
+    }
+}
+
+#[device]
+pub(super) fn rope_encoding_device(mat: span::DeviceSliceMutDescriptor<f32>, cols: usize) {
+    assert!(
+        cols % 2 == 0,
+        "ROPE encoding requires an even number of columns"
+    );
+    let row = thread::blockIdx_x();
+    let index = thread::threadIdx_x() as u32;
+    let base = row * cols as u32;
+    let (start, end) = (base + index * 2, base + (index + 1) * 2 - 1);
+
+    let sin = (row as f32).sin();
+    let cos = (row as f32).cos();
+
+    if end < base + cols as u32 {
+        let x0 = mat.read(start as usize);
+        let x1 = mat.read(end as usize);
+        mat.write(start as usize, x0 * cos - x1 * sin);
+        mat.write(end as usize, x0 * sin + x1 * cos);
     }
 }

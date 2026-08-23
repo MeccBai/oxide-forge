@@ -81,7 +81,7 @@ Optimization follows profiler evidence instead of speculative abstraction.
 The current Transformer consumes a `[sequence, hidden]` matrix:
 
 ```text
-X = input + position
+X = position_encoding(input)
     ├── Q ──┐
     ├── K ──┴── QKᵀ / √hidden ── row softmax ──┐
     └── V ─────────────────────────────────────┴── attention value
@@ -92,7 +92,9 @@ X ───────────────── residual ── Norm ─�
 ```
 
 Inference and training select `NormType::Layer` or `NormType::Rms` when they are
-constructed. Both normalization types provide forward and backward paths. Q/K/V
+constructed. Positional encoding is an owned `Matrix -> Matrix` closure, so it can
+capture its own device-side state without coupling that state to Transformer.
+Both normalization types provide forward and backward paths. Q/K/V
 projections, their reusable streams, scaled
 attention, Softmax, residual normalization, and the attention training cache are
 owned by one shared Attention module. Inference executors do not retain
@@ -195,7 +197,8 @@ src/
         ├── attention.rs      reusable Q/K/V, streams, attention, and norm
         ├── decoder.rs        decoder assembly
         ├── encoder.rs        single-head encoder executors
-        └── inference.rs      shared encoder/decoder inference block
+        ├── inference.rs      shared encoder/decoder inference block
+        └── position.rs       owned positional-encoding closure type
 ```
 
 See the [CUDA Runtime API](docs/api.md) for the complete container, span,

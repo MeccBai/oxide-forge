@@ -1,13 +1,13 @@
 use crate::cuda::container::Matrix;
 use crate::cuda::runtime::CudaRuntime;
 use crate::net::linear::{Linear, LinearMetadata};
-use crate::net::metadata::{HostData, MatrixMetadata, MetadataCursor};
+use crate::net::metadata::{HostData, MetadataCursor};
 use crate::net::mlp::{InferenceMLP, MlpMetadata};
 use cuda_core::CudaStream;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use super::{NormType, attention::Attention};
+use super::{NormType, PositionEncoding, attention::Attention};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransformerMetadata {
@@ -15,7 +15,6 @@ pub struct TransformerMetadata {
     pub attention_residual: bool,
     pub feed_forward_residual: bool,
     pub normalization: NormType,
-    pub position: MatrixMetadata,
     pub query: LinearMetadata,
     pub key: LinearMetadata,
     pub value: LinearMetadata,
@@ -25,7 +24,7 @@ pub struct TransformerMetadata {
 
 pub(super) struct InferenceBlock {
     attention: Attention,
-    position_matrix: Matrix,
+    position_encoding: PositionEncoding,
     fcs: InferenceMLP,
     output_matrix: Linear,
 }
@@ -35,7 +34,7 @@ impl InferenceBlock {
         query: Linear,
         key: Linear,
         value: Linear,
-        position_matrix: Matrix,
+        position_encoding: PositionEncoding,
         fcs: InferenceMLP,
         output_matrix: Linear,
         qkv_streams: Option<Vec<Arc<CudaStream>>>,
@@ -43,7 +42,7 @@ impl InferenceBlock {
     ) -> Self {
         Self {
             attention: Attention::new(query, key, value, qkv_streams, norm_type),
-            position_matrix,
+            position_encoding,
             fcs,
             output_matrix,
         }
@@ -59,7 +58,6 @@ impl InferenceBlock {
             query: qkv.query,
             key: qkv.key,
             value: qkv.value,
-            position: cursor.matrix(self.position_matrix.rows(), self.position_matrix.cols()),
             feed_forward: self.fcs.get_meta_data(cursor),
             output: self.output_matrix.get_meta_data(cursor),
         }
@@ -67,20 +65,19 @@ impl InferenceBlock {
 
     pub(super) fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
         let mut data = self.attention.get_data(runtime);
-        data.push(HostData::new(self.position_matrix.to_host(runtime)));
         data.extend(self.fcs.get_data(runtime));
         data.extend(self.output_matrix.get_data(runtime));
         data
     }
 
     pub(super) fn forward(&mut self, input: &Matrix, runtime: &mut CudaRuntime) -> Matrix {
-        let positioned = runtime.matrix_add(input, &self.position_matrix);
+        let positioned = self.position(input, runtime);
         let x = self.attention.forward(&positioned, &positioned, runtime);
         self.finish_forward(positioned, x, runtime)
     }
 
     pub(super) fn forward_mask(&mut self, input: &Matrix, runtime: &mut CudaRuntime) -> Matrix {
-        let positioned = runtime.matrix_add(input, &self.position_matrix);
+        let positioned = self.position(input, runtime);
         let x = self
             .attention
             .forward_mask(&positioned, &positioned, runtime);
@@ -105,5 +102,12 @@ impl InferenceBlock {
         let result = self.output_matrix.forward(&output, None, runtime, None);
         runtime.recycle_matrix(output);
         result
+    }
+
+    fn position(&self, input: &Matrix, runtime: &mut CudaRuntime) -> Matrix {
+        let positioned = (self.position_encoding)(input, runtime);
+        assert_eq!(positioned.rows(), input.rows());
+        assert_eq!(positioned.cols(), input.cols());
+        positioned
     }
 }

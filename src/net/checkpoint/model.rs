@@ -147,23 +147,27 @@ pub fn dump_transformer<P: AsRef<Path>>(
     )
 }
 
-pub fn load_transformer<P: AsRef<Path>>(
+pub fn load_transformer<P, F>(
     path: P,
+    position_encoding: F,
     runtime: &CudaRuntime,
-) -> CheckpointResult<InferenceTransformer> {
+) -> CheckpointResult<InferenceTransformer>
+where
+    P: AsRef<Path>,
+    F: Fn(&Matrix, &mut CudaRuntime) -> Matrix + 'static,
+{
     let (metadata, mut reader) = open_transformer(path.as_ref())?;
     let transformer = &metadata.transformer;
     let q_matrix = load_linear_parameter(&transformer.query, &mut reader, runtime)?;
     let k_matrix = load_linear_parameter(&transformer.key, &mut reader, runtime)?;
     let v_matrix = load_linear_parameter(&transformer.value, &mut reader, runtime)?;
-    let position_matrix = load_matrix(&transformer.position, &mut reader, runtime)?;
     let (layers, residual) = load_mlp_parameters(&transformer.feed_forward, &mut reader, runtime)?;
     let output_matrix = load_linear_parameter(&transformer.output, &mut reader, runtime)?;
     Ok(InferenceTransformer::new(
         q_matrix,
         k_matrix,
         v_matrix,
-        position_matrix,
+        position_encoding,
         InferenceMLP::with_loss(layers, residual, transformer.feed_forward.loss),
         output_matrix,
         None,
@@ -183,23 +187,27 @@ pub fn dump_training_transformer<P: AsRef<Path>>(
     )
 }
 
-pub fn load_training_transformer<P: AsRef<Path>>(
+pub fn load_training_transformer<P, F>(
     path: P,
+    position_encoding: F,
     runtime: &CudaRuntime,
-) -> CheckpointResult<TrainingTransformer> {
+) -> CheckpointResult<TrainingTransformer>
+where
+    P: AsRef<Path>,
+    F: Fn(&Matrix, &mut CudaRuntime) -> Matrix + 'static,
+{
     let (metadata, mut reader) = open_transformer(path.as_ref())?;
     let transformer = &metadata.transformer;
     let q_matrix = load_linear_parameter(&transformer.query, &mut reader, runtime)?;
     let k_matrix = load_linear_parameter(&transformer.key, &mut reader, runtime)?;
     let v_matrix = load_linear_parameter(&transformer.value, &mut reader, runtime)?;
-    let position_matrix = load_matrix(&transformer.position, &mut reader, runtime)?;
     let (layers, residual) = load_mlp_parameters(&transformer.feed_forward, &mut reader, runtime)?;
     let output_matrix = load_linear_parameter(&transformer.output, &mut reader, runtime)?;
     Ok(TrainingTransformer::new(
         q_matrix,
         k_matrix,
         v_matrix,
-        position_matrix,
+        position_encoding,
         TrainingMlp::with_loss(layers, residual, transformer.feed_forward.loss),
         output_matrix,
         transformer.normalization,
@@ -454,18 +462,11 @@ fn validate_transformer(
     validate_linear(&metadata.query, ranges)?;
     validate_linear(&metadata.key, ranges)?;
     validate_linear(&metadata.value, ranges)?;
-    ranges.matrix(&metadata.position)?;
     validate_mlp(&metadata.feed_forward, ranges)?;
     validate_linear(&metadata.output, ranges)?;
 
-    let embedding = metadata.position.cols;
-    if metadata.position.rows == 0 || embedding == 0 {
-        return Err(invalid_data("position matrix dimensions must be non-zero").into());
-    }
-    if metadata.query.input_neurons != embedding
-        || metadata.key.input_neurons != embedding
-        || metadata.value.input_neurons != embedding
-    {
+    let embedding = metadata.query.input_neurons;
+    if metadata.key.input_neurons != embedding || metadata.value.input_neurons != embedding {
         return Err(invalid_data("Q/K/V input dimensions must match the embedding size").into());
     }
     if metadata.query.output_neurons != metadata.key.output_neurons {

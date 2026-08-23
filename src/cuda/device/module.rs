@@ -260,4 +260,11 @@ pub(in crate::cuda) mod kernels {
     ) {
         row::rms_norm_backward_device(input, output_gradient, result, cols, epsilon);
     }
+
+    #[kernel]
+    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32 / 2)]
+    #[launch_contract(domain = 1)]
+    pub fn matrix_rope_encoding(mat: span::DeviceSliceMutDescriptor<f32>, cols: usize) {
+        row::rope_encoding_device(mat, cols);
+    }
 }

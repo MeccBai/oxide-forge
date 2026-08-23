@@ -400,7 +400,7 @@ activation.
 
 ```text
 input                 [sequence, hidden]
-+ position            [sequence, hidden]
+position_encoding     [sequence, hidden]
 Q/K/V                 [sequence, hidden]
 QKᵀ                   [sequence, sequence]
 softmax(QKᵀ/√hidden)  [sequence, sequence]
@@ -413,14 +413,19 @@ output projection     [sequence, output]
 `InferenceTransformer` selects `NormType::Layer` or `NormType::Rms` at
 construction. It also accepts an optional set of three reusable Q/K/V streams;
 the supplied vector must contain exactly three streams. Passing `None` creates
-them lazily on the first forward call:
+them lazily on the first forward call. Positional encoding is supplied as an
+owned closure that maps an input Matrix to a newly allocated Matrix:
 
 ```rust
+let position_encoding = move |input: &Matrix, runtime: &mut CudaRuntime| {
+    runtime.matrix_add(input, &position)
+};
+
 let transformer = InferenceTransformer::new(
     query,
     key,
     value,
-    position,
+    position_encoding,
     feed_forward,
     output,
     None,
@@ -450,11 +455,13 @@ output projection
 → row Softmax
 → scaled QKᵀ
 → Q/K/V projections
-→ input + position
+→ position encoding
 ```
 
 `TrainingTransformer::backward` returns the input gradient and updates Linear
-parameters and the positional Matrix with the supplied learning rate.
+parameters with the supplied learning rate. The positional closure is external
+to the trainable Transformer parameters; training assumes its derivative with
+respect to the input is the identity, as with additive positional encoding.
 
 ## Model Checkpoints
 
@@ -479,16 +486,22 @@ checkpoint::dump_mlp(&mlp, "mlp.toml", &runtime)?;
 let mlp = checkpoint::load_mlp("mlp.toml", &runtime)?;
 
 checkpoint::dump_transformer(&model, "model.toml", &runtime)?;
-let model = checkpoint::load_transformer("model.toml", &runtime)?;
+let model = checkpoint::load_transformer(
+    "model.toml",
+    position_encoding,
+    &runtime,
+)?;
 ```
 
 All file operations live in `net::checkpoint`; `Linear`, MLP, and Transformer do
 not expose file methods. The module also provides explicit inference/training MLP
 and training Transformer variants. Inference and training forms share the same
 persistent parameter representation. Forward caches and Q/K/V streams are runtime
-state and are not saved. A loaded inference Transformer recreates streams lazily,
-while a loaded training wrapper starts with an empty cache. Training checkpoints
-retain their selected LayerNorm or RMSNorm type when loaded.
+state and are not saved. Positional closures are code and are likewise not
+serialized, so callers provide one when loading a Transformer. A loaded inference
+Transformer recreates streams lazily, while a loaded training wrapper starts with
+an empty cache. Training checkpoints retain their selected LayerNorm or RMSNorm
+type when loaded.
 
 The complete association-layer entry points are `dump_linear/load_linear`,
 `dump_mlp/load_mlp`, `dump_inference_mlp/load_inference_mlp`,

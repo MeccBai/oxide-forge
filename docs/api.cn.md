@@ -365,7 +365,7 @@ affine GEMM。每层先
 
 ```text
 input                 [sequence,hidden]
-+ position            [sequence,hidden]
+position_encoding     [sequence,hidden]
 Q/K/V                 [sequence,hidden]
 QKᵀ                   [sequence,sequence]
 softmax(QKᵀ/√hidden)  [sequence,sequence]
@@ -377,14 +377,19 @@ output projection     [sequence,output]
 
 `InferenceTransformer` 在构造时选择 `NormType::Layer` 或 `NormType::Rms`，同时可以传入
 三条可复用的 Q/K/V stream；传入的 Vec 必须正好包含三条 stream。传入 `None` 时会在
-第一次 forward 中延迟创建：
+第一次 forward 中延迟创建。位置编码作为一个由 Transformer 持有的闭包传入，负责把
+输入 Matrix 转换成新 Matrix：
 
 ```rust
+let position_encoding = move |input: &Matrix, runtime: &mut CudaRuntime| {
+    runtime.matrix_add(input, &position)
+};
+
 let transformer = InferenceTransformer::new(
     query,
     key,
     value,
-    position,
+    position_encoding,
     feed_forward,
     output,
     None,
@@ -411,11 +416,12 @@ output projection
 → row Softmax
 → scaled QKᵀ
 → Q/K/V projection
-→ input + position
+→ position encoding
 ```
 
 `TrainingTransformer::backward` 返回输入梯度，并使用传入 learning rate 更新 Linear
-参数和 position matrix。
+参数。位置编码闭包不属于 Transformer 的可训练参数；训练路径假定它对输入的导数为
+恒等映射，对应加法式位置编码。
 
 ## 模型存档
 
@@ -439,14 +445,19 @@ checkpoint::dump_mlp(&mlp, "mlp.toml", &runtime)?;
 let mlp = checkpoint::load_mlp("mlp.toml", &runtime)?;
 
 checkpoint::dump_transformer(&model, "model.toml", &runtime)?;
-let model = checkpoint::load_transformer("model.toml", &runtime)?;
+let model = checkpoint::load_transformer(
+    "model.toml",
+    position_encoding,
+    &runtime,
+)?;
 ```
 
 所有文件操作都只存在于 `net::checkpoint`；`Linear`、MLP 和 Transformer 不提供
 文件方法。该模块另外提供明确的 inference/training MLP 以及 training Transformer
 变体。推理版和训练版使用相同的持久参数表示。forward cache 与 Q/K/V stream
-属于运行时状态，不会保存。推理模型加载后延迟重建 stream，训练模型的 cache 从空状态
-开始；加载训练 checkpoint 时会保留其选择的 LayerNorm 或 RMSNorm 类型。
+属于运行时状态，不会保存。位置编码闭包属于代码，同样不会被序列化，因此加载
+Transformer 时由调用方重新提供。推理模型加载后延迟重建 stream，训练模型的 cache
+从空状态开始；加载训练 checkpoint 时会保留其选择的 LayerNorm 或 RMSNorm 类型。
 
 模型关联层的完整入口为 `dump_linear/load_linear`、`dump_mlp/load_mlp`、
 `dump_inference_mlp/load_inference_mlp`、`dump_training_mlp/load_training_mlp`、
