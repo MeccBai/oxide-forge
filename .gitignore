@@ -1,4 +1,5 @@
 /target/
+/.oxide-artifacts/
 **/*.bc
 .DS_Store
 **/*.cubin
@@ -11,6 +12,6 @@
 **/*.target
 .idea
 /log/
-dataset/
-model/
 /oxide-forge/docs/impl
+**/__pycache__/
+*.py[cod]

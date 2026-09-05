@@ -35,6 +35,25 @@ impl Matrix {
         self.for_each(runtime, move |x| x + value);
     }
 
+    pub fn threshold(&mut self, threshold: f32, runtime: &CudaRuntime) {
+        assert!(threshold.is_finite() && (0.0..1.0).contains(&threshold));
+        self.for_each(
+            runtime,
+            move |value| {
+                if value >= threshold { 1.0 } else { 0.0 }
+            },
+        );
+    }
+
+    /// Applies the numerically stable logistic sigmoid in place.
+    pub fn sigmoid(&mut self, runtime: &CudaRuntime) {
+        self.sigmoid_on(runtime, runtime.stream());
+    }
+
+    pub(crate) fn sigmoid_on(&mut self, runtime: &CudaRuntime, stream: &CudaStream) {
+        self.for_each_on(runtime, stream, crate::cuda::sigmoid_f32);
+    }
+
     pub fn binary_assign(&mut self, rhs: &Matrix, op: BinaryOp, runtime: &CudaRuntime) {
         self.binary_assign_on(rhs, op, runtime, runtime.stream());
     }

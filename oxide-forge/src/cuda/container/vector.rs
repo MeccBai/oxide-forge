@@ -50,6 +50,11 @@ impl Vector {
         span.for_each(runtime, move |x| (x - offset).exp());
     }
 
+    /// Applies the numerically stable logistic sigmoid in place.
+    pub fn sigmoid(&mut self, runtime: &CudaRuntime) {
+        self.for_each(runtime, crate::cuda::sigmoid_f32);
+    }
+
     pub fn softmax(&mut self, runtime: &mut CudaRuntime) {
         let max = self.max(runtime);
         self.exp_shifted(max, runtime);

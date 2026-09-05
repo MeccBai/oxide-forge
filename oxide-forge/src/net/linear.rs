@@ -16,6 +16,7 @@ pub enum Activation {
     Gelu,
     Relu,
     Silu,
+    Sigmoid,
 }
 
 impl Activation {
@@ -39,6 +40,7 @@ impl Activation {
                 }
             }
             Self::Silu => x / (1.0 + (-x).exp()),
+            Self::Sigmoid => crate::cuda::sigmoid_f32(x),
         }
     }
 
@@ -65,6 +67,10 @@ impl Activation {
                 let exp_neg_x = (-x).exp();
                 1.0 / (1.0 + exp_neg_x) + x * exp_neg_x / ((1.0 + exp_neg_x) * (1.0 + exp_neg_x))
             }
+            Self::Sigmoid => {
+                let sigmoid = crate::cuda::sigmoid_f32(x);
+                sigmoid * (1.0 - sigmoid)
+            }
         }
     }
 }
@@ -73,6 +79,109 @@ pub struct Linear {
     weights: Matrix,
     bias: Option<Vector>,
     activation: Activation,
+}
+
+/// Training state deliberately kept outside `Linear`: parameter gradients are
+/// accumulated over a mini-batch and the velocity survives optimizer steps.
+#[derive(Default)]
+pub(crate) struct LinearMomentum {
+    weight_gradient: Option<Matrix>,
+    bias_gradient: Option<Vector>,
+    weight_velocity: Option<Matrix>,
+    bias_velocity: Option<Vector>,
+}
+
+impl LinearMomentum {
+    pub(crate) fn accumulate(
+        &mut self,
+        input: &Matrix,
+        gradient: &Matrix,
+        bias_gradient: Option<&Vector>,
+        runtime: &mut CudaRuntime,
+    ) {
+        let input_transpose = runtime.matrix_transpose(input);
+        let weight_gradient = runtime.matrix_multiply(&input_transpose, gradient);
+        runtime.recycle_matrix(input_transpose);
+
+        if let Some(total) = &mut self.weight_gradient {
+            total.binary_assign(&weight_gradient, Add, runtime);
+            runtime.recycle_matrix(weight_gradient);
+        } else {
+            self.weight_gradient = Some(weight_gradient);
+        }
+
+        match bias_gradient {
+            Some(bias_gradient) => {
+                if let Some(total) = &mut self.bias_gradient {
+                    total.binary_assign(bias_gradient, Add, runtime);
+                } else {
+                    self.bias_gradient = Some(runtime.clone_vector(bias_gradient));
+                }
+            }
+            None => assert!(
+                self.bias_gradient.is_none(),
+                "missing bias gradient while a batch is being accumulated"
+            ),
+        }
+    }
+
+    pub(crate) fn step(
+        &mut self,
+        linear: &mut Linear,
+        learning_rate: f32,
+        momentum: f32,
+        batch_len: usize,
+        runtime: &mut CudaRuntime,
+    ) {
+        assert!(batch_len > 0, "optimizer batch must not be empty");
+        assert!(
+            learning_rate.is_finite() && learning_rate > 0.0,
+            "learning rate must be finite and greater than zero"
+        );
+        assert!(
+            momentum.is_finite() && (0.0..1.0).contains(&momentum),
+            "momentum must be finite and in [0, 1)"
+        );
+
+        let inverse_batch = 1.0 / batch_len as f32;
+        let mut weight_gradient = self
+            .weight_gradient
+            .take()
+            .expect("optimizer step requires accumulated gradients");
+        weight_gradient.scale(inverse_batch, runtime);
+        if let Some(velocity) = &mut self.weight_velocity {
+            velocity.scale(momentum, runtime);
+            velocity.binary_assign(&weight_gradient, Add, runtime);
+            runtime.recycle_matrix(weight_gradient);
+        } else {
+            self.weight_velocity = Some(weight_gradient);
+        }
+
+        let mut weight_update = runtime.clone_matrix(self.weight_velocity.as_ref().unwrap());
+        weight_update.scale(learning_rate, runtime);
+        linear.weights.binary_assign(&weight_update, Sub, runtime);
+        runtime.recycle_matrix(weight_update);
+
+        match (&mut linear.bias, self.bias_gradient.take()) {
+            (Some(bias), Some(mut bias_gradient)) => {
+                bias_gradient.scale(inverse_batch, runtime);
+                if let Some(velocity) = &mut self.bias_velocity {
+                    velocity.scale(momentum, runtime);
+                    velocity.binary_assign(&bias_gradient, Add, runtime);
+                    runtime.recycle_vector(bias_gradient);
+                } else {
+                    self.bias_velocity = Some(bias_gradient);
+                }
+
+                let mut bias_update = runtime.clone_vector(self.bias_velocity.as_ref().unwrap());
+                bias_update.scale(learning_rate, runtime);
+                bias.binary_assign(&bias_update, Sub, runtime);
+                runtime.recycle_vector(bias_update);
+            }
+            (None, None) => {}
+            _ => panic!("bias and accumulated bias gradient do not match"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -529,5 +638,18 @@ impl Linear {
         };
 
         (gradient, bias_gradient)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Activation;
+
+    #[test]
+    fn sigmoid_is_stable_and_has_the_expected_derivative() {
+        assert_eq!(Activation::Sigmoid.forward(f32::INFINITY), 1.0);
+        assert_eq!(Activation::Sigmoid.forward(f32::NEG_INFINITY), 0.0);
+        assert!((Activation::Sigmoid.forward(0.0) - 0.5).abs() < 1.0e-7);
+        assert!((Activation::Sigmoid.derivative(0.0) - 0.25).abs() < 1.0e-7);
     }
 }

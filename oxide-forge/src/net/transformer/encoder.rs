@@ -1,5 +1,5 @@
 use crate::cuda::{BinaryOp::Add, container::Matrix, runtime::CudaRuntime};
-use crate::net::linear::Linear;
+use crate::net::linear::{Linear, LinearMomentum};
 use crate::net::metadata::{HostData, MetadataCursor};
 use crate::net::mlp::{InferenceMLP, TrainingMlp};
 use cuda_core::CudaStream;
@@ -59,6 +59,7 @@ pub struct TrainingTransformer {
     position_encoding: PositionEncoding,
     fcs: TrainingMlp,
     output_matrix: Linear,
+    output_optimizer: LinearMomentum,
     cache: Option<TransformerCache>,
 }
 
@@ -85,6 +86,7 @@ impl TrainingTransformer {
             position_encoding: Box::new(position_encoding),
             fcs,
             output_matrix,
+            output_optimizer: LinearMomentum::default(),
             cache: None,
         }
     }
@@ -138,6 +140,18 @@ impl TrainingTransformer {
         learning_rate: f32,
         runtime: &mut CudaRuntime,
     ) -> Matrix {
+        let input_gradient = self.backward_accumulate(output_gradient, runtime);
+        self.step(learning_rate, 0.0, 1, runtime);
+        input_gradient
+    }
+
+    /// Backpropagates one sample while retaining parameter gradients for a
+    /// later mini-batch optimizer step.
+    pub fn backward_accumulate(
+        &mut self,
+        output_gradient: &Matrix,
+        runtime: &mut CudaRuntime,
+    ) -> Matrix {
         let cache = self
             .cache
             .as_ref()
@@ -157,13 +171,11 @@ impl TrainingTransformer {
         let encoded_gradient = self
             .output_matrix
             .input_gradient(&output_gradient, runtime, None);
-        self.output_matrix.learn(
+        self.output_optimizer.accumulate(
             &cache.encoded,
             &output_gradient,
             output_bias_gradient.as_ref(),
-            learning_rate,
             runtime,
-            None,
         );
 
         let second_gradient = self.attention.normalization_backward(
@@ -171,14 +183,34 @@ impl TrainingTransformer {
             &encoded_gradient,
             runtime,
         );
-        let ffn_input_gradient = self.fcs.backward(&second_gradient, learning_rate, runtime);
+        let ffn_input_gradient = self.fcs.backward_accumulate(&second_gradient, runtime);
         let mut first_output_gradient = second_gradient;
         first_output_gradient.binary_assign(&ffn_input_gradient, Add, runtime);
 
-        let positioned_gradient =
-            self.attention
-                .backward_self(&first_output_gradient, learning_rate, runtime);
+        let positioned_gradient = self
+            .attention
+            .backward_self_accumulate(&first_output_gradient, runtime);
 
         positioned_gradient
+    }
+
+    /// Applies every accumulated transformer gradient in one Momentum SGD step.
+    pub fn step(
+        &mut self,
+        learning_rate: f32,
+        momentum: f32,
+        batch_len: usize,
+        runtime: &mut CudaRuntime,
+    ) {
+        self.output_optimizer.step(
+            &mut self.output_matrix,
+            learning_rate,
+            momentum,
+            batch_len,
+            runtime,
+        );
+        self.fcs.step(learning_rate, momentum, batch_len, runtime);
+        self.attention
+            .step(learning_rate, momentum, batch_len, runtime);
     }
 }

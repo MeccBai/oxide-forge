@@ -26,7 +26,7 @@ OxideForge 目前处于实验性开发阶段，API 会继续调整。核心前�
 - 元素级四则运算、映射、缩放、归约和广播；
 - tiled matrix multiplication 和 shared-memory transpose；
 - row Softmax、LayerNorm 和 RMSNorm，三者均提供 backward kernel；
-- Linear、GELU、MLP、残差连接和对应反向传播；
+- Linear、可复用的 GELU/ReLU/SiLU/Sigmoid、MLP、BCE-with-logits、残差连接和对应反向传播；
 - 单头 Post-Norm Transformer 执行器，推理和训练均可选 LayerNorm/RMSNorm；
 - MLP 与 Transformer 参数的 checkpoint 保存和加载；
 - 主 stream 异步提交，以及额外 stream 的 fork/join。

@@ -1,6 +1,6 @@
 [workspace]
-members = ["oxide-forge", "examples/ocr"]
-default-members = ["examples/ocr"]
+members = ["oxide-forge", "bench"]
+default-members = ["bench"]
 resolver = "3"
 
 [workspace.package]
@@ -8,10 +8,11 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+oxide-forge = { path = "oxide-forge" }
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git" }
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git" }
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git" }
 rand = "0.10.2"
-toml = "1.1.4"
+toml = "1.1.5"
 serde = { version = "1.0.229", features = ["derive"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }

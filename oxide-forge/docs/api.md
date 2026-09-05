@@ -176,6 +176,8 @@ synchronization.
 ```rust
 matrix.scale(value, &runtime);
 matrix.add_scalar(value, &runtime);
+matrix.sigmoid(&runtime);
+matrix.threshold(0.8, &runtime);
 matrix.for_each(&runtime, move |x| x * 2.0);
 matrix.softmax_rows(&runtime);
 matrix.layer_norm(&runtime);
@@ -185,7 +187,7 @@ matrix.binary_assign_by_rows(&bias, BinaryOp::Add, &runtime);
 
 | API | Synchronization behavior |
 | --- | --- |
-| `scale`, `add_scalar`, `for_each` | Asynchronous submission |
+| `scale`, `add_scalar`, `sigmoid`, `threshold`, `for_each` | Asynchronous submission |
 | `softmax_rows` | One block per row in one asynchronous launch |
 | `layer_norm` | One block per row in one asynchronous launch |
 | `rms_norm` | One block per row in one asynchronous launch |
@@ -238,6 +240,7 @@ not allocate continue to take `&CudaRuntime`.
 ```rust
 vector.add_scalar(value, &runtime);
 vector.scale(value, &runtime);
+vector.sigmoid(&runtime);
 vector.exp_shifted(offset, &runtime); // exp(x - offset)
 
 let sum = vector.sum(&mut runtime);
@@ -349,12 +352,27 @@ Linear owns only its weights, optional bias, and activation. It does not cache
 forward values or own a training tape, workspace, or gradient lifetime. The MLP
 layer owns scheduling because it sees the complete local data flow.
 
+Available activations are `Identity`, `Gelu`, `Relu`, `Silu`, and `Sigmoid`.
+Sigmoid uses separate positive/negative branches to avoid overflow.
+
 ### MlpExecutor, InferenceMLP, and TrainingMlp
 
 ```rust
 let mlp = InferenceMLP::new(vec![layer1, layer2], None);
 let output = mlp.forward(&input, &mut runtime);
 ```
+
+`Loss::MeanSquaredError` consumes ordinary model outputs.
+`Loss::BinaryCrossEntropyWithLogits` keeps the final output as logits for stable
+loss and gradient computation. Call `InferenceMLP::predict` (or
+`Loss::activate_output`) to apply Sigmoid and obtain probabilities. The shared
+`loss_rows` and `output_gradient` paths accept a positive-class weight for
+imbalanced binary classification and segmentation.
+
+`loss_and_output_gradient` optionally adds soft Dice loss through a non-negative
+Dice weight and returns both row losses and the combined logit gradient. A zero
+Dice weight is exactly the weighted-BCE path. Dice uses whole-matrix reductions,
+so it introduces synchronization and is intended for segmentation objectives.
 
 `MlpExecutor` owns the Linear layers and residual configuration and provides the
 shared forward/backward execution logic. `InferenceMLP` delegates forward only;
@@ -375,6 +393,19 @@ layer `i`. Each newly allocated Matrix moves directly into the next layer's
 input slot; moving it into a `Vec` transfers only the owning handle and does not
 copy device data. The last layer's output is returned by value instead of being
 cached, allowing the parent model to decide whether to retain it.
+
+For mini-batch training, `backward_accumulate` computes `dX` immediately but
+only adds parameter gradients to optimizer state owned by `TrainingMlp`.
+`step(learning_rate, momentum, batch_len, runtime)` averages those gradients,
+updates a persistent classical-momentum velocity, applies the parameters, and
+clears the accumulators. `Linear` remains optimizer- and tape-free. The older
+`backward(..., learning_rate, ...)` entry is the one-sample, zero-momentum
+convenience path.
+
+`TrainingTransformer` exposes the same `backward_accumulate`/`step` split and
+applies a single batch boundary to its output projection, feed-forward MLP, and
+Q/K/V projections. Optimizer velocity is runtime state and is not serialized in
+the parameter checkpoint.
 
 Training forward consumes its input Matrix and moves it into the tape without
 an implicit device copy. A caller that still needs the input must explicitly

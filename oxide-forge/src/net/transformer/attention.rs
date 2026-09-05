@@ -1,5 +1,5 @@
 use crate::cuda::{BinaryOp::Add, container::Matrix, runtime::CudaRuntime};
-use crate::net::linear::{Linear, LinearMetadata};
+use crate::net::linear::{Linear, LinearMetadata, LinearMomentum};
 use crate::net::metadata::{HostData, MetadataCursor};
 use cuda_core::CudaStream;
 use std::sync::Arc;
@@ -16,6 +16,7 @@ pub(super) struct QkvProjection {
     query: Linear,
     key: Linear,
     value: Linear,
+    optimizers: [LinearMomentum; 3],
     streams: Option<[Arc<CudaStream>; 3]>,
 }
 
@@ -41,6 +42,7 @@ impl QkvProjection {
             query,
             key,
             value,
+            optimizers: std::array::from_fn(|_| LinearMomentum::default()),
             streams,
         }
     }
@@ -101,21 +103,21 @@ impl QkvProjection {
         runtime.join_streams(&self.streams.as_ref().unwrap()[2..]);
     }
 
-    pub(super) fn backward_self(
+    pub(super) fn backward_self_accumulate(
         &mut self,
         input: &Matrix,
         query_gradient: &Matrix,
         key_gradient: &Matrix,
         value_gradient: &Matrix,
-        learning_rate: f32,
         runtime: &mut CudaRuntime,
     ) -> Matrix {
         let mut input_gradient: Option<Matrix> = None;
+        let [query_optimizer, key_optimizer, value_optimizer] = &mut self.optimizers;
 
-        for (linear, projected_gradient) in [
-            (&mut self.query, query_gradient),
-            (&mut self.key, key_gradient),
-            (&mut self.value, value_gradient),
+        for (linear, optimizer, projected_gradient) in [
+            (&mut self.query, query_optimizer, query_gradient),
+            (&mut self.key, key_optimizer, key_gradient),
+            (&mut self.value, value_optimizer, value_gradient),
         ] {
             let pre_activation = linear
                 .needs_pre_activation()
@@ -130,17 +132,27 @@ impl QkvProjection {
                 input_gradient = Some(current_input_gradient);
             }
 
-            linear.learn(
-                input,
-                &gradient,
-                bias_gradient.as_ref(),
-                learning_rate,
-                runtime,
-                None,
-            );
+            optimizer.accumulate(input, &gradient, bias_gradient.as_ref(), runtime);
         }
 
         input_gradient.unwrap()
+    }
+
+    pub(super) fn step(
+        &mut self,
+        learning_rate: f32,
+        momentum: f32,
+        batch_len: usize,
+        runtime: &mut CudaRuntime,
+    ) {
+        let [query_optimizer, key_optimizer, value_optimizer] = &mut self.optimizers;
+        for (linear, optimizer) in [
+            (&mut self.query, query_optimizer),
+            (&mut self.key, key_optimizer),
+            (&mut self.value, value_optimizer),
+        ] {
+            optimizer.step(linear, learning_rate, momentum, batch_len, runtime);
+        }
     }
 }
 
@@ -280,10 +292,9 @@ impl Attention {
         output
     }
 
-    pub(super) fn backward_self(
+    pub(super) fn backward_self_accumulate(
         &mut self,
         output_gradient: &Matrix,
-        learning_rate: f32,
         runtime: &mut CudaRuntime,
     ) -> Matrix {
         let cache = self
@@ -307,17 +318,26 @@ impl Attention {
         let score_gradient_t = runtime.matrix_transpose(&score_gradient);
         let key_gradient = runtime.matrix_multiply(&score_gradient_t, &cache.query);
 
-        let projection_gradient = self.qkv.backward_self(
+        let projection_gradient = self.qkv.backward_self_accumulate(
             &cache.input,
             &query_gradient,
             &key_gradient,
             &value_gradient,
-            learning_rate,
             runtime,
         );
         let mut input_gradient = residual_gradient;
         input_gradient.binary_assign(&projection_gradient, Add, runtime);
         input_gradient
+    }
+
+    pub(super) fn step(
+        &mut self,
+        learning_rate: f32,
+        momentum: f32,
+        batch_len: usize,
+        runtime: &mut CudaRuntime,
+    ) {
+        self.qkv.step(learning_rate, momentum, batch_len, runtime);
     }
 
     pub(super) fn normalize(&self, matrix: &mut Matrix, runtime: &mut CudaRuntime) {

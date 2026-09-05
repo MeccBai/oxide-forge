@@ -29,7 +29,8 @@ Implemented capabilities include:
 - element-wise arithmetic, mapping, scaling, reduction, and row broadcasting;
 - tiled matrix multiplication and shared-memory matrix transpose;
 - row-wise Softmax, LayerNorm, and RMSNorm, all with backward kernels;
-- Linear, GELU, MLP, residual connections, and their backward paths;
+- Linear, reusable GELU/ReLU/SiLU/Sigmoid activations, MLP, BCE-with-logits,
+  residual connections, and their backward paths;
 - single-head Post-Norm Transformer executors with selectable LayerNorm/RMSNorm
   inference and training;
 - parameter checkpoint save/load for MLP and Transformer executors;

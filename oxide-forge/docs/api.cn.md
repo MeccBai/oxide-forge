@@ -162,6 +162,8 @@ API 不需要暴露 stream 选择。
 ```rust
 matrix.scale(value, &runtime);
 matrix.add_scalar(value, &runtime);
+matrix.sigmoid(&runtime);
+matrix.threshold(0.8, &runtime);
 matrix.for_each(&runtime, move |x| x * 2.0);
 matrix.softmax_rows(&runtime);
 matrix.layer_norm(&runtime);
@@ -171,7 +173,7 @@ matrix.binary_assign_by_rows(&bias, BinaryOp::Add, &runtime);
 
 | API | 同步行为 |
 | --- | --- |
-| `scale/add_scalar/for_each` | 异步提交 |
+| `scale/add_scalar/sigmoid/threshold/for_each` | 异步提交 |
 | `softmax_rows` | 单次异步 launch，每行一个 block |
 | `layer_norm` | 单次异步 launch，每行一个 block |
 | `rms_norm` | 单次异步 launch，每行一个 block |
@@ -221,6 +223,7 @@ vector.to_host(&runtime);
 ```rust
 vector.add_scalar(value, &runtime);
 vector.scale(value, &runtime);
+vector.sigmoid(&runtime);
 vector.exp_shifted(offset, &runtime); // exp(x - offset)
 
 let sum = vector.sum(&mut runtime);
@@ -323,12 +326,24 @@ matmul → optional bias → optional residual → activation
 Linear 只保存权重、bias 和 activation，不缓存 forward 中间数据，不负责训练 tape、
 workspace 或梯度生命周期；这些由拥有完整局部数据流的 MLP 层调度。
 
+当前 activation 包括 `Identity`、`Gelu`、`Relu`、`Silu` 和 `Sigmoid`。Sigmoid 对正负
+输入使用不同的数值分支，避免指数溢出。
+
 ### MlpExecutor、InferenceMLP 与 TrainingMlp
 
 ```rust
 let mlp = InferenceMLP::new(vec![layer1, layer2], None);
 let output = mlp.forward(&input, &mut runtime);
 ```
+
+`Loss::MeanSquaredError` 直接使用模型输出。`Loss::BinaryCrossEntropyWithLogits` 保持
+最后一层输出为 logits，以稳定地计算 loss 和梯度；推理时调用
+`InferenceMLP::predict`（或 `Loss::activate_output`）应用 Sigmoid 得到概率。共享的
+`loss_rows` 与 `output_gradient` 接受正类别权重，可复用于类别不平衡的二分类和分割。
+
+`loss_and_output_gradient` 可通过非负 Dice 权重加入 soft Dice loss，并同时返回逐行 loss
+和组合后的 logit 梯度。Dice 权重为零时就是原加权 BCE 路径。Dice 需要对整张 Matrix
+执行归约并产生同步，因此主要用于分割目标。
 
 `MlpExecutor` 统一保存 Linear 和 residual 配置，并提供 forward/backward 执行逻辑。
 `InferenceMLP` 只委托 forward；`TrainingMlp` 额外持有 forward activation tape 并委托
@@ -347,6 +362,16 @@ TrainingMlp 只保存 `layer_inputs[i]`，即第 `i` 层 backward 所需的输�
 训练 forward 消费输入 Matrix 并直接移入 tape，不执行隐式设备复制。如果上级还需要
 保留该输入，应由上级在调用前明确复制，或在 forward 后通过 `input()` 借用 tape
 中的第一个输入。
+
+mini-batch 训练使用 `backward_accumulate`：它立即计算 `dX`，但参数梯度只累积到
+`TrainingMlp` 持有的 optimizer 状态中。随后调用
+`step(learning_rate, momentum, batch_len, runtime)`，对梯度取 batch 平均、更新经典
+Momentum velocity、修改参数并清空累积量。`Linear` 仍然不持有 optimizer 或 tape。
+原有 `backward(..., learning_rate, ...)` 是单样本、零 momentum 的便捷路径。
+
+`TrainingTransformer` 提供相同的 `backward_accumulate`/`step` 分离接口，用同一个 batch
+边界更新 output projection、FFN 和 Q/K/V。optimizer velocity 属于运行期状态，不写入
+参数 checkpoint。
 
 ```rust
 let output: Matrix = training_mlp.forward(input, runtime);
