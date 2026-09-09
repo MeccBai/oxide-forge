@@ -66,39 +66,6 @@ pub(in crate::cuda) mod kernels {
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn slice_sum(
-        span: span::DeviceSliceDescriptor<f32>,
-        result: span::DeviceSliceMutDescriptor<f32>,
-    ) {
-        reduction::slice_sum_device(span, result);
-    }
-
-    #[kernel]
-    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
-    #[launch_contract(domain = 1)]
-    pub fn slice_map_sum<F>(
-        span: span::DeviceSliceDescriptor<f32>,
-        result: span::DeviceSliceMutDescriptor<f32>,
-        f: F,
-    ) where
-        F: Fn(f32) -> f32 + Copy,
-    {
-        reduction::slice_map_sum_device(span, result, f);
-    }
-
-    #[kernel]
-    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
-    #[launch_contract(domain = 1)]
-    pub fn slice_max(
-        span: span::DeviceSliceDescriptor<f32>,
-        result: span::DeviceSliceMutDescriptor<f32>,
-    ) {
-        reduction::slice_max_device(span, result);
-    }
-
-    #[kernel]
-    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
-    #[launch_contract(domain = 1)]
     pub fn matrix_sum_rows(
         matrix: span::DeviceSliceDescriptor<f32>,
         result: span::DeviceSliceMutDescriptor<f32>,
@@ -266,5 +233,31 @@ pub(in crate::cuda) mod kernels {
     #[launch_contract(domain = 1)]
     pub fn matrix_rope_encoding(mat: span::DeviceSliceMutDescriptor<f32>, cols: usize) {
         row::rope_encoding_device(mat, cols);
+    }
+
+    #[kernel]
+    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
+    #[launch_contract(domain = 1, dynamic_shared = 128)]
+    pub fn map_reduce<FM, FR>(
+        source: span::DeviceSliceDescriptor<f32>,
+        result: span::DeviceSliceMutDescriptor<f32>,
+        elements_per_thread: usize,
+        apply_map: bool,
+        map: FM,
+        reduce: FR,
+        default: f32,
+    ) where
+        FM: Fn(f32) -> f32 + Copy,
+        FR: Fn(f32, f32) -> f32 + Copy,
+    {
+        reduction::map_reduce_device(
+            source,
+            result,
+            elements_per_thread,
+            apply_map,
+            map,
+            reduce,
+            default,
+        );
     }
 }

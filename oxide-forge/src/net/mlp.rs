@@ -157,10 +157,7 @@ impl Loss {
 }
 
 fn matrix_sum(matrix: &Matrix, runtime: &mut CudaRuntime) -> f32 {
-    let rows = runtime.matrix_sum_rows(matrix);
-    let sum = rows.sum(runtime);
-    runtime.recycle_vector(rows);
-    sum
+    matrix.sum(runtime)
 }
 
 fn validate_binary_loss_inputs(output: &Matrix, target: &Matrix, positive_weight: f32) {

@@ -171,6 +171,31 @@ These operations submit work to the primary stream asynchronously. A later
 kernel on the same stream may consume the returned Matrix without an explicit
 synchronization.
 
+### Scalar reductions
+
+`Matrix`, `Vector`, and `VectorView` expose the same generic scalar reduction:
+
+```rust
+let squared_sum = matrix.map_reduce(
+    &mut runtime,
+    0.0,
+    move |value| value * value,
+    move |lhs, rhs| lhs + rhs,
+);
+```
+
+`map_reduce` accepts any input length. It maps each source element exactly once,
+reduces block-local values, and recursively reduces block results until one
+`f32` remains. `sum`, `max`, and `map_sum` are thin wrappers over this entry
+point. Both closures must use `move`, implement `Copy`, and be compilable as
+device code.
+
+The reduction closure must be associative and `identity` must be its identity
+value. Floating-point results can differ slightly from a sequential CPU fold
+because the parallel reduction order is different. Returning the final host
+scalar synchronizes the primary stream. Empty input returns `identity` without
+launching a kernel.
+
 ### In-place operations
 
 ```rust
@@ -245,6 +270,8 @@ vector.exp_shifted(offset, &runtime); // exp(x - offset)
 
 let sum = vector.sum(&mut runtime);
 let max = vector.max(&mut runtime);
+let squared_sum = vector.map_sum(&mut runtime, move |x| x * x);
+let custom = vector.map_reduce(&mut runtime, 0.0, move |x| x, move |a, b| a + b);
 vector.softmax(&mut runtime);
 
 let c = runtime.vector_add(&a, &b);
@@ -259,7 +286,7 @@ its temporary product is still allocated and recycled through `CudaRuntime`.
 `vector_binary` and its convenience wrappers submit asynchronously. `sum`,
 `max`, and `dot` still form synchronization boundaries because they return host
 `f32` values. For an empty input, `sum` returns `0.0` and `max` returns
-`f32::MIN`.
+`f32::NEG_INFINITY`.
 
 ### Contiguous spans
 
@@ -288,7 +315,9 @@ view.add_scalar(value, &runtime);
 view.scale(value, &runtime);
 view.for_each(&runtime, f);
 view.sum(&mut runtime);
+view.max(&mut runtime);
 view.map_sum(&mut runtime, f);
+view.map_reduce(&mut runtime, identity, map, reduce);
 view.softmax(&mut runtime);
 ```
 

@@ -37,11 +37,37 @@ impl Vector {
     }
 
     pub fn sum(&self, runtime: &mut CudaRuntime) -> f32 {
-        DeviceSpan::from_buffer(&self.buffer, 0, self.buffer.len()).sum(runtime)
+        self.map_reduce(runtime, 0.0, move |value| value, move |lhs, rhs| lhs + rhs)
     }
 
     pub fn max(&self, runtime: &mut CudaRuntime) -> f32 {
-        DeviceSpan::from_buffer(&self.buffer, 0, self.buffer.len()).max(runtime)
+        self.map_reduce(
+            runtime,
+            f32::NEG_INFINITY,
+            move |value| value,
+            move |lhs, rhs| lhs.max(rhs),
+        )
+    }
+
+    pub fn map_sum<F>(&self, runtime: &mut CudaRuntime, map: F) -> f32
+    where
+        F: Fn(f32) -> f32 + Copy,
+    {
+        self.map_reduce(runtime, 0.0, map, move |lhs, rhs| lhs + rhs)
+    }
+
+    pub fn map_reduce<FM, FR>(
+        &self,
+        runtime: &mut CudaRuntime,
+        identity: f32,
+        map: FM,
+        reduce: FR,
+    ) -> f32
+    where
+        FM: Fn(f32) -> f32 + Copy,
+        FR: Fn(f32, f32) -> f32 + Copy,
+    {
+        self.as_span().map_reduce(runtime, identity, map, reduce)
     }
 
     pub fn exp_shifted(&mut self, offset: f32, runtime: &CudaRuntime) {

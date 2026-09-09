@@ -28,14 +28,37 @@ impl<'a> VectorView<'a> {
     }
 
     pub fn sum(&self, runtime: &mut CudaRuntime) -> f32 {
-        self.span.sum(runtime)
+        self.map_reduce(runtime, 0.0, move |value| value, move |lhs, rhs| lhs + rhs)
     }
 
-    pub fn map_sum<F>(&self, runtime: &mut CudaRuntime, f: F) -> f32
+    pub fn max(&self, runtime: &mut CudaRuntime) -> f32 {
+        self.map_reduce(
+            runtime,
+            f32::NEG_INFINITY,
+            move |value| value,
+            move |lhs, rhs| lhs.max(rhs),
+        )
+    }
+
+    pub fn map_sum<F>(&self, runtime: &mut CudaRuntime, map: F) -> f32
     where
         F: Fn(f32) -> f32 + Copy,
     {
-        self.span.map_sum(runtime, f)
+        self.map_reduce(runtime, 0.0, map, move |lhs, rhs| lhs + rhs)
+    }
+
+    pub fn map_reduce<FM, FR>(
+        &self,
+        runtime: &mut CudaRuntime,
+        identity: f32,
+        map: FM,
+        reduce: FR,
+    ) -> f32
+    where
+        FM: Fn(f32) -> f32 + Copy,
+        FR: Fn(f32, f32) -> f32 + Copy,
+    {
+        self.span.map_reduce(runtime, identity, map, reduce)
     }
 
     pub fn softmax(&mut self, runtime: &mut CudaRuntime) {

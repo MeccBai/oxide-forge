@@ -157,6 +157,27 @@ API 不需要暴露 stream 选择。
 三者向主 stream 异步提交。后续同 stream kernel 可以立即使用返回 Matrix，无需手动
 插入同步。
 
+### 标量归约
+
+`Matrix`、`Vector` 和 `VectorView` 提供相同的通用标量归约入口：
+
+```rust
+let squared_sum = matrix.map_reduce(
+    &mut runtime,
+    0.0,
+    move |value| value * value,
+    move |lhs, rhs| lhs + rhs,
+);
+```
+
+`map_reduce` 支持任意长度输入。它只对每个源元素执行一次 map，先得到各 block 的局部
+结果，再递归归约局部结果，直到得到一个 `f32`。`sum`、`max` 和 `map_sum` 都只是该
+入口的薄封装。两个闭包都必须写成 `move`、满足 `Copy`，并且能够编译为设备代码。
+
+reduce 闭包必须满足结合律，`identity` 必须是它的单位元。浮点归约的并行计算顺序与
+CPU 顺序 fold 不同，因此末位可能略有差异。返回最终 host 标量时会同步主 stream。
+空输入不启动 kernel，直接返回 `identity`。
+
 ### 修改自身
 
 ```rust
@@ -228,6 +249,8 @@ vector.exp_shifted(offset, &runtime); // exp(x - offset)
 
 let sum = vector.sum(&mut runtime);
 let max = vector.max(&mut runtime);
+let squared_sum = vector.map_sum(&mut runtime, move |x| x * x);
+let custom = vector.map_reduce(&mut runtime, 0.0, move |x| x, move |a, b| a + b);
 vector.softmax(&mut runtime);
 
 let c = runtime.vector_add(&a, &b);
@@ -239,7 +262,7 @@ let dot = a.dot(&b, &mut runtime);
 源 Vector；其临时乘积仍由 `CudaRuntime` 分配和回收。
 
 `vector_binary` 及其四个便利封装异步提交。`sum/max/dot` 因为返回 host `f32`，
-仍然是同步边界。空输入的 `sum` 返回 `0.0`，`max` 返回 `f32::MIN`。
+仍然是同步边界。空输入的 `sum` 返回 `0.0`，`max` 返回 `f32::NEG_INFINITY`。
 
 ### 连续 Span
 
@@ -266,7 +289,9 @@ view.add_scalar(value, &runtime);
 view.scale(value, &runtime);
 view.for_each(&runtime, f);
 view.sum(&mut runtime);
+view.max(&mut runtime);
 view.map_sum(&mut runtime, f);
+view.map_reduce(&mut runtime, identity, map, reduce);
 view.softmax(&mut runtime);
 ```
 
