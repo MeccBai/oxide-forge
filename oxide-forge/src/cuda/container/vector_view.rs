@@ -61,6 +61,22 @@ impl<'a> VectorView<'a> {
         self.span.map_reduce(runtime, identity, map, reduce)
     }
 
+    pub fn zip_map_reduce<FM, FR>(
+        &self,
+        rhs: &VectorView<'_>,
+        runtime: &mut CudaRuntime,
+        identity: f32,
+        map: FM,
+        reduce: FR,
+    ) -> f32
+    where
+        FM: Fn(f32, f32) -> f32 + Copy,
+        FR: Fn(f32, f32) -> f32 + Copy,
+    {
+        self.span
+            .zip_map_reduce(&rhs.span, runtime, identity, map, reduce)
+    }
+
     pub fn softmax(&mut self, runtime: &mut CudaRuntime) {
         let max = self.span.max(runtime);
         self.span.for_each(runtime, move |x| (x - max).exp());

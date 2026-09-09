@@ -1,11 +1,9 @@
 use core::marker::PhantomData;
 
-use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D, memory};
+use cuda_core::simt::memory;
+use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
 
 use super::{CudaRuntime, DEFAULT_BLOCK_SIZE};
-
-const REDUCE_ELEMENTS_PER_THREAD: usize = 8;
-const REDUCE_ELEMENTS_PER_BLOCK: usize = DEFAULT_BLOCK_SIZE * REDUCE_ELEMENTS_PER_THREAD;
 
 #[repr(C)]
 pub(super) struct DeviceSliceDescriptor<T> {
@@ -168,6 +166,28 @@ impl DeviceSpan<'_, f32> {
         FR: Fn(f32, f32) -> f32 + Copy,
     {
         map_reduce_descriptor(self.descriptor(), runtime, identity, map, reduce)
+    }
+
+    pub fn zip_map_reduce<FM, FR>(
+        &self,
+        rhs: &DeviceSpan<'_, f32>,
+        runtime: &mut CudaRuntime,
+        identity: f32,
+        map: FM,
+        reduce: FR,
+    ) -> f32
+    where
+        FM: Fn(f32, f32) -> f32 + Copy,
+        FR: Fn(f32, f32) -> f32 + Copy,
+    {
+        zip_map_reduce_descriptors(
+            self.descriptor(),
+            rhs.descriptor(),
+            runtime,
+            identity,
+            map,
+            reduce,
+        )
     }
 }
 
@@ -337,6 +357,51 @@ impl DeviceSpanMut<'_, f32> {
     {
         map_reduce_descriptor(self.read_descriptor(), runtime, identity, map, reduce)
     }
+
+    pub fn zip_map_reduce<FM, FR>(
+        &self,
+        rhs: &DeviceSpanMut<'_, f32>,
+        runtime: &mut CudaRuntime,
+        identity: f32,
+        map: FM,
+        reduce: FR,
+    ) -> f32
+    where
+        FM: Fn(f32, f32) -> f32 + Copy,
+        FR: Fn(f32, f32) -> f32 + Copy,
+    {
+        zip_map_reduce_descriptors(
+            self.read_descriptor(),
+            rhs.read_descriptor(),
+            runtime,
+            identity,
+            map,
+            reduce,
+        )
+    }
+}
+
+fn zip_map_reduce_descriptors<FM, FR>(
+    lhs: DeviceSliceDescriptor<f32>,
+    rhs: DeviceSliceDescriptor<f32>,
+    runtime: &mut CudaRuntime,
+    identity: f32,
+    map: FM,
+    reduce: FR,
+) -> f32
+where
+    FM: Fn(f32, f32) -> f32 + Copy,
+    FR: Fn(f32, f32) -> f32 + Copy,
+{
+    assert_eq!(lhs.len(), rhs.len(), "zip-map-reduce length mismatch");
+    if lhs.len() == 0 {
+        return identity;
+    }
+
+    let input = launch_zip_map_reduce(lhs, rhs, runtime, identity, map, reduce);
+    let result = input.to_host_vec(runtime.stream()).unwrap()[0];
+    runtime.recycle_buffer(input);
+    result
 }
 
 fn map_reduce_descriptor<FM, FR>(
@@ -354,22 +419,7 @@ where
         return identity;
     }
 
-    let mut input = launch_map_reduce(source, source.len(), runtime, identity, map, reduce, true);
-    while input.len() > 1 {
-        let input_span = DeviceSpan::from_buffer(&input, 0, input.len());
-        let output = launch_map_reduce(
-            input_span.descriptor(),
-            input.len(),
-            runtime,
-            identity,
-            map,
-            reduce,
-            false,
-        );
-        runtime.recycle_buffer(input);
-        input = output;
-    }
-
+    let input = launch_map_reduce(source, source.len(), runtime, identity, map, reduce);
     let result = input.to_host_vec(runtime.stream()).unwrap()[0];
     runtime.recycle_buffer(input);
     result
@@ -382,18 +432,16 @@ fn launch_map_reduce<FM, FR>(
     identity: f32,
     map: FM,
     reduce: FR,
-    apply_map: bool,
 ) -> DeviceBuffer<f32>
 where
     FM: Fn(f32) -> f32 + Copy,
     FR: Fn(f32, f32) -> f32 + Copy,
 {
-    let output_len = source_len.div_ceil(REDUCE_ELEMENTS_PER_BLOCK);
-    let grid_size = u32::try_from(output_len).expect("map-reduce grid exceeds CUDA limits");
+    let elements_per_thread = source_len.div_ceil(DEFAULT_BLOCK_SIZE);
     let shared_mem_bytes = 32 * size_of::<f32>() as u32;
-    let config = LaunchConfig1D::new(grid_size, DEFAULT_BLOCK_SIZE as u32, shared_mem_bytes);
-    let mut output = runtime.get_uninit_buffer(output_len);
-    let output_span = DeviceSpanMut::from_buffer(&mut output, 0, output_len);
+    let config = LaunchConfig1D::new(1, DEFAULT_BLOCK_SIZE as u32, shared_mem_bytes);
+    let mut output = runtime.get_uninit_buffer(1);
+    let output_span = DeviceSpanMut::from_buffer(&mut output, 0, 1);
     let prepared = runtime
         .module()
         .prepare_map_reduce::<FM, FR>(config)
@@ -405,8 +453,45 @@ where
             &prepared,
             source,
             output_span.descriptor(),
-            REDUCE_ELEMENTS_PER_THREAD,
-            apply_map,
+            elements_per_thread,
+            map,
+            reduce,
+            identity,
+        )
+        .unwrap();
+    output
+}
+
+fn launch_zip_map_reduce<FM, FR>(
+    lhs: DeviceSliceDescriptor<f32>,
+    rhs: DeviceSliceDescriptor<f32>,
+    runtime: &mut CudaRuntime,
+    identity: f32,
+    map: FM,
+    reduce: FR,
+) -> DeviceBuffer<f32>
+where
+    FM: Fn(f32, f32) -> f32 + Copy,
+    FR: Fn(f32, f32) -> f32 + Copy,
+{
+    let elements_per_thread = lhs.len().div_ceil(DEFAULT_BLOCK_SIZE);
+    let shared_mem_bytes = 32 * size_of::<f32>() as u32;
+    let config = LaunchConfig1D::new(1, DEFAULT_BLOCK_SIZE as u32, shared_mem_bytes);
+    let mut output = runtime.get_uninit_buffer(1);
+    let output_span = DeviceSpanMut::from_buffer(&mut output, 0, 1);
+    let prepared = runtime
+        .module()
+        .prepare_zip_map_reduce::<FM, FR>(config)
+        .unwrap();
+    runtime
+        .module()
+        .zip_map_reduce::<FM, FR>(
+            runtime.stream(),
+            &prepared,
+            lhs,
+            rhs,
+            output_span.descriptor(),
+            elements_per_thread,
             map,
             reduce,
             identity,

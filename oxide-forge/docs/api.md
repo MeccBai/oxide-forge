@@ -182,13 +182,25 @@ let squared_sum = matrix.map_reduce(
     move |value| value * value,
     move |lhs, rhs| lhs + rhs,
 );
+
+let dot = lhs.zip_map_reduce(
+    &rhs,
+    &mut runtime,
+    0.0,
+    move |lhs, rhs| lhs * rhs,
+    move |lhs, rhs| lhs + rhs,
+);
 ```
 
-`map_reduce` accepts any input length. It maps each source element exactly once,
-reduces block-local values, and recursively reduces block results until one
-`f32` remains. `sum`, `max`, and `map_sum` are thin wrappers over this entry
-point. Both closures must use `move`, implement `Copy`, and be compilable as
-device code.
+`map_reduce` accepts any input length. One 1024-thread block processes the full
+input, with each thread visiting as many coalesced positions as necessary, and
+returns one `f32` directly. `sum`, `max`, and `map_sum` are thin wrappers over
+this entry point. Both closures must use `move`, implement `Copy`, and be
+compilable as device code.
+
+`zip_map_reduce` applies a binary map to two equal-length containers, then uses
+the same single-launch reduction path. It avoids materializing an element-wise
+temporary; `Vector::dot` and the Dice intersection use this path directly.
 
 The reduction closure must be associative and `identity` must be its identity
 value. Floating-point results can differ slightly from a sequential CPU fold
@@ -280,8 +292,8 @@ let dot = a.dot(&b, &mut runtime);
 ```
 
 `vector_add`, `vector_sub`, `vector_mul`, and `vector_div` are thin wrappers over
-`vector_binary`. `dot` belongs to the source Vector because it returns a scalar;
-its temporary product is still allocated and recycled through `CudaRuntime`.
+`vector_binary`. `dot` belongs to the source Vector because it returns a scalar
+and is implemented as `zip_map_reduce` without a temporary product Vector.
 
 `vector_binary` and its convenience wrappers submit asynchronously. `sum`,
 `max`, and `dot` still form synchronization boundaries because they return host
@@ -318,6 +330,7 @@ view.sum(&mut runtime);
 view.max(&mut runtime);
 view.map_sum(&mut runtime, f);
 view.map_reduce(&mut runtime, identity, map, reduce);
+view.zip_map_reduce(&rhs, &mut runtime, identity, map, reduce);
 view.softmax(&mut runtime);
 ```
 

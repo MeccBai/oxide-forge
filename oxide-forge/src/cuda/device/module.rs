@@ -203,9 +203,10 @@ pub(in crate::cuda) mod kernels {
     pub fn compare_vectors(
         lhs: span::DeviceSliceDescriptor<f32>,
         rhs: span::DeviceSliceDescriptor<f32>,
+        elements_per_thread: usize,
         result: span::DeviceSliceMutDescriptor<u32>,
     ) {
-        reduction::compare_vectors_device(lhs, rhs, result);
+        reduction::compare_vectors_device(lhs, rhs, elements_per_thread, result);
     }
 
     #[kernel]
@@ -242,7 +243,6 @@ pub(in crate::cuda) mod kernels {
         source: span::DeviceSliceDescriptor<f32>,
         result: span::DeviceSliceMutDescriptor<f32>,
         elements_per_thread: usize,
-        apply_map: bool,
         map: FM,
         reduce: FR,
         default: f32,
@@ -250,11 +250,29 @@ pub(in crate::cuda) mod kernels {
         FM: Fn(f32) -> f32 + Copy,
         FR: Fn(f32, f32) -> f32 + Copy,
     {
-        reduction::map_reduce_device(
-            source,
+        reduction::map_reduce_device(source, result, elements_per_thread, map, reduce, default);
+    }
+
+    #[kernel]
+    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
+    #[launch_contract(domain = 1, dynamic_shared = 128)]
+    pub fn zip_map_reduce<FM, FR>(
+        source1: span::DeviceSliceDescriptor<f32>,
+        source2: span::DeviceSliceDescriptor<f32>,
+        result: span::DeviceSliceMutDescriptor<f32>,
+        elements_per_thread: usize,
+        map: FM,
+        reduce: FR,
+        default: f32,
+    ) where
+        FM: Fn(f32, f32) -> f32 + Copy,
+        FR: Fn(f32, f32) -> f32 + Copy,
+    {
+        reduction::zip_map_reduce_device(
+            source1,
+            source2,
             result,
             elements_per_thread,
-            apply_map,
             map,
             reduce,
             default,

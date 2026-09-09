@@ -168,11 +168,22 @@ let squared_sum = matrix.map_reduce(
     move |value| value * value,
     move |lhs, rhs| lhs + rhs,
 );
+
+let dot = lhs.zip_map_reduce(
+    &rhs,
+    &mut runtime,
+    0.0,
+    move |lhs, rhs| lhs * rhs,
+    move |lhs, rhs| lhs + rhs,
+);
 ```
 
-`map_reduce` 支持任意长度输入。它只对每个源元素执行一次 map，先得到各 block 的局部
-结果，再递归归约局部结果，直到得到一个 `f32`。`sum`、`max` 和 `map_sum` 都只是该
-入口的薄封装。两个闭包都必须写成 `move`、满足 `Copy`，并且能够编译为设备代码。
+`map_reduce` 支持任意长度输入。一个 1024 线程的 block 处理完整输入，每个线程按需
+读取多个保持合并访存的位置，并直接返回一个 `f32`。`sum`、`max` 和 `map_sum` 都只是
+该入口的薄封装。两个闭包都必须写成 `move`、满足 `Copy`，并且能够编译为设备代码。
+
+`zip_map_reduce` 先对两个等长容器执行二元 map，再复用同一条单次 launch 归约路径。它不会物化
+逐元素运算的临时容器；`Vector::dot` 和 Dice intersection 已直接使用该入口。
 
 reduce 闭包必须满足结合律，`identity` 必须是它的单位元。浮点归约的并行计算顺序与
 CPU 顺序 fold 不同，因此末位可能略有差异。返回最终 host 标量时会同步主 stream。
@@ -259,7 +270,7 @@ let dot = a.dot(&b, &mut runtime);
 ```
 
 `vector_add/sub/mul/div` 同样是 `vector_binary` 的薄封装。`dot` 返回标量，因此属于
-源 Vector；其临时乘积仍由 `CudaRuntime` 分配和回收。
+源 Vector，并通过 `zip_map_reduce` 实现，不再分配临时乘积 Vector。
 
 `vector_binary` 及其四个便利封装异步提交。`sum/max/dot` 因为返回 host `f32`，
 仍然是同步边界。空输入的 `sum` 返回 `0.0`，`max` 返回 `f32::NEG_INFINITY`。
@@ -292,6 +303,7 @@ view.sum(&mut runtime);
 view.max(&mut runtime);
 view.map_sum(&mut runtime, f);
 view.map_reduce(&mut runtime, identity, map, reduce);
+view.zip_map_reduce(&rhs, &mut runtime, identity, map, reduce);
 view.softmax(&mut runtime);
 ```
 

@@ -127,10 +127,15 @@ impl Loss {
 
         let mut probabilities = runtime.clone_matrix(output);
         probabilities.sigmoid(runtime);
-        let intersection = runtime.matrix_mul(&probabilities, target);
-        let numerator = 2.0 * matrix_sum(&intersection, runtime) + 1.0;
+        let intersection = probabilities.zip_map_reduce(
+            target,
+            runtime,
+            0.0,
+            move |probability, target| probability * target,
+            move |lhs, rhs| lhs + rhs,
+        );
+        let numerator = 2.0 * intersection + 1.0;
         let denominator = matrix_sum(&probabilities, runtime) + matrix_sum(target, runtime) + 1.0;
-        runtime.recycle_matrix(intersection);
 
         let dice_loss = 1.0 - numerator / denominator;
         loss_rows.add_scalar(dice_weight * dice_loss, runtime);

@@ -55,6 +55,25 @@ impl Matrix {
             .map_reduce(runtime, identity, map, reduce)
     }
 
+    pub fn zip_map_reduce<FM, FR>(
+        &self,
+        rhs: &Matrix,
+        runtime: &mut CudaRuntime,
+        identity: f32,
+        map: FM,
+        reduce: FR,
+    ) -> f32
+    where
+        FM: Fn(f32, f32) -> f32 + Copy,
+        FR: Fn(f32, f32) -> f32 + Copy,
+    {
+        assert_eq!(self.rows, rhs.rows);
+        assert_eq!(self.cols, rhs.cols);
+        let lhs = DeviceSpan::from_buffer(&self.buffer, 0, self.buffer.len());
+        let rhs = DeviceSpan::from_buffer(&rhs.buffer, 0, rhs.buffer.len());
+        lhs.zip_map_reduce(&rhs, runtime, identity, map, reduce)
+    }
+
     pub fn for_each<F>(&mut self, runtime: &CudaRuntime, f: F)
     where
         F: Fn(f32) -> f32 + Copy,

@@ -1,5 +1,6 @@
 use crate::cuda::{DeviceSpan, kernels};
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D, memory};
+use cuda_core::simt::memory;
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -181,7 +182,7 @@ impl CudaRuntime {
         new_buffer
     }
 
-    pub fn span_to_buffer_async(&mut self, span: &DeviceSpan<'_, f32>) -> DeviceBuffer<f32> {
+    fn span_to_buffer_async(&mut self, span: &DeviceSpan<'_, f32>) -> DeviceBuffer<f32> {
         span.to_buffer_async(self)
     }
 

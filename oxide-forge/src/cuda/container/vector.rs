@@ -70,6 +70,22 @@ impl Vector {
         self.as_span().map_reduce(runtime, identity, map, reduce)
     }
 
+    pub fn zip_map_reduce<FM, FR>(
+        &self,
+        rhs: &Vector,
+        runtime: &mut CudaRuntime,
+        identity: f32,
+        map: FM,
+        reduce: FR,
+    ) -> f32
+    where
+        FM: Fn(f32, f32) -> f32 + Copy,
+        FR: Fn(f32, f32) -> f32 + Copy,
+    {
+        self.as_span()
+            .zip_map_reduce(&rhs.as_span(), runtime, identity, map, reduce)
+    }
+
     pub fn exp_shifted(&mut self, offset: f32, runtime: &CudaRuntime) {
         let len = self.buffer.len();
         let mut span = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
@@ -138,16 +154,19 @@ impl Vector {
     }
 
     pub fn dot(&self, rhs: &Vector, runtime: &mut CudaRuntime) -> f32 {
-        assert_eq!(self.len(), rhs.len());
-        let product = runtime.vector_mul(self, rhs);
-        let result = product.sum(runtime);
-        runtime.recycle_vector(product);
-        result
+        self.zip_map_reduce(
+            rhs,
+            runtime,
+            0.0,
+            move |lhs, rhs| lhs * rhs,
+            move |lhs, rhs| lhs + rhs,
+        )
     }
 
     pub fn equals(&self, rhs: &Vector, runtime: &mut CudaRuntime) -> bool {
         assert_eq!(self.len(), rhs.len());
-        let config = runtime.get_launch_config(self.len(), DEFAULT_BLOCK_SIZE);
+        let config = cuda_core::LaunchConfig1D::new(1, DEFAULT_BLOCK_SIZE as u32, 0);
+        let elements_per_thread = self.len().div_ceil(DEFAULT_BLOCK_SIZE);
         let prepared = runtime.module().prepare_compare_vectors(config).unwrap();
         let mut result = runtime.get_u32_uninit_buffer(1);
         let view = span::DeviceSpanMut::from_buffer(&mut result, 0, 1);
@@ -158,6 +177,7 @@ impl Vector {
                 &prepared,
                 self.as_span().descriptor(),
                 rhs.as_span().descriptor(),
+                elements_per_thread,
                 view.descriptor(),
             )
             .unwrap();
