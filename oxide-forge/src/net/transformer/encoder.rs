@@ -1,4 +1,4 @@
-use crate::cuda::{BinaryOp::Add, container::Matrix, runtime::CudaRuntime};
+use crate::cuda::{container::Matrix, runtime::CudaRuntime};
 use crate::net::linear::{Linear, LinearMomentum};
 use crate::net::metadata::{HostData, MetadataCursor};
 use crate::net::mlp::{InferenceMLP, TrainingMlp};
@@ -185,7 +185,7 @@ impl TrainingTransformer {
         );
         let ffn_input_gradient = self.fcs.backward_accumulate(&second_gradient, runtime);
         let mut first_output_gradient = second_gradient;
-        first_output_gradient.binary_assign(&ffn_input_gradient, Add, runtime);
+        first_output_gradient.binary_assign(&ffn_input_gradient, move |lhs,rhs| lhs+rhs, runtime);
 
         let positioned_gradient = self
             .attention

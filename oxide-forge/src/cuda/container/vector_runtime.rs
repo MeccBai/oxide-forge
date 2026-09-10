@@ -1,7 +1,7 @@
 use cuda_core::{CudaStream, DeviceBuffer, DriverError};
 
 use crate::cuda::{
-    BinaryOp, CudaRuntime, DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, runtime::InitType,
+    CudaRuntime, DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, runtime::InitType,
 };
 
 use super::Vector;
@@ -29,30 +29,47 @@ impl CudaRuntime {
             };
         }
         let mut buffer = self.get_uninit_buffer(size);
-        let config = self.get_launch_config(buffer.len(), DEFAULT_BLOCK_SIZE);
+        let (config, elements_per_thread) =
+            self.get_elementwise_launch_config(buffer.len(), DEFAULT_BLOCK_SIZE);
+        let span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
         match init_type {
             InitType::Sequence => {
                 let prepared = self.module().prepare_slice_set_seq(config).unwrap();
-                let span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
                 self.module()
-                    .slice_set_seq(self.stream(), &prepared, span.descriptor(), true)
+                    .slice_set_seq(
+                        self.stream(),
+                        &prepared,
+                        span.descriptor(),
+                        elements_per_thread,
+                        true,
+                    )
                     .unwrap();
                 Vector { buffer }
             }
             InitType::Reserve => {
                 let prepared = self.module().prepare_slice_set_seq(config).unwrap();
-                let span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
                 self.module()
-                    .slice_set_seq(self.stream(), &prepared, span.descriptor(), false)
+                    .slice_set_seq(
+                        self.stream(),
+                        &prepared,
+                        span.descriptor(),
+                        elements_per_thread,
+                        false,
+                    )
                     .unwrap();
                 Vector { buffer }
             }
             InitType::Random => {
                 let seed = rand::random();
                 let prepared = self.module().prepare_slice_set_random(config).unwrap();
-                let span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
                 self.module()
-                    .slice_set_random(self.stream(), &prepared, span.descriptor(), seed)
+                    .slice_set_random(
+                        self.stream(),
+                        &prepared,
+                        span.descriptor(),
+                        elements_per_thread,
+                        seed,
+                    )
                     .unwrap();
                 Vector { buffer }
             }
@@ -74,26 +91,30 @@ impl CudaRuntime {
     }
 
     pub fn vector_add(&mut self, vec1: &Vector, vec2: &Vector) -> Vector {
-        self.vector_binary(vec1, vec2, BinaryOp::Add)
+        self.vector_binary(vec1, vec2, move |lhs, rhs| lhs + rhs)
     }
 
     pub fn vector_sub(&mut self, vec1: &Vector, vec2: &Vector) -> Vector {
-        self.vector_binary(vec1, vec2, BinaryOp::Sub)
+        self.vector_binary(vec1, vec2, move |lhs, rhs| lhs - rhs)
     }
 
     pub fn vector_mul(&mut self, vec1: &Vector, vec2: &Vector) -> Vector {
-        self.vector_binary(vec1, vec2, BinaryOp::Mul)
+        self.vector_binary(vec1, vec2, move |lhs, rhs| lhs * rhs)
     }
 
     pub fn vector_div(&mut self, vec1: &Vector, vec2: &Vector) -> Vector {
-        self.vector_binary(vec1, vec2, BinaryOp::Div)
+        self.vector_binary(vec1, vec2, move |lhs, rhs| lhs / rhs)
     }
 
-    pub fn vector_binary(&mut self, vec1: &Vector, vec2: &Vector, op: BinaryOp) -> Vector {
+    pub fn vector_binary<F>(&mut self, vec1: &Vector, vec2: &Vector, f: F) -> Vector
+    where
+        F: Fn(f32, f32) -> f32 + Copy,
+    {
         assert_eq!(vec1.buffer.len(), vec2.buffer.len());
         let mut result_buffer = self.get_uninit_buffer(vec1.buffer.len());
 
-        let config = self.get_launch_config(vec1.buffer.len(), DEFAULT_BLOCK_SIZE);
+        let (config, elements_per_thread) =
+            self.get_elementwise_launch_config(vec1.buffer.len(), DEFAULT_BLOCK_SIZE);
 
         let prepared = self.module().prepare_slice_binary(config).unwrap();
         let lhs = DeviceSpan::from_buffer(&vec1.buffer, 0, vec1.buffer.len());
@@ -108,7 +129,8 @@ impl CudaRuntime {
                 lhs.descriptor(),
                 rhs.descriptor(),
                 output.descriptor(),
-                op,
+                elements_per_thread,
+                f,
             )
             .unwrap();
         Vector {

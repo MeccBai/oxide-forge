@@ -1,4 +1,4 @@
-use crate::cuda::{BinaryOp::Add, container::Matrix, runtime::CudaRuntime};
+use crate::cuda::{container::Matrix, runtime::CudaRuntime};
 use crate::net::linear::{Linear, LinearMetadata, LinearMomentum};
 use crate::net::metadata::{HostData, MetadataCursor};
 use cuda_core::CudaStream;
@@ -127,7 +127,7 @@ impl QkvProjection {
             let current_input_gradient = linear.input_gradient(&gradient, runtime, None);
 
             if let Some(total) = &mut input_gradient {
-                total.binary_assign(&current_input_gradient, Add, runtime);
+                total.binary_assign(&current_input_gradient, move |lhs,rhs| lhs+rhs, runtime);
             } else {
                 input_gradient = Some(current_input_gradient);
             }
@@ -326,7 +326,7 @@ impl Attention {
             runtime,
         );
         let mut input_gradient = residual_gradient;
-        input_gradient.binary_assign(&projection_gradient, Add, runtime);
+        input_gradient.binary_assign(&projection_gradient, move |lhs,rhs| lhs+rhs, runtime);
         input_gradient
     }
 

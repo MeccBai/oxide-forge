@@ -1,4 +1,4 @@
-use crate::cuda::{BinaryOp, CudaRuntime, DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, span};
+use crate::cuda::{CudaRuntime, DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, span};
 use cuda_core::CudaStream;
 
 use super::Vector;
@@ -104,23 +104,29 @@ impl Vector {
         self.scale(1.0 / sum, runtime);
     }
 
-    pub fn binary_assign(&mut self, rhs: &Vector, op: BinaryOp, runtime: &CudaRuntime) {
-        self.binary_assign_on(rhs, op, runtime, runtime.stream());
+    pub fn binary_assign<F>(&mut self, rhs: &Vector, runtime: &CudaRuntime, f: F)
+    where
+        F: Fn(f32, f32) -> f32 + Copy,
+    {
+        self.binary_assign_on(rhs, f, runtime, runtime.stream());
     }
 
-    pub(crate) fn binary_assign_on(
+    pub(crate) fn binary_assign_on<F>(
         &mut self,
         rhs: &Vector,
-        op: BinaryOp,
+        f: F,
         runtime: &CudaRuntime,
         stream: &CudaStream,
-    ) {
+    ) where
+        F: Fn(f32, f32) -> f32 + Copy,
+    {
         let len = self.buffer.len();
         assert_eq!(len, rhs.buffer.len());
         let span = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
         let rhs_span = DeviceSpan::from_buffer(&rhs.buffer, 0, len);
 
-        let config = runtime.get_launch_config(len, DEFAULT_BLOCK_SIZE);
+        let (config, elements_per_thread) =
+            runtime.get_elementwise_launch_config(len, DEFAULT_BLOCK_SIZE);
         let prepared = runtime
             .module()
             .prepare_slice_binary_assign(config)
@@ -132,7 +138,8 @@ impl Vector {
                 &prepared,
                 span.descriptor(),
                 rhs_span.descriptor(),
-                op,
+                elements_per_thread,
+                f,
             )
             .unwrap();
     }

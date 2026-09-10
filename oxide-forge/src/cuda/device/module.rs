@@ -1,5 +1,5 @@
 use super::{elementwise, gemm, layout, reduction, row};
-use crate::cuda::{BinaryOp, span};
+use crate::cuda::span;
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
 
@@ -12,66 +12,97 @@ pub(in crate::cuda) mod kernels {
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn slice_set(target: span::DeviceSliceMutDescriptor<f32>, value: f32) {
-        elementwise::slice_set_device(target, value);
+    pub fn slice_set(
+        target: span::DeviceSliceMutDescriptor<f32>,
+        elements_per_thread: usize,
+        value: f32,
+    ) {
+        elementwise::slice_set_device(target, elements_per_thread, value);
     }
 
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn slice_set_seq(target: span::DeviceSliceMutDescriptor<f32>, dir: bool) {
-        elementwise::slice_set_seq_device(target, dir);
+    pub fn slice_set_seq(
+        target: span::DeviceSliceMutDescriptor<f32>,
+        elements_per_thread: usize,
+        dir: bool,
+    ) {
+        elementwise::slice_set_seq_device(target, elements_per_thread, dir);
     }
 
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn slice_set_random(target: span::DeviceSliceMutDescriptor<f32>, seed: u32) {
-        elementwise::slice_set_random_device(target, seed);
+    pub fn slice_set_random(
+        target: span::DeviceSliceMutDescriptor<f32>,
+        elements_per_thread: usize,
+        seed: u32,
+    ) {
+        elementwise::slice_set_random_device(target, elements_per_thread, seed);
     }
 
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn slice_binary(
+    pub fn slice_binary<F>(
         lhs: span::DeviceSliceDescriptor<f32>,
         rhs: span::DeviceSliceDescriptor<f32>,
         output: span::DeviceSliceMutDescriptor<f32>,
-        op: BinaryOp,
-    ) {
-        elementwise::slice_binary_device(lhs, rhs, output, op);
+        elements_per_thread: usize,
+        f: F,
+    ) where
+        F: Fn(f32, f32) -> f32 + Copy,
+    {
+        elementwise::slice_binary_device(lhs, rhs, output, elements_per_thread, f);
     }
 
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn slice_binary_assign(
+    pub fn slice_binary_assign<F>(
         target: span::DeviceSliceMutDescriptor<f32>,
         rhs: span::DeviceSliceDescriptor<f32>,
-        op: BinaryOp,
-    ) {
-        elementwise::slice_binary_assign_device(target, rhs, op);
+        elements_per_thread: usize,
+        f: F,
+    ) where
+        F: Fn(f32, f32) -> f32 + Copy,
+    {
+        elementwise::slice_binary_assign_device(target, rhs, elements_per_thread, f);
     }
 
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn slice_for_each<F>(span: span::DeviceSliceMutDescriptor<f32>, f: F)
-    where
+    pub fn slice_for_each<F>(
+        span: span::DeviceSliceMutDescriptor<f32>,
+        elements_per_thread: usize,
+        f: F,
+    ) where
         F: Fn(f32) -> f32 + Copy,
     {
-        elementwise::slice_for_each_device(span, f);
+        elementwise::slice_for_each_device(span, elements_per_thread, f);
     }
 
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
-    #[launch_contract(domain = 1)]
+    #[launch_contract(domain = 1, dynamic_shared = 128)]
     pub fn matrix_sum_rows(
         matrix: span::DeviceSliceDescriptor<f32>,
         result: span::DeviceSliceMutDescriptor<f32>,
         cols: usize,
+        elements_per_thread: usize,
     ) {
-        row::matrix_sum_rows_device(matrix, result, cols);
+        let row = thread::blockIdx_x() as usize;
+        let row = matrix.slice(row * cols, cols);
+        reduction::map_reduce_device(
+            row,
+            result,
+            elements_per_thread,
+            move |value| value,
+            move |lhs, rhs| lhs + rhs,
+            0.0,
+        );
     }
 
     #[kernel]
@@ -95,13 +126,15 @@ pub(in crate::cuda) mod kernels {
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn matrix_binary_assign_by_rows(
+    pub fn matrix_binary_assign_by_rows<F>(
         matrix: span::DeviceSliceMutDescriptor<f32>,
         row_value: span::DeviceSliceDescriptor<f32>,
         cols: usize,
-        op: BinaryOp,
-    ) {
-        row::matrix_binary_assign_by_rows_device(matrix, row_value, cols, op);
+        f: F,
+    ) where
+        F: Fn(f32, f32) -> f32 + Copy,
+    {
+        row::matrix_binary_assign_by_rows_device(matrix, row_value, cols, f);
     }
 
     #[kernel]

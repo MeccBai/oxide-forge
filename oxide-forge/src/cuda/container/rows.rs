@@ -1,18 +1,18 @@
 use cuda_core::{CudaStream, LaunchConfig1D};
 
-use crate::cuda::{BinaryOp, DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, runtime::CudaRuntime};
+use crate::cuda::{DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, runtime::CudaRuntime};
 
 use super::{Matrix, Vector};
 
 impl Matrix {
-    pub fn binary_assign_by_rows(&mut self, vec: &Vector, op: BinaryOp, runtime: &CudaRuntime) {
-        self.binary_assign_by_rows_on(vec, op, runtime, runtime.stream());
+    pub fn binary_assign_by_rows(&mut self, vec: &Vector, f:impl Fn(f32, f32) -> f32 + Copy, runtime: &CudaRuntime) {
+        self.binary_assign_by_rows_on(vec, f, runtime, runtime.stream());
     }
 
     pub(crate) fn binary_assign_by_rows_on(
         &mut self,
         vec: &Vector,
-        op: BinaryOp,
+        f:impl Fn(f32, f32) -> f32 + Copy,
         runtime: &CudaRuntime,
         stream: &CudaStream,
     ) {
@@ -36,7 +36,7 @@ impl Matrix {
                 matrix.descriptor(),
                 rhs.descriptor(),
                 self.cols,
-                op,
+                f
             )
             .unwrap();
     }
@@ -70,8 +70,9 @@ impl CudaRuntime {
         buffer: &mut cuda_core::DeviceBuffer<f32>,
         stream: &CudaStream,
     ) {
-        assert!(matrix.cols > 0 && matrix.cols <= DEFAULT_BLOCK_SIZE);
-        let config = LaunchConfig1D::new(matrix.rows as u32, DEFAULT_BLOCK_SIZE as u32, 0);
+        assert!(matrix.cols > 0);
+        let elements_per_thread = matrix.cols.div_ceil(DEFAULT_BLOCK_SIZE);
+        let config = LaunchConfig1D::new(matrix.rows as u32, DEFAULT_BLOCK_SIZE as u32, 128);
         let prepared = self.module().prepare_matrix_sum_rows(config).unwrap();
         let input = DeviceSpan::from_buffer(&matrix.buffer, 0, matrix.buffer.len());
         let result_len = buffer.len();
@@ -83,6 +84,7 @@ impl CudaRuntime {
                 input.descriptor(),
                 result.descriptor(),
                 matrix.cols,
+                elements_per_thread,
             )
             .unwrap();
     }

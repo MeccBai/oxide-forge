@@ -130,6 +130,25 @@ impl CudaRuntime {
         )
     }
 
+    pub(crate) fn get_elementwise_launch_config(
+        &self,
+        size: usize,
+        block_size: usize,
+    ) -> (LaunchConfig1D, usize) {
+        const MAX_ELEMENTS_PER_THREAD: usize = 4;
+
+        let elements_per_thread = size.div_ceil(block_size).clamp(1, MAX_ELEMENTS_PER_THREAD);
+        let thread_count = size.div_ceil(elements_per_thread);
+        let grid_size = thread_count.div_ceil(block_size).max(1);
+        let grid_size = u32::try_from(grid_size).expect("elementwise grid exceeds CUDA limits");
+        let block_size = u32::try_from(block_size).expect("block size exceeds u32");
+
+        (
+            LaunchConfig1D::new(grid_size, block_size, 0),
+            elements_per_thread,
+        )
+    }
+
     pub fn concat_buffers(&mut self, buffers: &[&DeviceBuffer<f32>]) -> DeviceBuffer<f32> {
         let total_len = buffers
             .iter()
@@ -209,5 +228,13 @@ impl CudaRuntime {
     pub fn sync_streams(&self, streams: &[Arc<CudaStream>]) {
         self.join_streams(streams);
         self.sync();
+    }
+
+    pub fn clear_buffers(&mut self) {
+        self.buffer_pool.clear();
+    }
+
+    pub fn clear_buffers_by_size(&mut self, size: usize) {
+        self.buffer_pool.remove(&size);
     }
 }

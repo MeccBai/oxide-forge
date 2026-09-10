@@ -41,6 +41,16 @@ impl<T> DeviceSliceDescriptor<T> {
     pub(super) fn as_ptr(&self) -> *const T {
         self.ptr
     }
+
+    #[inline(always)]
+    pub(super) fn slice(&self, offset: usize, len: usize) -> Self {
+        debug_assert!(offset <= self.len);
+        debug_assert!(len <= self.len - offset);
+        Self {
+            ptr: unsafe { self.ptr.add(offset) },
+            len,
+        }
+    }
 }
 
 #[repr(C)]
@@ -308,7 +318,8 @@ impl DeviceSpanMut<'_, f32> {
             return;
         }
 
-        let config = runtime.get_launch_config(self.len(), DEFAULT_BLOCK_SIZE);
+        let (config, elements_per_thread) =
+            runtime.get_elementwise_launch_config(self.len(), DEFAULT_BLOCK_SIZE);
         let prepared = runtime
             .module()
             .prepare_slice_for_each::<F>(config)
@@ -316,7 +327,7 @@ impl DeviceSpanMut<'_, f32> {
 
         runtime
             .module()
-            .slice_for_each::<F>(stream, &prepared, self.descriptor(), f)
+            .slice_for_each::<F>(stream, &prepared, self.descriptor(), elements_per_thread, f)
             .unwrap();
     }
 

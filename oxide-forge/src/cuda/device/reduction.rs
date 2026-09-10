@@ -1,6 +1,6 @@
 use crate::cuda::span;
-use cuda_device::{device, shared, thread, warp};
 use core::mem::size_of;
+use cuda_device::{device, shared, thread, warp};
 
 #[device]
 pub(super) fn compare_vectors_device(
@@ -58,7 +58,9 @@ pub(super) fn map_reduce_device<FM, FR>(
     FM: Fn(f32) -> f32 + Copy,
     FR: Fn(f32, f32) -> f32 + Copy,
 {
-    let index = thread::index_1d().get();
+    // Each block reduces the descriptor supplied to it. Callers may therefore
+    // launch one block per independent descriptor, such as one matrix row.
+    let index = thread::threadIdx_x() as usize;
     let lane = thread::threadIdx_x() as usize % 32;
     let warp_id = thread::threadIdx_x() as usize / 32;
 

@@ -1,13 +1,5 @@
 const DEFAULT_BLOCK_SIZE: usize = 1024;
 
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BinaryOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-}
 
 #[inline(always)]
 pub(crate) fn sigmoid_f32(value: f32) -> f32 {

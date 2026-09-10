@@ -1,5 +1,4 @@
-use super::elementwise::apply_binary;
-use crate::cuda::{BinaryOp, span};
+use crate::cuda::span;
 use cuda_device::{device, shared, thread, warp};
 
 #[device]
@@ -10,45 +9,6 @@ pub(super) fn matrix_causal_mask_device(matrix: span::DeviceSliceMutDescriptor<f
 
     if col < cols && index < matrix.len() && col > row {
         matrix.write(index, f32::NEG_INFINITY);
-    }
-}
-
-#[device]
-pub(super) fn matrix_sum_rows_device(
-    matrix: span::DeviceSliceDescriptor<f32>,
-    result: span::DeviceSliceMutDescriptor<f32>,
-    cols: usize,
-) {
-    static mut SHARED: shared::SharedArray<f32, 32> = shared::SharedArray::UNINIT;
-
-    let tid = thread::threadIdx_x() as usize;
-    let lane = tid % 32;
-    let warp_id = tid / 32;
-    let row = thread::blockIdx_x() as usize;
-    let index = row * cols + tid;
-    let mut value = if tid < cols && index < matrix.len() {
-        matrix.read(index)
-    } else {
-        0.0
-    };
-
-    for delta in [1, 2, 4, 8, 16] {
-        value += warp::shuffle_down_f32(value, delta);
-    }
-    if lane == 0 {
-        unsafe { SHARED[warp_id] = value };
-    }
-    thread::sync_threads();
-
-    if warp_id == 0 {
-        value = unsafe { SHARED[lane] };
-        for delta in [1, 2, 4, 8, 16] {
-            value += warp::shuffle_down_f32(value, delta);
-        }
-    }
-
-    if tid == 0 && row < result.len() {
-        result.write(row, value);
     }
 }
 
@@ -177,16 +137,18 @@ pub(super) fn matrix_layer_norm_rows_device(
 }
 
 #[device]
-pub(super) fn matrix_binary_assign_by_rows_device(
+pub(super) fn matrix_binary_assign_by_rows_device<F>(
     matrix: span::DeviceSliceMutDescriptor<f32>,
     row: span::DeviceSliceDescriptor<f32>,
     cols: usize,
-    op: BinaryOp,
-) {
+    f: F,
+) where
+    F: Fn(f32, f32) -> f32 + Copy,
+{
     let index = thread::index_1d().get();
     if index < matrix.len() {
         let rhs = row.read(index % cols);
-        matrix.write(index, apply_binary(matrix.read(index), rhs, op));
+        matrix.write(index, f(matrix.read(index), rhs));
     }
 }
 

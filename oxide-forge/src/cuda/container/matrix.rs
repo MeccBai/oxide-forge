@@ -1,7 +1,7 @@
 use cuda_core::{CudaStream, DeviceBuffer, DriverError, LaunchConfig1D, LaunchConfig2D};
 
 use crate::cuda::{
-    BinaryOp, DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut,
+    DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut,
     runtime::{CudaRuntime, InitType},
 };
 
@@ -108,14 +108,19 @@ impl Matrix {
         self.for_each_on(runtime, stream, crate::cuda::sigmoid_f32);
     }
 
-    pub fn binary_assign(&mut self, rhs: &Matrix, op: BinaryOp, runtime: &CudaRuntime) {
-        self.binary_assign_on(rhs, op, runtime, runtime.stream());
+    pub fn binary_assign(
+        &mut self,
+        rhs: &Matrix,
+        f: impl Fn(f32, f32) -> f32 + Copy,
+        runtime: &CudaRuntime,
+    ) {
+        self.binary_assign_on(rhs, f, runtime, runtime.stream());
     }
 
     pub(crate) fn binary_assign_on(
         &mut self,
         rhs: &Matrix,
-        op: BinaryOp,
+        f: impl Fn(f32, f32) -> f32 + Copy,
         runtime: &CudaRuntime,
         stream: &CudaStream,
     ) {
@@ -123,7 +128,8 @@ impl Matrix {
         assert_eq!(self.cols, rhs.cols);
 
         let len = self.buffer.len();
-        let config = runtime.get_launch_config(len, DEFAULT_BLOCK_SIZE);
+        let (config, elements_per_thread) =
+            runtime.get_elementwise_launch_config(len, DEFAULT_BLOCK_SIZE);
         let prepared = runtime
             .module()
             .prepare_slice_binary_assign(config)
@@ -132,7 +138,14 @@ impl Matrix {
         let rhs = DeviceSpan::from_buffer(&rhs.buffer, 0, len);
         runtime
             .module()
-            .slice_binary_assign(stream, &prepared, target.descriptor(), rhs.descriptor(), op)
+            .slice_binary_assign(
+                stream,
+                &prepared,
+                target.descriptor(),
+                rhs.descriptor(),
+                elements_per_thread,
+                f,
+            )
             .unwrap();
     }
 
@@ -202,7 +215,6 @@ impl CudaRuntime {
     }
 
     pub fn matrix_multiply(&mut self, mat1: &Matrix, mat2: &Matrix) -> Matrix {
-        assert_eq!(mat1.cols, mat2.rows);
         let mut result = self.new_uninit_matrix(mat1.rows, mat2.cols);
         self.matrix_multiply_into_on(self.stream(), mat1, mat2, &mut result);
         result
@@ -214,7 +226,6 @@ impl CudaRuntime {
         mat1: &Matrix,
         mat2: &Matrix,
     ) -> Matrix {
-        assert_eq!(mat1.cols, mat2.rows);
         let mut result = self.new_uninit_matrix(mat1.rows, mat2.cols);
         stream.join(self.stream()).unwrap();
         self.matrix_multiply_into_on(stream, mat1, mat2, &mut result);
@@ -267,22 +278,27 @@ impl CudaRuntime {
     }
 
     pub fn matrix_add(&mut self, mat1: &Matrix, mat2: &Matrix) -> Matrix {
-        self.matrix_binary(mat1, mat2, BinaryOp::Add)
+        self.matrix_binary(mat1, mat2, move |lhs, rhs| lhs + rhs)
     }
 
     pub fn matrix_sub(&mut self, mat1: &Matrix, mat2: &Matrix) -> Matrix {
-        self.matrix_binary(mat1, mat2, BinaryOp::Sub)
+        self.matrix_binary(mat1, mat2, move |lhs, rhs| lhs - rhs)
     }
 
     pub fn matrix_mul(&mut self, mat1: &Matrix, mat2: &Matrix) -> Matrix {
-        self.matrix_binary(mat1, mat2, BinaryOp::Mul)
+        self.matrix_binary(mat1, mat2, move |lhs, rhs| lhs * rhs)
     }
 
     pub fn matrix_div(&mut self, mat1: &Matrix, mat2: &Matrix) -> Matrix {
-        self.matrix_binary(mat1, mat2, BinaryOp::Div)
+        self.matrix_binary(mat1, mat2, move |lhs, rhs| lhs / rhs)
     }
 
-    pub fn matrix_binary(&mut self, mat1: &Matrix, mat2: &Matrix, op: BinaryOp) -> Matrix {
+    pub fn matrix_binary(
+        &mut self,
+        mat1: &Matrix,
+        mat2: &Matrix,
+        f: impl Fn(f32, f32) -> f32 + Copy,
+    ) -> Matrix {
         assert_eq!(mat1.rows, mat2.rows);
         assert_eq!(mat1.cols, mat2.cols);
 
@@ -290,7 +306,8 @@ impl CudaRuntime {
         let cols = mat1.cols;
         let mut result_buffer = self.get_uninit_buffer(rows * cols);
 
-        let config = self.get_launch_config(mat1.buffer.len(), DEFAULT_BLOCK_SIZE);
+        let (config, elements_per_thread) =
+            self.get_elementwise_launch_config(mat1.buffer.len(), DEFAULT_BLOCK_SIZE);
         let prepared = self.module().prepare_slice_binary(config).unwrap();
         let lhs = DeviceSpan::from_buffer(&mat1.buffer, 0, mat1.buffer.len());
         let rhs = DeviceSpan::from_buffer(&mat2.buffer, 0, mat2.buffer.len());
@@ -303,7 +320,8 @@ impl CudaRuntime {
                 lhs.descriptor(),
                 rhs.descriptor(),
                 output.descriptor(),
-                op,
+                elements_per_thread,
+                f,
             )
             .unwrap();
         self.create_matrix(result_buffer, rows, cols)
@@ -314,7 +332,7 @@ impl CudaRuntime {
         stream: &CudaStream,
         mat1: &Matrix,
         mat2: &Matrix,
-        op: BinaryOp,
+        f: impl Fn(f32, f32) -> f32 + Copy,
     ) -> Matrix {
         assert_eq!(mat1.rows, mat2.rows);
         assert_eq!(mat1.cols, mat2.cols);
@@ -324,7 +342,8 @@ impl CudaRuntime {
         let mut result_buffer = self.get_uninit_buffer(rows * cols);
         stream.join(self.stream()).unwrap();
 
-        let config = self.get_launch_config(mat1.buffer.len(), DEFAULT_BLOCK_SIZE);
+        let (config, elements_per_thread) =
+            self.get_elementwise_launch_config(mat1.buffer.len(), DEFAULT_BLOCK_SIZE);
         let prepared = self.module().prepare_slice_binary(config).unwrap();
         let lhs = DeviceSpan::from_buffer(&mat1.buffer, 0, mat1.buffer.len());
         let rhs = DeviceSpan::from_buffer(&mat2.buffer, 0, mat2.buffer.len());
@@ -337,7 +356,8 @@ impl CudaRuntime {
                 lhs.descriptor(),
                 rhs.descriptor(),
                 output.descriptor(),
-                op,
+                elements_per_thread,
+                f,
             )
             .unwrap();
         self.create_matrix(result_buffer, rows, cols)
@@ -355,20 +375,33 @@ impl CudaRuntime {
             return self.create_matrix(buffer, rows, cols);
         }
         let mut buffer = self.get_uninit_buffer(size);
-        let config = self.get_launch_config(buffer.len(), DEFAULT_BLOCK_SIZE);
+        let (config, elements_per_thread) =
+            self.get_elementwise_launch_config(buffer.len(), DEFAULT_BLOCK_SIZE);
         match init_type {
             InitType::Sequence => {
                 let prepared = self.module().prepare_slice_set_seq(config).unwrap();
                 let span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
                 self.module()
-                    .slice_set_seq(self.stream(), &prepared, span.descriptor(), true)
+                    .slice_set_seq(
+                        self.stream(),
+                        &prepared,
+                        span.descriptor(),
+                        elements_per_thread,
+                        true,
+                    )
                     .unwrap();
             }
             InitType::Reserve => {
                 let prepared = self.module().prepare_slice_set_seq(config).unwrap();
                 let span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
                 self.module()
-                    .slice_set_seq(self.stream(), &prepared, span.descriptor(), false)
+                    .slice_set_seq(
+                        self.stream(),
+                        &prepared,
+                        span.descriptor(),
+                        elements_per_thread,
+                        false,
+                    )
                     .unwrap();
             }
             InitType::Random => {
@@ -376,7 +409,13 @@ impl CudaRuntime {
                 let prepared = self.module().prepare_slice_set_random(config).unwrap();
                 let span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
                 self.module()
-                    .slice_set_random(self.stream(), &prepared, span.descriptor(), seed)
+                    .slice_set_random(
+                        self.stream(),
+                        &prepared,
+                        span.descriptor(),
+                        elements_per_thread,
+                        seed,
+                    )
                     .unwrap();
             }
             InitType::Zero => {}
