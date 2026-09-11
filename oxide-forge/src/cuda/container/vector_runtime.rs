@@ -1,8 +1,6 @@
 use cuda_core::{CudaStream, DeviceBuffer, DriverError};
 
-use crate::cuda::{
-    CudaRuntime, DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, runtime::InitType,
-};
+use crate::cuda::{CudaRuntime, DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, runtime::InitType};
 
 use super::Vector;
 
@@ -42,6 +40,8 @@ impl CudaRuntime {
                         span.descriptor(),
                         elements_per_thread,
                         true,
+                        0.0,
+                        1.0,
                     )
                     .unwrap();
                 Vector { buffer }
@@ -55,6 +55,8 @@ impl CudaRuntime {
                         span.descriptor(),
                         elements_per_thread,
                         false,
+                        0.0,
+                        1.0,
                     )
                     .unwrap();
                 Vector { buffer }

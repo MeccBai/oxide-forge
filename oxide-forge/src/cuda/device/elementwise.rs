@@ -26,6 +26,8 @@ pub(super) fn slice_set_seq_device(
     target: span::DeviceSliceMutDescriptor<f32>,
     elements_per_thread: usize,
     dir: bool,
+    start:f32,
+    step:f32
 ) {
     let thread_index = thread::index_1d().get();
     let stride = thread::gridDim_x() as usize * thread::blockDim_x() as usize;
@@ -33,10 +35,11 @@ pub(super) fn slice_set_seq_device(
         let index = thread_index + stride * iteration;
         if index < target.len() {
             let value = if dir {
-                index as f32
+                index  as f32 * step + start
             } else {
-                (target.len() - index) as f32
+                (target.len() - index) as f32 * step - start
             };
+            
             target.write(index, value);
         }
     }

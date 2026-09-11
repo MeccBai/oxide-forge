@@ -1,6 +1,6 @@
-use super::{elementwise, gemm, layout, reduction, row};
+use super::{gemm2, elementwise, gemm, layout, reduction, row};
 use crate::cuda::span;
-use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
+use cuda_device::{kernel, launch_bounds, launch_contract, thread, DisjointSlice};
 use cuda_host::cuda_module;
 
 #[cuda_module]
@@ -27,8 +27,10 @@ pub(in crate::cuda) mod kernels {
         target: span::DeviceSliceMutDescriptor<f32>,
         elements_per_thread: usize,
         dir: bool,
+        start: f32,
+        step: f32,
     ) {
-        elementwise::slice_set_seq_device(target, elements_per_thread, dir);
+        elementwise::slice_set_seq_device(target, elements_per_thread, dir, start, step);
     }
 
     #[kernel]
@@ -188,6 +190,20 @@ pub(in crate::cuda) mod kernels {
         cols: usize,
     ) {
         gemm::matrix_multiply_device(matrix1, matrix2, result, len, rows, cols);
+    }
+
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(domain = 1, block = (128, 1, 1))]
+    pub fn matrix_multiply_at(
+        matrix1: span::DeviceSliceDescriptor<f32>,
+        matrix2: span::DeviceSliceDescriptor<f32>,
+        result: span::DeviceSliceMutDescriptor<f32>,
+        len: usize,
+        rows: usize,
+        cols: usize,
+    ) {
+        gemm2::matrix_multiply_at_device(matrix1, matrix2, result, len, rows, cols);
     }
 
     #[kernel]

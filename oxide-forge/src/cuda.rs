@@ -17,6 +17,7 @@ pub mod runtime;
 //mod tensor;
 
 mod span;
+mod tools;
 
 pub use runtime::CudaRuntime;
 pub use runtime::InitType;
