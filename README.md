@@ -20,5 +20,3 @@ be launched from the repository root with:
 ```bash
 cargo oxide run
 ```
-
-See each member's README for its API, constraints, and commands.

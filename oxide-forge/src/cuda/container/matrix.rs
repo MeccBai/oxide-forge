@@ -1,8 +1,8 @@
-use cuda_core::{CudaStream, DeviceBuffer, DriverError, LaunchConfig1D, LaunchConfig2D};
+use cuda_core::{CudaStream, DeviceBuffer, DriverError, LaunchConfig1D};
 
 use crate::cuda::{
+    DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut,
     runtime::{CudaRuntime, InitType},
-    DeviceSpan, DeviceSpanMut, DEFAULT_BLOCK_SIZE,
 };
 
 use super::Matrix;
@@ -94,11 +94,7 @@ impl Matrix {
         self.for_each(
             runtime,
             move |value| {
-                if value >= threshold {
-                    1.0
-                } else {
-                    0.0
-                }
+                if value >= threshold { 1.0 } else { 0.0 }
             },
         );
     }
@@ -228,48 +224,6 @@ impl CudaRuntime {
         self.matrix_multiply_into_on(self.stream(), mat1, mat2, result);
     }
 
-    /// Experimental 1D TF32 GEMM with a 32x32 block tile split across four
-    /// 16x16 warp tiles, double-buffered async copies, and swizzled shared memory.
-    pub fn matrix_multiply_at(&mut self, mat1: &Matrix, mat2: &Matrix) -> Matrix {
-        let mut result = self.new_uninit_matrix(mat1.rows, mat2.cols);
-        self.matrix_multiply_at_into(mat1, mat2, &mut result);
-        result
-    }
-
-    pub fn matrix_multiply_at_into(&self, mat1: &Matrix, mat2: &Matrix, result: &mut Matrix) {
-        assert_eq!(mat1.cols, mat2.rows);
-        assert!(mat1.rows > 0 && mat1.cols > 0 && mat2.cols > 0);
-        assert_eq!(mat1.rows % 16, 0);
-        assert_eq!(mat1.cols % 16, 0);
-        assert_eq!(mat2.cols % 16, 0);
-
-        let rows = mat1.rows;
-        let cols = mat2.cols;
-        let len = mat1.cols;
-        assert_eq!(result.rows, rows);
-        assert_eq!(result.cols, cols);
-        let block_rows = rows.div_ceil(32);
-        let block_cols = cols.div_ceil(32);
-        let config = LaunchConfig1D::new((block_rows * block_cols) as u32, 128, 0);
-        let prepared = self.module().prepare_matrix_multiply_at(config).unwrap();
-        let lhs = DeviceSpan::from_buffer(&mat1.buffer, 0, mat1.buffer.len());
-        let rhs = DeviceSpan::from_buffer(&mat2.buffer, 0, mat2.buffer.len());
-        let output = DeviceSpanMut::from_buffer(&mut result.buffer, 0, rows * cols);
-
-        self.module()
-            .matrix_multiply_at(
-                self.stream(),
-                &prepared,
-                lhs.descriptor(),
-                rhs.descriptor(),
-                output.descriptor(),
-                len,
-                rows,
-                cols,
-            )
-            .unwrap();
-    }
-
     pub(crate) fn matrix_multiply_on(
         &mut self,
         stream: &CudaStream,
@@ -300,13 +254,9 @@ impl CudaRuntime {
         assert_eq!(cols % 16, 0);
         assert_eq!(len % 16, 0);
 
-        const TILE_SIZE: usize = 32;
-        const BLOCK_SIZE: u32 = 128;
-        let grid = (
-            cols.div_ceil(TILE_SIZE) as u32,
-            rows.div_ceil(TILE_SIZE) as u32,
-        );
-        let config = LaunchConfig2D::new(grid, (BLOCK_SIZE, 1), 0);
+        let block_rows = rows.div_ceil(32);
+        let block_cols = cols.div_ceil(32);
+        let config = LaunchConfig1D::new((block_rows * block_cols) as u32, 128, 0);
         let prepared = self.module().prepare_matrix_multiply(config).unwrap();
 
         let lhs = DeviceSpan::from_buffer(&mat1.buffer, 0, mat1.buffer.len());

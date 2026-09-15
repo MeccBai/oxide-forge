@@ -1,6 +1,6 @@
-use super::{gemm2, elementwise, gemm, layout, reduction, row};
+use super::{elementwise, gemm, layout, reduction, row};
 use crate::cuda::span;
-use cuda_device::{kernel, launch_bounds, launch_contract, thread, DisjointSlice};
+use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
 
 #[cuda_module]
@@ -165,22 +165,8 @@ pub(in crate::cuda) mod kernels {
     }
 
     #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(domain = 2, block = (16, 16, 1))]
-    pub fn matrix_multiply_fp32(
-        matrix1: span::DeviceSliceDescriptor<f32>,
-        matrix2: span::DeviceSliceDescriptor<f32>,
-        result: span::DeviceSliceMutDescriptor<f32>,
-        len: usize,
-        rows: usize,
-        cols: usize,
-    ) {
-        gemm::matrix_multiply_fp32_device(matrix1, matrix2, result, len, rows, cols);
-    }
-
-    #[kernel]
     #[launch_bounds(128)]
-    #[launch_contract(domain = 2, block = (128, 1, 1))]
+    #[launch_contract(domain = 1, block = (128, 1, 1))]
     pub fn matrix_multiply(
         matrix1: span::DeviceSliceDescriptor<f32>,
         matrix2: span::DeviceSliceDescriptor<f32>,
@@ -190,20 +176,6 @@ pub(in crate::cuda) mod kernels {
         cols: usize,
     ) {
         gemm::matrix_multiply_device(matrix1, matrix2, result, len, rows, cols);
-    }
-
-    #[kernel]
-    #[launch_bounds(128)]
-    #[launch_contract(domain = 1, block = (128, 1, 1))]
-    pub fn matrix_multiply_at(
-        matrix1: span::DeviceSliceDescriptor<f32>,
-        matrix2: span::DeviceSliceDescriptor<f32>,
-        result: span::DeviceSliceMutDescriptor<f32>,
-        len: usize,
-        rows: usize,
-        cols: usize,
-    ) {
-        gemm2::matrix_multiply_at_device(matrix1, matrix2, result, len, rows, cols);
     }
 
     #[kernel]

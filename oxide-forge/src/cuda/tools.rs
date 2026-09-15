@@ -1,13 +1,14 @@
 use cuda_device::async_copy::{
-    cp_async_ca_zfill_16, cp_async_ca_zfill_4, cp_async_ca_zfill_8, cp_async_commit_group,
+    cp_async_ca_zfill_4, cp_async_ca_zfill_8, cp_async_ca_zfill_16, cp_async_commit_group,
     cp_async_wait_group,
 };
 pub mod index;
 pub mod tensor;
 
 pub(super) struct DoubleBuffer<S: Copy> {
-    stages: [*mut S; 2],
-    current: usize,
+    stage0: *mut S,
+    stage1: *mut S,
+    current_is_stage1: bool,
 }
 
 impl<S: Copy> DoubleBuffer<S> {
@@ -27,8 +28,9 @@ impl<S: Copy> DoubleBuffer<S> {
         count: usize,
     ) -> Self {
         let buffer = Self {
-            stages: [stage0, stage1],
-            current: 0,
+            stage0,
+            stage1,
+            current_is_stage1: false,
         };
         unsafe { buffer.copy_current_async(destination_offset, source, valid_elements, count) };
         buffer
@@ -36,12 +38,20 @@ impl<S: Copy> DoubleBuffer<S> {
 
     #[inline(always)]
     pub(super) fn current(&self) -> *mut S {
-        self.stages[self.current]
+        if self.current_is_stage1 {
+            self.stage1
+        } else {
+            self.stage0
+        }
     }
 
     #[inline(always)]
     pub(super) fn writable(&self) -> *mut S {
-        self.stages[self.current ^ 1]
+        if self.current_is_stage1 {
+            self.stage0
+        } else {
+            self.stage1
+        }
     }
 
     #[inline(always)]
@@ -95,7 +105,7 @@ impl<S: Copy> DoubleBuffer<S> {
     /// participating in the same copy group after `ready_blocking` or `wait`.
     #[inline(always)]
     pub(super) fn advance(&mut self) {
-        self.current ^= 1;
+        self.current_is_stage1 = !self.current_is_stage1;
     }
 
     #[inline(always)]

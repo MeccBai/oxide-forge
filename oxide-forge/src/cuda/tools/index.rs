@@ -54,8 +54,6 @@ pub fn get_global_thread_id() -> usize {
     block_id * threads_per_block + thread_id
 }
 
-/// Returns a unique warp index across the complete launch. Partial tail warps
-/// remain local to their block and are never merged with the following block.
 #[device]
 pub fn get_global_warp_id() -> usize {
     let thread_id = thread::threadIdx_x() as usize

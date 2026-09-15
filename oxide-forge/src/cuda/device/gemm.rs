@@ -1,373 +1,271 @@
-use crate::cuda::span;
-use cuda_device::{
-    async_copy::{cp_async_ca_zfill_4, cp_async_commit_group, cp_async_wait_group},
-    convert, device, shared, thread, wmma,
-};
+use crate::cuda::tools::DoubleBuffer;
+use crate::cuda::{span, tools};
+use cuda_device::{convert, device, shared, wmma};
 
-const MATMUL_TILE_SIZE: usize = 32;
-const MATMUL_THREAD_TILE_SIZE: usize = 16;
-const MATMUL_SHARED_SIZE: usize = MATMUL_TILE_SIZE * MATMUL_TILE_SIZE;
-const TENSOR_K_TILE_SIZE: usize = 16;
-const TENSOR_SHARED_STRIDE: usize = 20;
-const TENSOR_SHARED_STAGE_SIZE: usize = MATMUL_TILE_SIZE * TENSOR_SHARED_STRIDE;
-const TENSOR_SHARED_SIZE: usize = TENSOR_SHARED_STAGE_SIZE * 2;
+pub(super) const TILE_SIZE: usize = 16;
+const K_STEP: usize = 8;
+pub(super) const BLOCK_TILE_AXIS: usize = 2;
+pub(super) const STAGE_SIZE: usize = BLOCK_TILE_AXIS * TILE_SIZE * TILE_SIZE;
+
+// Swizzle<B, M, S> uses the same bit roles as CuTe, expressed in f32 element
+// offsets. M=2 preserves each 16-byte cp.async vector. CUTLASS's canonical
+// 128-byte starting point is <3, 2, 3> in these units; NCU selects <3, 2, 2>
+// for this kernel's manual TF32 fragment loads because it removes every shared
+// load bank conflict. Keep these compile-time constants for cheap NCU sweeps.
+const SWIZZLE_BITS: usize = 3;
+const SWIZZLE_BASE: usize = 2;
+const SWIZZLE_SHIFT: usize = 2;
+
+#[inline(always)]
+pub(super) fn swizzled_index(row: usize, col: usize) -> usize {
+    let offset = row * TILE_SIZE + col;
+    if SWIZZLE_BITS == 0 {
+        return offset;
+    }
+
+    let bit_mask = (1usize << SWIZZLE_BITS) - 1;
+    let source_mask = bit_mask << (SWIZZLE_BASE + SWIZZLE_SHIFT);
+    offset ^ ((offset & source_mask) >> SWIZZLE_SHIFT)
+}
+
+pub(super) struct TileSources {
+    pub(super) a: *const f32,
+    pub(super) b: *const f32,
+    pub(super) destination: usize,
+    pub(super) a_valid: usize,
+    pub(super) b_valid: usize,
+}
 
 #[device]
-pub(super) fn matrix_multiply_fp32_device(
-    matrix1: span::DeviceSliceDescriptor<f32>,
-    matrix2: span::DeviceSliceDescriptor<f32>,
-    result: span::DeviceSliceMutDescriptor<f32>,
-    len: usize,
+pub(super) fn tile_sources(
+    matrix_a: *const f32,
+    matrix_b: *const f32,
+    block_row: usize,
+    block_col: usize,
+    k_tile: usize,
+    thread_id: usize,
+    inner: usize,
     rows: usize,
     cols: usize,
-) {
-    let tx = thread::threadIdx_x() as usize;
-    let ty = thread::threadIdx_y() as usize;
+) -> TileSources {
+    let subtile = thread_id / 64;
+    let chunk = thread_id % 64;
+    let local_row = chunk / 4;
+    let local_col = (chunk % 4) * 4;
+    let a_row = (block_row * BLOCK_TILE_AXIS + subtile) * TILE_SIZE + local_row;
+    let a_col = k_tile * TILE_SIZE + local_col;
+    let b_row = k_tile * TILE_SIZE + local_row;
+    let b_col = (block_col * BLOCK_TILE_AXIS + subtile) * TILE_SIZE + local_col;
 
-    let row0 = thread::blockIdx_y() as usize * MATMUL_TILE_SIZE + ty;
-    let row1 = row0 + MATMUL_THREAD_TILE_SIZE;
-    let col0 = thread::blockIdx_x() as usize * MATMUL_TILE_SIZE + tx;
-    let col1 = col0 + MATMUL_THREAD_TILE_SIZE;
+    let a_valid = if a_row < rows && a_col < inner {
+        (inner - a_col).min(4)
+    } else {
+        0
+    };
+    let b_valid = if b_row < inner && b_col < cols {
+        (cols - b_col).min(4)
+    } else {
+        0
+    };
 
-    static mut SHARED_MATRIX1: shared::SharedArray<f32, MATMUL_SHARED_SIZE> =
-        shared::SharedArray::UNINIT;
-    static mut SHARED_MATRIX2: shared::SharedArray<f32, MATMUL_SHARED_SIZE> =
-        shared::SharedArray::UNINIT;
+    let a = if a_valid == 0 {
+        matrix_a
+    } else {
+        unsafe { matrix_a.add(a_row * inner + a_col) }
+    };
+    let b = if b_valid == 0 {
+        matrix_b
+    } else {
+        unsafe { matrix_b.add(b_row * cols + b_col) }
+    };
 
-    let mut sum00 = 0.0;
-    let mut sum01 = 0.0;
-    let mut sum10 = 0.0;
-    let mut sum11 = 0.0;
-
-    for tile in 0..len.div_ceil(MATMUL_TILE_SIZE) {
-        let k0 = tile * MATMUL_TILE_SIZE + tx;
-        let k1 = k0 + MATMUL_THREAD_TILE_SIZE;
-        let b_row0 = tile * MATMUL_TILE_SIZE + ty;
-        let b_row1 = b_row0 + MATMUL_THREAD_TILE_SIZE;
-
-        unsafe {
-            SHARED_MATRIX1[ty * MATMUL_TILE_SIZE + tx] = if row0 < rows && k0 < len {
-                matrix1.read(row0 * len + k0)
-            } else {
-                0.0
-            };
-            SHARED_MATRIX1[ty * MATMUL_TILE_SIZE + tx + MATMUL_THREAD_TILE_SIZE] =
-                if row0 < rows && k1 < len {
-                    matrix1.read(row0 * len + k1)
-                } else {
-                    0.0
-                };
-            SHARED_MATRIX1[(ty + MATMUL_THREAD_TILE_SIZE) * MATMUL_TILE_SIZE + tx] =
-                if row1 < rows && k0 < len {
-                    matrix1.read(row1 * len + k0)
-                } else {
-                    0.0
-                };
-            SHARED_MATRIX1[(ty + MATMUL_THREAD_TILE_SIZE) * MATMUL_TILE_SIZE
-                + tx
-                + MATMUL_THREAD_TILE_SIZE] = if row1 < rows && k1 < len {
-                matrix1.read(row1 * len + k1)
-            } else {
-                0.0
-            };
-
-            SHARED_MATRIX2[ty * MATMUL_TILE_SIZE + tx] = if b_row0 < len && col0 < cols {
-                matrix2.read(b_row0 * cols + col0)
-            } else {
-                0.0
-            };
-            SHARED_MATRIX2[ty * MATMUL_TILE_SIZE + tx + MATMUL_THREAD_TILE_SIZE] =
-                if b_row0 < len && col1 < cols {
-                    matrix2.read(b_row0 * cols + col1)
-                } else {
-                    0.0
-                };
-            SHARED_MATRIX2[(ty + MATMUL_THREAD_TILE_SIZE) * MATMUL_TILE_SIZE + tx] =
-                if b_row1 < len && col0 < cols {
-                    matrix2.read(b_row1 * cols + col0)
-                } else {
-                    0.0
-                };
-            SHARED_MATRIX2[(ty + MATMUL_THREAD_TILE_SIZE) * MATMUL_TILE_SIZE
-                + tx
-                + MATMUL_THREAD_TILE_SIZE] = if b_row1 < len && col1 < cols {
-                matrix2.read(b_row1 * cols + col1)
-            } else {
-                0.0
-            };
-        }
-        thread::sync_threads();
-
-        for k in 0..MATMUL_TILE_SIZE {
-            unsafe {
-                let a0 = SHARED_MATRIX1[ty * MATMUL_TILE_SIZE + k];
-                let a1 = SHARED_MATRIX1[(ty + MATMUL_THREAD_TILE_SIZE) * MATMUL_TILE_SIZE + k];
-                let b0 = SHARED_MATRIX2[k * MATMUL_TILE_SIZE + tx];
-                let b1 = SHARED_MATRIX2[k * MATMUL_TILE_SIZE + tx + MATMUL_THREAD_TILE_SIZE];
-                sum00 += a0 * b0;
-                sum01 += a0 * b1;
-                sum10 += a1 * b0;
-                sum11 += a1 * b1;
-            }
-        }
-
-        thread::sync_threads();
-    }
-
-    if row0 < rows && col0 < cols {
-        result.write(row0 * cols + col0, sum00);
-    }
-    if row0 < rows && col1 < cols {
-        result.write(row0 * cols + col1, sum01);
-    }
-    if row1 < rows && col0 < cols {
-        result.write(row1 * cols + col0, sum10);
-    }
-    if row1 < rows && col1 < cols {
-        result.write(row1 * cols + col1, sum11);
+    TileSources {
+        a,
+        b,
+        destination: subtile * TILE_SIZE * TILE_SIZE + swizzled_index(local_row, local_col),
+        a_valid,
+        b_valid,
     }
 }
 
+pub(super) struct Tf32Fragments {
+    pub(super) a: [u32; 4],
+    pub(super) b_left: [u32; 2],
+    pub(super) b_right: [u32; 2],
+}
+
 #[inline(always)]
-unsafe fn prefetch_tensor_tile(
-    matrix1: span::DeviceSliceDescriptor<f32>,
-    matrix2: span::DeviceSliceDescriptor<f32>,
-    shared_matrix1: *mut f32,
-    shared_matrix2: *mut f32,
-    shared_base: usize,
-    tile_k: usize,
-    block_row: usize,
-    block_col: usize,
-    tid: usize,
-    len: usize,
-    rows: usize,
-    cols: usize,
-) {
-    for load in 0..4 {
-        let logical_index = tid + load * 128;
+unsafe fn tf32_at(matrix: *const f32, row: usize, col: usize) -> u32 {
+    unsafe { convert::cvt_rna_tf32_f32(*matrix.add(swizzled_index(row, col))) }
+}
 
-        let local_row = logical_index / TENSOR_K_TILE_SIZE;
-        let local_k = logical_index % TENSOR_K_TILE_SIZE;
-        let global_row = block_row + local_row;
-        let a_valid = global_row < rows;
-        let a_source = if a_valid {
-            unsafe {
-                matrix1
-                    .as_ptr()
-                    .add(global_row * len + tile_k + local_k)
-                    .cast::<u8>()
-            }
-        } else {
-            matrix1.as_ptr().cast::<u8>()
-        };
-        let a_destination =
-            unsafe { shared_matrix1.add(shared_base + local_row * TENSOR_SHARED_STRIDE + local_k) };
-        unsafe {
-            cp_async_ca_zfill_4(
-                a_destination.cast::<u32>(),
-                a_source,
-                if a_valid { 4 } else { 0 },
-            );
-        }
+/// Loads one K=8 slice of swizzled 16x16 A/B shared tiles into the register
+/// layout required by two `mma.m16n8k8.row.col.tf32` instructions.
+#[device]
+pub(super) unsafe fn prefetch_tf32_fragments(
+    matrix_a: *const f32,
+    matrix_b: *const f32,
+    k_offset: usize,
+    lane: usize,
+) -> Tf32Fragments {
+    let group = lane / 4;
+    let thread = lane % 4;
 
-        // Each warp reads one complete global B row. The individual async
-        // copies transpose that row into the column-major shared layout
-        // consumed by mma.sync.
-        let local_k = logical_index / MATMUL_TILE_SIZE;
-        let local_col = logical_index % MATMUL_TILE_SIZE;
-        let global_col = block_col + local_col;
-        let b_valid = global_col < cols;
-        let b_source = if b_valid {
-            unsafe {
-                matrix2
-                    .as_ptr()
-                    .add((tile_k + local_k) * cols + global_col)
-                    .cast::<u8>()
-            }
-        } else {
-            matrix2.as_ptr().cast::<u8>()
-        };
-        let b_destination =
-            unsafe { shared_matrix2.add(shared_base + local_col * TENSOR_SHARED_STRIDE + local_k) };
-        unsafe {
-            cp_async_ca_zfill_4(
-                b_destination.cast::<u32>(),
-                b_source,
-                if b_valid { 4 } else { 0 },
-            );
-        }
-    }
+    let a = unsafe {
+        [
+            tf32_at(matrix_a, group, k_offset + thread),
+            tf32_at(matrix_a, group + 8, k_offset + thread),
+            tf32_at(matrix_a, group, k_offset + thread + 4),
+            tf32_at(matrix_a, group + 8, k_offset + thread + 4),
+        ]
+    };
+    let b_left = unsafe {
+        [
+            tf32_at(matrix_b, k_offset + thread, group),
+            tf32_at(matrix_b, k_offset + thread + 4, group),
+        ]
+    };
+    let b_right = unsafe {
+        [
+            tf32_at(matrix_b, k_offset + thread, group + 8),
+            tf32_at(matrix_b, k_offset + thread + 4, group + 8),
+        ]
+    };
+
+    Tf32Fragments { a, b_left, b_right }
 }
 
 #[device]
 pub(super) fn matrix_multiply_device(
-    matrix1: span::DeviceSliceDescriptor<f32>,
-    matrix2: span::DeviceSliceDescriptor<f32>,
+    matrix_a: span::DeviceSliceDescriptor<f32>,
+    matrix_b: span::DeviceSliceDescriptor<f32>,
     result: span::DeviceSliceMutDescriptor<f32>,
-    len: usize,
+    inner: usize,
     rows: usize,
     cols: usize,
 ) {
-    static mut SHARED_MATRIX1: shared::SharedArray<f32, TENSOR_SHARED_SIZE> =
-        shared::SharedArray::UNINIT;
-    static mut SHARED_MATRIX2: shared::SharedArray<f32, TENSOR_SHARED_SIZE> =
-        shared::SharedArray::UNINIT;
+    static mut MATA0: shared::SharedArray<f32, STAGE_SIZE> = shared::SharedArray::UNINIT;
+    static mut MATA1: shared::SharedArray<f32, STAGE_SIZE> = shared::SharedArray::UNINIT;
+    static mut MATB0: shared::SharedArray<f32, STAGE_SIZE> = shared::SharedArray::UNINIT;
+    static mut MATB1: shared::SharedArray<f32, STAGE_SIZE> = shared::SharedArray::UNINIT;
 
-    let tid = thread::threadIdx_x() as usize;
-    let warp_id = tid / 32;
-    let lane = tid % 32;
+    let local_warp = tools::index::get_warp_id();
+    let block_id = tools::index::get_block_id_1d();
+    let thread_id = tools::index::get_thread_id_1d();
+    let lane = tools::index::get_lane_id();
+    let tile_rows = rows.div_ceil(TILE_SIZE);
+    let tile_cols = cols.div_ceil(TILE_SIZE);
+    let block_tile_cols = tile_cols.div_ceil(BLOCK_TILE_AXIS);
+    let block_row = block_id / block_tile_cols;
+    let block_col = block_id % block_tile_cols;
+    let warp_row = local_warp / BLOCK_TILE_AXIS;
+    let warp_col = local_warp % BLOCK_TILE_AXIS;
+    let tile_row = block_row * BLOCK_TILE_AXIS + warp_row;
+    let tile_col = block_col * BLOCK_TILE_AXIS + warp_col;
+    let active = tile_row < tile_rows && tile_col < tile_cols;
+
+    let a_stage0 = (&raw mut MATA0).cast::<f32>();
+    let a_stage1 = (&raw mut MATA1).cast::<f32>();
+    let b_stage0 = (&raw mut MATB0).cast::<f32>();
+    let b_stage1 = (&raw mut MATB1).cast::<f32>();
+    let source_base = (matrix_a.as_ptr(), matrix_b.as_ptr());
+    let initial = tile_sources(
+        source_base.0,
+        source_base.1,
+        block_row,
+        block_col,
+        0,
+        thread_id,
+        inner,
+        rows,
+        cols,
+    );
+
+    let mut a_buffer = unsafe {
+        DoubleBuffer::initialize(
+            a_stage0,
+            a_stage1,
+            initial.destination,
+            initial.a,
+            initial.a_valid,
+            4,
+        )
+    };
+    let mut b_buffer = unsafe {
+        DoubleBuffer::initialize(
+            b_stage0,
+            b_stage1,
+            initial.destination,
+            initial.b,
+            initial.b_valid,
+            4,
+        )
+    };
+    unsafe { DoubleBuffer::<f32>::ready_blocking() };
+
+    let mut accumulator_left = [0.0f32; 4];
+    let mut accumulator_right = [0.0f32; 4];
+    let k_tiles = inner.div_ceil(TILE_SIZE);
+
+    for k_tile in 0..k_tiles {
+        let has_next = k_tile + 1 < k_tiles;
+        if has_next {
+            let next = tile_sources(
+                source_base.0,
+                source_base.1,
+                block_row,
+                block_col,
+                k_tile + 1,
+                thread_id,
+                inner,
+                rows,
+                cols,
+            );
+            unsafe {
+                a_buffer.copy_async(next.destination, next.a, next.a_valid, 4);
+                b_buffer.copy_async(next.destination, next.b, next.b_valid, 4);
+                DoubleBuffer::<f32>::ready_async();
+            }
+        }
+
+        let current_a = unsafe { a_buffer.current().add(warp_row * TILE_SIZE * TILE_SIZE) };
+        let current_b = unsafe { b_buffer.current().add(warp_col * TILE_SIZE * TILE_SIZE) };
+        let fragments0 = unsafe { prefetch_tf32_fragments(current_a, current_b, 0, lane) };
+        unsafe {
+            accumulator_left =
+                wmma::mma_m16n8k8_f32_tf32(accumulator_left, fragments0.a, fragments0.b_left);
+            accumulator_right =
+                wmma::mma_m16n8k8_f32_tf32(accumulator_right, fragments0.a, fragments0.b_right);
+        }
+
+        let fragments1 = unsafe { prefetch_tf32_fragments(current_a, current_b, K_STEP, lane) };
+        unsafe {
+            accumulator_left =
+                wmma::mma_m16n8k8_f32_tf32(accumulator_left, fragments1.a, fragments1.b_left);
+            accumulator_right =
+                wmma::mma_m16n8k8_f32_tf32(accumulator_right, fragments1.a, fragments1.b_right);
+        }
+
+        if has_next {
+            unsafe { DoubleBuffer::<f32>::wait() };
+            a_buffer.advance();
+            b_buffer.advance();
+        }
+    }
+
     let group = lane / 4;
-    let thread_in_group = lane % 4;
-    let warp_row = warp_id / 2;
-    let warp_col = warp_id % 2;
-
-    let block_row = thread::blockIdx_y() as usize * MATMUL_TILE_SIZE;
-    let block_col = thread::blockIdx_x() as usize * MATMUL_TILE_SIZE;
-
-    let mut accumulator0 = [0.0f32; 4];
-    let mut accumulator1 = [0.0f32; 4];
-
-    let shared_matrix1 = core::ptr::addr_of_mut!(SHARED_MATRIX1) as *mut f32;
-    let shared_matrix2 = core::ptr::addr_of_mut!(SHARED_MATRIX2) as *mut f32;
-    let tile_count = len / TENSOR_K_TILE_SIZE;
-
-    unsafe {
-        prefetch_tensor_tile(
-            matrix1,
-            matrix2,
-            shared_matrix1,
-            shared_matrix2,
-            0,
-            0,
-            block_row,
-            block_col,
-            tid,
-            len,
-            rows,
-            cols,
-        );
-        cp_async_commit_group();
-        cp_async_wait_group(0);
-    }
-    thread::sync_threads();
-
-    for tile in 0..tile_count {
-        let read_base = (tile % 2) * TENSOR_SHARED_STAGE_SIZE;
-
-        if tile + 1 < tile_count {
-            let next_tile = tile + 1;
-            let write_base = (next_tile % 2) * TENSOR_SHARED_STAGE_SIZE;
-            unsafe {
-                prefetch_tensor_tile(
-                    matrix1,
-                    matrix2,
-                    shared_matrix1,
-                    shared_matrix2,
-                    write_base,
-                    next_tile * TENSOR_K_TILE_SIZE,
-                    block_row,
-                    block_col,
-                    tid,
-                    len,
-                    rows,
-                    cols,
-                );
-                cp_async_commit_group();
-            }
-        }
-
-        for k_half in 0..2 {
-            let local_k = k_half * 8;
-            let a_row_base = warp_row * 16;
-            let b_col_base = warp_col * 16;
-
-            let a = unsafe {
-                [
-                    convert::cvt_rna_tf32_f32(
-                        SHARED_MATRIX1[read_base
-                            + (a_row_base + group) * TENSOR_SHARED_STRIDE
-                            + local_k
-                            + thread_in_group],
-                    ),
-                    convert::cvt_rna_tf32_f32(
-                        SHARED_MATRIX1[read_base
-                            + (a_row_base + group + 8) * TENSOR_SHARED_STRIDE
-                            + local_k
-                            + thread_in_group],
-                    ),
-                    convert::cvt_rna_tf32_f32(
-                        SHARED_MATRIX1[read_base
-                            + (a_row_base + group) * TENSOR_SHARED_STRIDE
-                            + local_k
-                            + thread_in_group
-                            + 4],
-                    ),
-                    convert::cvt_rna_tf32_f32(
-                        SHARED_MATRIX1[read_base
-                            + (a_row_base + group + 8) * TENSOR_SHARED_STRIDE
-                            + local_k
-                            + thread_in_group
-                            + 4],
-                    ),
-                ]
-            };
-
-            let b0 = unsafe {
-                [
-                    convert::cvt_rna_tf32_f32(
-                        SHARED_MATRIX2[read_base
-                            + (b_col_base + group) * TENSOR_SHARED_STRIDE
-                            + local_k
-                            + thread_in_group],
-                    ),
-                    convert::cvt_rna_tf32_f32(
-                        SHARED_MATRIX2[read_base
-                            + (b_col_base + group) * TENSOR_SHARED_STRIDE
-                            + local_k
-                            + thread_in_group
-                            + 4],
-                    ),
-                ]
-            };
-            let b1 = unsafe {
-                [
-                    convert::cvt_rna_tf32_f32(
-                        SHARED_MATRIX2[read_base
-                            + (b_col_base + group + 8) * TENSOR_SHARED_STRIDE
-                            + local_k
-                            + thread_in_group],
-                    ),
-                    convert::cvt_rna_tf32_f32(
-                        SHARED_MATRIX2[read_base
-                            + (b_col_base + group + 8) * TENSOR_SHARED_STRIDE
-                            + local_k
-                            + thread_in_group
-                            + 4],
-                    ),
-                ]
-            };
-
-            unsafe {
-                accumulator0 = wmma::mma_m16n8k8_f32_tf32(accumulator0, a, b0);
-                accumulator1 = wmma::mma_m16n8k8_f32_tf32(accumulator1, a, b1);
-            }
-        }
-
-        if tile + 1 < tile_count {
-            unsafe { cp_async_wait_group(0) };
-            thread::sync_threads();
-        }
-    }
-
+    let thread = lane % 4;
     for register in 0..4 {
-        let output_row = block_row + warp_row * 16 + group + if register >= 2 { 8 } else { 0 };
-        let output_col = block_col + warp_col * 16 + thread_in_group * 2 + register % 2;
-
-        if output_row < rows && output_col < cols {
-            result.write(output_row * cols + output_col, accumulator0[register]);
+        let output_row = tile_row * TILE_SIZE + group + if register >= 2 { 8 } else { 0 };
+        let output_col = tile_col * TILE_SIZE + thread * 2 + register % 2;
+        if active && output_row < rows && output_col < cols {
+            result.write(output_row * cols + output_col, accumulator_left[register]);
         }
-        if output_row < rows && output_col + 8 < cols {
-            result.write(output_row * cols + output_col + 8, accumulator1[register]);
+        if active && output_row < rows && output_col + 8 < cols {
+            result.write(
+                output_row * cols + output_col + 8,
+                accumulator_right[register],
+            );
         }
     }
 }
