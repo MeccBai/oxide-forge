@@ -2,20 +2,19 @@
 
 English | [简体中文](README.cn.md)
 
-This workspace contains two deliberately separated members:
+This workspace contains the reusable runtime and its focused benchmark:
 
 - [`oxide-forge`](oxide-forge/README.md): the reusable Rust/CUDA runtime,
   containers, kernels, and neural-network execution layers;
-- [`examples/ocr`](examples/ocr/README.md): the OCR-specific dataset pipeline,
-  model assembly, training program, and inference program.
+- `bench`: the fixed-shape GPU benchmark executable.
 
 ```text
 oxide-forge/       base runtime library
-examples/ocr/      OCR consumer and executable examples
+bench/             runtime benchmark
 ```
 
-The OCR package is the default workspace member, so its training entry point can
-be launched from the repository root with:
+The benchmark is the default workspace member and can be launched through the
+CUDA-Oxide workflow:
 
 ```bash
 cargo oxide run

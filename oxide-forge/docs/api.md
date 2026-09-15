@@ -14,6 +14,8 @@ does not aim for unrestricted generality.
 - `Matrix` and `Vector` own device memory; views and spans borrow it.
 - Views and spans represent contiguous regions only and do not support strides.
 - Column-oriented data must be transposed or physically rearranged first.
+- `net::node` composes explicit forward/backward paths; it does not record or
+  discover an automatic computation graph.
 - Device work on the primary stream is submitted asynchronously whenever
   practical.
 - Reductions that return a host scalar must synchronize.
@@ -124,19 +126,12 @@ let transposed = runtime.matrix_transpose(&a);
 let row_sums = runtime.matrix_sum_rows(&a);
 ```
 
-Element-wise arithmetic is selected through `BinaryOp`:
+Element-wise container arithmetic accepts a device-compilable closure:
 
 ```rust
-pub enum BinaryOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-}
-
-let c = runtime.matrix_binary(&a, &b, BinaryOp::Mul);
-matrix.binary_assign(&rhs, BinaryOp::Add, &runtime);
-matrix.binary_assign_by_rows(&bias, BinaryOp::Add, &runtime);
+let c = runtime.matrix_binary(&a, &b, move |lhs, rhs| lhs * rhs);
+matrix.binary_assign(&rhs, move |lhs, rhs| lhs + rhs, &runtime);
+matrix.binary_assign_by_rows(&bias, move |lhs, rhs| lhs + rhs, &runtime);
 ```
 
 Operand order for subtraction and division is always `lhs - rhs` and
@@ -144,17 +139,16 @@ Operand order for subtraction and division is always `lhs - rhs` and
 wrappers over the generic entry point. `matrix_mul` is element-wise and must not
 be confused with `matrix_multiply`.
 
-The device layer uses one `slice_binary` kernel and one `slice_binary_assign`
-kernel. `BinaryOp` is a host-selected value shared by the entire launch, so this
-abstraction introduces no dynamic dispatch, temporary buffer, or additional
-kernel launch.
+The device layer uses one generic `slice_binary` kernel and one
+`slice_binary_assign` kernel. The copied `move` closure is compiled as device
+code and introduces no dynamic dispatch or additional kernel launch.
 
 | API | Constraint | Output shape |
 | --- | --- | --- |
 | `matrix_multiply(a, b)` | `a.cols == b.rows`; SM80+; M/K/N must currently be multiples of 16 | `[a.rows, b.cols]` |
 | `matrix_add(a, b)` | Identical shapes | Input shape |
 | `matrix_transpose(a)` | No additional shape constraint | `[a.cols, a.rows]` |
-| `matrix_sum_rows(a)` | At most 1024 columns | Vector with `a.rows` elements |
+| `matrix_sum_rows(a)` | Non-empty rows | Vector with `a.rows` elements |
 | `softmax_rows_backward(p, dy)` | Identical shapes; at most 1024 columns | `dScores`, same shape |
 | `layer_norm_backward(x, dy)` | Identical shapes; at most 1024 columns | `dX`, same shape |
 
@@ -219,7 +213,7 @@ matrix.for_each(&runtime, move |x| x * 2.0);
 matrix.softmax_rows(&runtime);
 matrix.layer_norm(&runtime);
 matrix.rms_norm(&runtime);
-matrix.binary_assign_by_rows(&bias, BinaryOp::Add, &runtime);
+matrix.binary_assign_by_rows(&bias, move |lhs, rhs| lhs + rhs, &runtime);
 ```
 
 | API | Synchronization behavior |
@@ -249,6 +243,10 @@ reduction is involved.
 | `broadcast(vector, copies)` | `[copies, vector.len]` Matrix | Yes |
 | `extract_vector(matrix)` | Transfers a single-row buffer; copies the first row otherwise | Depends |
 | `matrix_slice(matrix, cols, rows)` | Physically rearranged contiguous matrix blocks | Yes |
+| `matrix_concat_rows(matrices)` | Concatenate complete row ranges | Yes |
+| `matrix_concat_cols(matrices)` | Physically interleave row segments by columns | Yes |
+| `matrix_split_rows(matrix, sizes)` | Independently owned row partitions | Yes |
+| `matrix_split_cols(matrix, sizes)` | Physically rearranged column partitions | Yes |
 | `matrix_into_vector(matrix)` | Consumes the Matrix and transfers its entire buffer | No |
 | `vector_into_matrix(vector)` | Consumes the Vector and transfers its buffer as one column | No |
 | `clone_matrix(matrix)` | Independent Matrix with the same shape | Yes |
@@ -287,7 +285,8 @@ let custom = vector.map_reduce(&mut runtime, 0.0, move |x| x, move |a, b| a + b)
 vector.softmax(&mut runtime);
 
 let c = runtime.vector_add(&a, &b);
-let product = runtime.vector_binary(&a, &b, BinaryOp::Mul);
+let product = runtime.vector_binary(&a, &b, move |lhs, rhs| lhs * rhs);
+vector.binary_assign(&rhs, &runtime, move |lhs, rhs| lhs + rhs);
 let dot = a.dot(&b, &mut runtime);
 ```
 
@@ -365,6 +364,111 @@ runtime.concat_buffers_from_span(&spans);
 - `into_span` consumes a mutable span and downgrades it to an immutable span
   without copying.
 - Spans do not support strides.
+
+## Explicit Compute Nodes
+
+`net::node` fills the composition layer between complete modules such as MLPs
+and Transformers. It deliberately does not build an automatic graph. Model code
+writes forward in execution order and calls the matching training nodes in
+reverse order during backward.
+
+All node values operate on `Matrix`. A row may represent one logical feature
+vector, while preserving the shape information required by row Softmax and
+normalization. Stateless nodes are intended for inference. Their `Training*`
+counterparts retain only the state mathematically required by one backward pass.
+
+### BinaryNode
+
+```rust
+use oxide_forge::net::node::{BinaryNode, BinaryOp, TrainingBinaryNode};
+
+let add = BinaryNode::new(BinaryOp::Add);
+let output = add.forward(&[&left, &right], &mut runtime);
+
+let mut multiply = TrainingBinaryNode::new(BinaryOp::Mul);
+let output = multiply.forward(vec![left, right], &mut runtime);
+let [left_gradient, right_gradient]: [Matrix; 2] = multiply
+    .backward(output_gradient, &mut runtime)
+    .try_into()
+    .unwrap();
+```
+
+| `BinaryOp` | Forward | Backward state |
+| --- | --- | --- |
+| `Add` | Element-wise sum of two or more equal-shaped matrices | Input count only |
+| `Sub` | `lhs - rhs` | None |
+| `Mul` | Element-wise product | Both inputs |
+| `Div` | Element-wise `lhs / rhs` | Both inputs |
+| `MatMul` | Matrix product | Both inputs |
+
+`forward_owned` consumes inference inputs. Element-wise operations reuse the
+first allocation as output; MatMul allocates its differently shaped result.
+`TrainingBinaryNode::forward` also consumes inputs, moving Mul/Div/MatMul
+operands directly into its cache without a device copy. `forward_borrowed` is
+available only for Add and Sub because their derivatives do not depend on the
+forward values.
+
+MatMul backward computes `dA = dY @ B^T` and `dB = A^T @ dY`; therefore the
+same Tensor Core shape constraints as `CudaRuntime::matrix_multiply` apply to
+its forward and backward products.
+
+### SingleNode
+
+```rust
+use oxide_forge::net::{
+    linear::Activation,
+    node::{SingleNode, SingleType, TrainingSingleNode},
+};
+
+let relu = SingleNode::new(SingleType::Activation(Activation::Relu));
+let output = relu.forward(input, &mut runtime);
+
+let mut norm = TrainingSingleNode::new(SingleType::LayerNorm);
+let output = norm.forward(input, &mut runtime);
+let input_gradient = norm.backward(output_gradient, &mut runtime);
+```
+
+`SingleType` supports `Activation(Identity/Gelu/Relu/Silu/Sigmoid)`, `Scale`,
+`Softmax`, `LayerNorm`, `RmsNorm`, and `Transpose`. Scale, Identity, and
+Transpose need no numerical forward cache. Activations and normalization retain
+their input; Softmax retains its probability output. Transpose backward is
+another physical transpose.
+
+### Concat and Split
+
+```rust
+use oxide_forge::net::node::{
+    MatrixAxis, TrainingConcatNode, TrainingSplitNode,
+};
+
+let mut concat = TrainingConcatNode::new(MatrixAxis::Columns);
+let joined = concat.forward(vec![left, right], &mut runtime);
+let branch_gradients = concat.backward(joined_gradient, &mut runtime);
+
+let mut split = TrainingSplitNode::new(MatrixAxis::Rows, vec![16, 32]);
+let branches = split.forward(input, &mut runtime);
+let input_gradient = split.backward(branch_gradients, &mut runtime);
+```
+
+`ConcatNode`/`TrainingConcatNode` and `SplitNode`/`TrainingSplitNode` support
+rows and columns. Sizes describe row counts for `Rows` and column counts for
+`Columns`, must be non-zero, and must cover the input exactly. Every output owns
+contiguous row-major storage. Column operations physically rearrange data rather
+than creating a strided view.
+
+### RowReduceNode
+
+```rust
+use oxide_forge::net::node::{RowReduction, TrainingRowReduceNode};
+
+let mut mean = TrainingRowReduceNode::new(RowReduction::Mean);
+let row_means = mean.forward(input, &mut runtime); // [rows, 1]
+let input_gradient = mean.backward(row_gradient, &mut runtime);
+```
+
+`RowReduction::Sum` and `Mean` reduce `[rows, cols]` to `[rows, 1]`. Training
+retains only the input shape. Backward physically broadcasts each row gradient
+to a new contiguous `[rows, cols]` Matrix; Mean additionally divides by `cols`.
 
 ## Network Layers
 

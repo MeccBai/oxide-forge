@@ -14,6 +14,101 @@ impl Matrix {
 }
 
 impl CudaRuntime {
+    /// Concatenates equally wide matrices by appending complete rows.
+    pub fn matrix_concat_rows(&mut self, matrices: &[&Matrix]) -> Matrix {
+        assert!(
+            !matrices.is_empty(),
+            "matrix concat requires at least one input"
+        );
+        let cols = matrices[0].cols;
+        let rows = matrices
+            .iter()
+            .map(|matrix| {
+                assert_eq!(matrix.cols, cols, "row concat column mismatch");
+                matrix.rows
+            })
+            .try_fold(0usize, usize::checked_add)
+            .expect("row concat size overflow");
+        let buffers = matrices
+            .iter()
+            .map(|matrix| &matrix.buffer)
+            .collect::<Vec<_>>();
+        let buffer = self.concat_buffers(&buffers);
+        self.create_matrix(buffer, rows, cols)
+    }
+
+    /// Concatenates equally tall matrices by physically interleaving each
+    /// row's contiguous segments into a new row-major allocation.
+    pub fn matrix_concat_cols(&mut self, matrices: &[&Matrix]) -> Matrix {
+        assert!(
+            !matrices.is_empty(),
+            "matrix concat requires at least one input"
+        );
+        let rows = matrices[0].rows;
+        let cols = matrices
+            .iter()
+            .map(|matrix| {
+                assert_eq!(matrix.rows, rows, "column concat row mismatch");
+                matrix.cols
+            })
+            .try_fold(0usize, usize::checked_add)
+            .expect("column concat size overflow");
+
+        let mut spans = Vec::with_capacity(rows.saturating_mul(matrices.len()));
+        for row in 0..rows {
+            for matrix in matrices {
+                spans.push(DeviceSpan::from_buffer(
+                    &matrix.buffer,
+                    row.checked_mul(matrix.cols).expect("row offset overflow"),
+                    matrix.cols,
+                ));
+            }
+        }
+        let buffer = self.concat_buffers_from_span(&spans);
+        self.create_matrix(buffer, rows, cols)
+    }
+
+    pub fn matrix_split_rows(&mut self, matrix: &Matrix, row_sizes: &[usize]) -> Vec<Matrix> {
+        validate_partition(row_sizes, matrix.rows, "row");
+        let mut offset = 0usize;
+        row_sizes
+            .iter()
+            .map(|&rows| {
+                let len = rows
+                    .checked_mul(matrix.cols)
+                    .expect("row split size overflow");
+                let span = DeviceSpan::from_buffer(&matrix.buffer, offset, len);
+                offset += len;
+                let buffer = span.to_buffer(self);
+                self.create_matrix(buffer, rows, matrix.cols)
+            })
+            .collect()
+    }
+
+    pub fn matrix_split_cols(&mut self, matrix: &Matrix, col_sizes: &[usize]) -> Vec<Matrix> {
+        validate_partition(col_sizes, matrix.cols, "column");
+        let mut column_offset = 0usize;
+        col_sizes
+            .iter()
+            .map(|&cols| {
+                let spans = (0..matrix.rows)
+                    .map(|row| {
+                        DeviceSpan::from_buffer(
+                            &matrix.buffer,
+                            row.checked_mul(matrix.cols)
+                                .and_then(|offset| offset.checked_add(column_offset))
+                                .expect("column split offset overflow"),
+                            cols,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                column_offset += cols;
+                let buffer = self.concat_buffers_from_span(&spans);
+                self.create_matrix(buffer, matrix.rows, cols)
+            })
+            .collect()
+    }
+
     pub fn matrix_transpose(&mut self, mat: &Matrix) -> Matrix {
         let rows = mat.cols;
         let cols = mat.rows;
@@ -148,4 +243,21 @@ impl CudaRuntime {
         let rows = vector.buffer.len();
         self.create_matrix(vector.buffer, rows, 1)
     }
+}
+
+fn validate_partition(sizes: &[usize], expected: usize, axis: &str) {
+    assert!(
+        !sizes.is_empty(),
+        "matrix split requires at least one output"
+    );
+    assert!(
+        sizes.iter().all(|&size| size > 0),
+        "matrix split sizes must be non-zero"
+    );
+    let total = sizes
+        .iter()
+        .copied()
+        .try_fold(0usize, usize::checked_add)
+        .expect("matrix split size overflow");
+    assert_eq!(total, expected, "{axis} split sizes do not cover input");
 }

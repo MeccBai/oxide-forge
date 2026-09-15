@@ -11,10 +11,15 @@ impl SingleNode {
         self.op
     }
 
-    /// Inference path: consumes and transforms its input without keeping a
-    /// second device allocation alive.
+    /// Inference path: consumes its input and recycles it when the operation
+    /// necessarily creates a differently laid out result.
     pub fn forward(&self, mut input: Matrix, runtime: &mut CudaRuntime) -> Matrix {
-        apply(self.op, &mut input, runtime);
+        if let SingleType::Transpose = self.op {
+            let output = runtime.matrix_transpose(&input);
+            runtime.recycle_matrix(input);
+            return output;
+        }
+        apply_in_place(self.op, &mut input, runtime);
         input
     }
 }
@@ -37,10 +42,14 @@ impl TrainingSingleNode {
         self.forward_pending = true;
 
         match self.node.op {
-            SingleType::Scale(_) => self.node.forward(input, runtime),
-            SingleType::LayerNorm | SingleType::RmsNorm => {
+            SingleType::Scale(_)
+            | SingleType::Transpose
+            | SingleType::Activation(crate::net::linear::Activation::Identity) => {
+                self.node.forward(input, runtime)
+            }
+            SingleType::Activation(_) | SingleType::LayerNorm | SingleType::RmsNorm => {
                 let mut output = runtime.clone_matrix(&input);
-                apply(self.node.op, &mut output, runtime);
+                apply_in_place(self.node.op, &mut output, runtime);
                 self.cache = Some(SingleCache::Input(input));
                 output
             }
@@ -62,6 +71,26 @@ impl TrainingSingleNode {
         match self.node.op {
             SingleType::Scale(scale) => {
                 output_gradient.scale(scale, runtime);
+                output_gradient
+            }
+            SingleType::Transpose => self.node.forward(output_gradient, runtime),
+            SingleType::Activation(crate::net::linear::Activation::Identity) => output_gradient,
+            SingleType::Activation(activation) => {
+                let SingleCache::Input(input) = self
+                    .cache
+                    .take()
+                    .expect("Activation forward input cache missing")
+                else {
+                    unreachable!()
+                };
+                let mut derivative = input;
+                derivative.for_each(runtime, move |value| activation.derivative(value));
+                output_gradient.binary_assign(
+                    &derivative,
+                    move |gradient, derivative| gradient * derivative,
+                    runtime,
+                );
+                runtime.recycle_matrix(derivative);
                 output_gradient
             }
             SingleType::Softmax => {
@@ -117,11 +146,15 @@ impl TrainingSingleNode {
     }
 }
 
-fn apply(op: SingleType, matrix: &mut Matrix, runtime: &CudaRuntime) {
+fn apply_in_place(op: SingleType, matrix: &mut Matrix, runtime: &CudaRuntime) {
     match op {
+        SingleType::Activation(activation) => {
+            matrix.for_each(runtime, move |value| activation.forward(value))
+        }
         SingleType::Softmax => matrix.softmax_rows(runtime),
         SingleType::RmsNorm => matrix.rms_norm(runtime),
         SingleType::LayerNorm => matrix.layer_norm(runtime),
         SingleType::Scale(scale) => matrix.scale(scale, runtime),
+        SingleType::Transpose => unreachable!("transpose is not an in-place operation"),
     }
 }

@@ -31,6 +31,9 @@ Implemented capabilities include:
 - row-wise Softmax, LayerNorm, and RMSNorm, all with backward kernels;
 - Linear, reusable GELU/ReLU/SiLU/Sigmoid activations, MLP, BCE-with-logits,
   residual connections, and their backward paths;
+- explicit differentiable compute nodes for element-wise arithmetic, MatMul,
+  activations, normalization, transpose, row reduction, and contiguous
+  concat/split;
 - single-head Post-Norm Transformer executors with selectable LayerNorm/RMSNorm
   inference and training;
 - parameter checkpoint save/load for MLP and Transformer executors;
@@ -73,6 +76,15 @@ independent work and are explicitly rejoined.
 The runtime currently uses `f32` and targets known model shapes. Generality is
 added only when it does not impose significant complexity or performance cost.
 Optimization follows profiler evidence instead of speculative abstraction.
+
+### Explicit networks instead of autograd
+
+OxideForge does not record a dynamic computation graph. Networks are ordinary
+Rust modules assembled from layers and nodes: forward calls them in execution
+order, and backward calls the corresponding training components in reverse
+order. Branching, residual addition, concatenation, and gradient routing are
+explicit. This keeps cache ownership and device allocation visible without
+duplicating the model as a runtime graph.
 
 ## Execution Model
 
@@ -118,8 +130,8 @@ cargo check -p oxide-forge
 ```
 
 Executable consumers must use the CUDA-Oxide build workflow so the device
-artifact is compiled and linked. The workspace's
-[OCR example](../examples/ocr/README.md) is one complete consumer.
+artifact is compiled and linked. The workspace `bench` package is the current
+executable consumer and performance harness.
 
 ## Minimal Example
 
@@ -159,6 +171,7 @@ src/
     ├── linear.rs          Linear, activation, and parameter updates
     ├── metadata.rs        public parameter metadata and host data
     ├── mlp.rs             inference/training MLP executors
+    ├── node/              explicit differentiable composition operations
     └── transformer/       attention, encoder, decoder, and position encoding
 docs/
 └── api.md                 complete runtime API reference
@@ -171,6 +184,7 @@ synchronization, and network-layer reference.
 
 - `f32` only;
 - contiguous row-major matrices only; no stride support;
+- explicit forward/backward composition only; no automatic computation graph;
 - matrix multiplication uses Tensor Core TF32 products with `f32` accumulation
   and output, requires SM80+, and currently requires M/K/N dimensions to be
   multiples of 16;
@@ -178,7 +192,8 @@ synchronization, and network-layer reference.
   elements per row;
 - the current Transformer is single-head and Post-Norm; inference and training
   support LayerNorm or RMSNorm;
-- parameter updates use direct SGD rather than a general optimizer abstraction;
+- parameter updates currently use classical Momentum SGD rather than a general
+  optimizer abstraction;
 - checkpoint format version 1 stores little-endian `f32` parameters; unsupported
   versions are rejected explicitly.
 
