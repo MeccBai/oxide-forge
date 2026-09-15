@@ -3,6 +3,7 @@ use crate::cuda::runtime::CudaRuntime;
 use crate::net::linear::{Linear, LinearMetadata};
 use crate::net::metadata::{HostData, MetadataCursor};
 use crate::net::mlp::{InferenceMLP, MlpMetadata};
+use crate::net::node::{BinaryNode, BinaryOp, SingleNode, SingleType};
 use cuda_core::CudaStream;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -27,6 +28,8 @@ pub(super) struct InferenceBlock {
     position_encoding: PositionEncoding,
     fcs: InferenceMLP,
     output_matrix: Linear,
+    feed_forward_residual: BinaryNode,
+    feed_forward_normalization: SingleNode,
 }
 
 impl InferenceBlock {
@@ -45,6 +48,11 @@ impl InferenceBlock {
             position_encoding,
             fcs,
             output_matrix,
+            feed_forward_residual: BinaryNode::new(BinaryOp::Add),
+            feed_forward_normalization: SingleNode::new(match norm_type {
+                NormType::Layer => SingleType::LayerNorm,
+                NormType::Rms => SingleType::RmsNorm,
+            }),
         }
     }
 
@@ -93,11 +101,10 @@ impl InferenceBlock {
         runtime.recycle_matrix(positioned);
 
         let ffn = self.fcs.forward(&x, runtime);
-        let mut output = runtime.matrix_add(&x, &ffn);
-        runtime.recycle_matrix(x);
-        runtime.recycle_matrix(ffn);
-
-        self.attention.normalize(&mut output, runtime);
+        let output = self
+            .feed_forward_residual
+            .forward_owned(vec![x, ffn], runtime);
+        let output = self.feed_forward_normalization.forward(output, runtime);
 
         let result = self.output_matrix.forward(&output, None, runtime, None);
         runtime.recycle_matrix(output);

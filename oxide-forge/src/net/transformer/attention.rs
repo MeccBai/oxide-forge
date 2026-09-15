@@ -1,6 +1,9 @@
 use crate::cuda::{container::Matrix, runtime::CudaRuntime};
 use crate::net::linear::{Linear, LinearMetadata, LinearMomentum};
 use crate::net::metadata::{HostData, MetadataCursor};
+use crate::net::node::{
+    BinaryNode, BinaryOp, SingleNode, SingleType, TrainingBinaryNode, TrainingSingleNode,
+};
 use cuda_core::CudaStream;
 use std::sync::Arc;
 
@@ -111,7 +114,7 @@ impl QkvProjection {
         value_gradient: &Matrix,
         runtime: &mut CudaRuntime,
     ) -> Matrix {
-        let mut input_gradient: Option<Matrix> = None;
+        let mut input_gradients = Vec::with_capacity(3);
         let [query_optimizer, key_optimizer, value_optimizer] = &mut self.optimizers;
 
         for (linear, optimizer, projected_gradient) in [
@@ -126,16 +129,12 @@ impl QkvProjection {
                 linear.backward(pre_activation.as_ref(), projected_gradient, runtime, None);
             let current_input_gradient = linear.input_gradient(&gradient, runtime, None);
 
-            if let Some(total) = &mut input_gradient {
-                total.binary_assign(&current_input_gradient, move |lhs,rhs| lhs+rhs, runtime);
-            } else {
-                input_gradient = Some(current_input_gradient);
-            }
+            input_gradients.push(current_input_gradient);
 
             optimizer.accumulate(input, &gradient, bias_gradient.as_ref(), runtime);
         }
 
-        input_gradient.unwrap()
+        BinaryNode::new(BinaryOp::Add).forward_owned(input_gradients, runtime)
     }
 
     pub(super) fn step(
@@ -156,39 +155,13 @@ impl QkvProjection {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Normalization {
-    kind: NormType,
-}
-
-impl Normalization {
-    fn new(kind: NormType) -> Self {
-        Self { kind }
-    }
-
-    fn forward(self, matrix: &mut Matrix, runtime: &mut CudaRuntime) {
-        match self.kind {
-            NormType::Layer => matrix.layer_norm(runtime),
-            NormType::Rms => matrix.rms_norm(runtime),
-        }
-    }
-
-    fn backward(
-        self,
-        input: &Matrix,
-        output_gradient: &Matrix,
-        runtime: &mut CudaRuntime,
-    ) -> Matrix {
-        match self.kind {
-            NormType::Layer => runtime.layer_norm_backward(input, output_gradient),
-            NormType::Rms => runtime.rms_norm_backward(input, output_gradient),
-        }
-    }
-}
-
 pub(super) struct Attention {
     qkv: QkvProjection,
-    normalization: Normalization,
+    norm_type: NormType,
+    residual: BinaryNode,
+    normalization: SingleNode,
+    training_residual: TrainingBinaryNode,
+    training_normalization: TrainingSingleNode,
     training_cache: Option<AttentionCache>,
 }
 
@@ -198,7 +171,6 @@ struct AttentionCache {
     key: Matrix,
     value: Matrix,
     probabilities: Matrix,
-    pre_norm: Matrix,
 }
 
 impl Attention {
@@ -209,15 +181,23 @@ impl Attention {
         streams: Option<Vec<Arc<CudaStream>>>,
         norm_type: NormType,
     ) -> Self {
+        let normalization = match norm_type {
+            NormType::Layer => SingleType::LayerNorm,
+            NormType::Rms => SingleType::RmsNorm,
+        };
         Self {
             qkv: QkvProjection::new(query, key, value, streams),
-            normalization: Normalization::new(norm_type),
+            norm_type,
+            residual: BinaryNode::new(BinaryOp::Add),
+            normalization: SingleNode::new(normalization),
+            training_residual: TrainingBinaryNode::new(BinaryOp::Add),
+            training_normalization: TrainingSingleNode::new(normalization),
             training_cache: None,
         }
     }
 
     pub(super) fn norm_type(&self) -> NormType {
-        self.normalization.kind
+        self.norm_type
     }
 
     pub(super) fn get_meta_data(&self, cursor: &mut MetadataCursor) -> QkvMetadata {
@@ -258,10 +238,9 @@ impl Attention {
         attention: Matrix,
         runtime: &mut CudaRuntime,
     ) -> Matrix {
-        let mut output = runtime.matrix_add(query_input, &attention);
+        let output = self.residual.forward(&[query_input, &attention], runtime);
         runtime.recycle_matrix(attention);
-        self.normalize(&mut output, runtime);
-        output
+        self.normalization.forward(output, runtime)
     }
 
     /// Self-attention variant that owns the input and retains exactly the state
@@ -276,10 +255,11 @@ impl Attention {
         let probabilities = self.attention_probabilities(&projected, runtime);
         self.qkv.wait_for_value(runtime);
         let attention = runtime.matrix_multiply(&probabilities, &projected.value);
-        let pre_norm = runtime.matrix_add(&input, &attention);
+        let pre_norm = self
+            .training_residual
+            .forward_borrowed(&[&input, &attention], runtime);
         runtime.recycle_matrix(attention);
-        let mut output = runtime.clone_matrix(&pre_norm);
-        self.normalize(&mut output, runtime);
+        let output = self.training_normalization.forward(pre_norm, runtime);
 
         self.training_cache = Some(AttentionCache {
             input,
@@ -287,32 +267,38 @@ impl Attention {
             key: projected.key,
             value: projected.value,
             probabilities,
-            pre_norm,
         });
         output
     }
 
     pub(super) fn backward_self_accumulate(
         &mut self,
-        output_gradient: &Matrix,
+        output_gradient: Matrix,
         runtime: &mut CudaRuntime,
     ) -> Matrix {
         let cache = self
             .training_cache
-            .as_ref()
+            .take()
             .expect("attention forward must run before backward");
-        let residual_gradient =
-            self.normalization
-                .backward(&cache.pre_norm, output_gradient, runtime);
+        let residual_gradient = self
+            .training_normalization
+            .backward(output_gradient, runtime);
+        let [direct_gradient, attention_gradient]: [Matrix; 2] = self
+            .training_residual
+            .backward(residual_gradient, runtime)
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("residual Add has two inputs"));
 
         let value_t = runtime.matrix_transpose(&cache.value);
-        let probabilities_gradient = runtime.matrix_multiply(&residual_gradient, &value_t);
+        let probabilities_gradient = runtime.matrix_multiply(&attention_gradient, &value_t);
         let probabilities_t = runtime.matrix_transpose(&cache.probabilities);
-        let value_gradient = runtime.matrix_multiply(&probabilities_t, &residual_gradient);
+        let value_gradient = runtime.matrix_multiply(&probabilities_t, &attention_gradient);
 
-        let mut score_gradient =
+        let score_gradient =
             runtime.softmax_rows_backward(&cache.probabilities, &probabilities_gradient);
-        score_gradient.scale(1.0 / (cache.query.cols() as f32).sqrt(), runtime);
+        let score_gradient =
+            SingleNode::new(SingleType::Scale(1.0 / (cache.query.cols() as f32).sqrt()))
+                .forward(score_gradient, runtime);
 
         let query_gradient = runtime.matrix_multiply(&score_gradient, &cache.key);
         let score_gradient_t = runtime.matrix_transpose(&score_gradient);
@@ -325,9 +311,9 @@ impl Attention {
             &value_gradient,
             runtime,
         );
-        let mut input_gradient = residual_gradient;
-        input_gradient.binary_assign(&projection_gradient, move |lhs,rhs| lhs+rhs, runtime);
-        input_gradient
+        runtime.recycle_matrix(attention_gradient);
+        BinaryNode::new(BinaryOp::Add)
+            .forward_owned(vec![direct_gradient, projection_gradient], runtime)
     }
 
     pub(super) fn step(
@@ -340,27 +326,14 @@ impl Attention {
         self.qkv.step(learning_rate, momentum, batch_len, runtime);
     }
 
-    pub(super) fn normalize(&self, matrix: &mut Matrix, runtime: &mut CudaRuntime) {
-        self.normalization.forward(matrix, runtime);
-    }
-
-    pub(super) fn normalization_backward(
-        &self,
-        input: &Matrix,
-        output_gradient: &Matrix,
-        runtime: &mut CudaRuntime,
-    ) -> Matrix {
-        self.normalization.backward(input, output_gradient, runtime)
-    }
-
     fn attention_value_inference(
         &self,
         projected: ProjectedQkv,
         runtime: &mut CudaRuntime,
     ) -> Matrix {
-        let mut probabilities =
+        let probabilities =
             self.attention_scores_inference(projected.query, projected.key, runtime);
-        probabilities.softmax_rows(runtime);
+        let probabilities = SingleNode::new(SingleType::Softmax).forward(probabilities, runtime);
         self.attention_value_from_probabilities(probabilities, projected.value, runtime)
     }
 
@@ -372,7 +345,7 @@ impl Attention {
         let mut probabilities =
             self.attention_scores_inference(projected.query, projected.key, runtime);
         probabilities.causal_mask(runtime);
-        probabilities.softmax_rows(runtime);
+        let probabilities = SingleNode::new(SingleType::Softmax).forward(probabilities, runtime);
         self.attention_value_from_probabilities(probabilities, projected.value, runtime)
     }
 
@@ -386,11 +359,11 @@ impl Attention {
         let query_width = query.cols();
         let key_t = runtime.matrix_transpose(&key);
         runtime.recycle_matrix(key);
-        let mut scores = runtime.matrix_multiply(&query, &key_t);
+        let scores = runtime.matrix_multiply(&query, &key_t);
         runtime.recycle_matrix(query);
         runtime.recycle_matrix(key_t);
-        scores.scale(1.0 / (query_width as f32).sqrt(), runtime);
-        scores
+        SingleNode::new(SingleType::Scale(1.0 / (query_width as f32).sqrt()))
+            .forward(scores, runtime)
     }
 
     fn attention_value_from_probabilities(
@@ -413,10 +386,12 @@ impl Attention {
     ) -> Matrix {
         self.qkv.wait_for_query_key(runtime);
         let key_t = runtime.matrix_transpose(&projected.key);
-        let mut scores = runtime.matrix_multiply(&projected.query, &key_t);
+        let scores = runtime.matrix_multiply(&projected.query, &key_t);
         runtime.recycle_matrix(key_t);
-        scores.scale(1.0 / (projected.query.cols() as f32).sqrt(), runtime);
-        scores.softmax_rows(runtime);
-        scores
+        let scores = SingleNode::new(SingleType::Scale(
+            1.0 / (projected.query.cols() as f32).sqrt(),
+        ))
+        .forward(scores, runtime);
+        SingleNode::new(SingleType::Softmax).forward(scores, runtime)
     }
 }

@@ -2,6 +2,7 @@ use crate::cuda::{container::Matrix, runtime::CudaRuntime};
 use crate::net::linear::{Linear, LinearMomentum};
 use crate::net::metadata::{HostData, MetadataCursor};
 use crate::net::mlp::{InferenceMLP, TrainingMlp};
+use crate::net::node::{BinaryNode, BinaryOp, SingleType, TrainingBinaryNode, TrainingSingleNode};
 use cuda_core::CudaStream;
 
 use std::sync::Arc;
@@ -60,11 +61,12 @@ pub struct TrainingTransformer {
     fcs: TrainingMlp,
     output_matrix: Linear,
     output_optimizer: LinearMomentum,
+    feed_forward_residual: TrainingBinaryNode,
+    feed_forward_normalization: TrainingSingleNode,
     cache: Option<TransformerCache>,
 }
 
 struct TransformerCache {
-    second_pre_norm: Matrix,
     encoded: Matrix,
 }
 
@@ -87,6 +89,11 @@ impl TrainingTransformer {
             fcs,
             output_matrix,
             output_optimizer: LinearMomentum::default(),
+            feed_forward_residual: TrainingBinaryNode::new(BinaryOp::Add),
+            feed_forward_normalization: TrainingSingleNode::new(match norm_type {
+                NormType::Layer => SingleType::LayerNorm,
+                NormType::Rms => SingleType::RmsNorm,
+            }),
             cache: None,
         }
     }
@@ -119,18 +126,20 @@ impl TrainingTransformer {
         assert_eq!(positioned.cols(), input.cols());
         let first_output = self.attention.forward_self_training(positioned, runtime);
         let ffn = self.fcs.forward(first_output, runtime);
-        let second_pre_norm = runtime.matrix_add(
-            self.fcs.input().expect("training MLP input cache missing"),
-            &ffn,
+        let second_pre_norm = self.feed_forward_residual.forward_borrowed(
+            &[
+                self.fcs.input().expect("training MLP input cache missing"),
+                &ffn,
+            ],
+            runtime,
         );
-        let mut encoded = runtime.clone_matrix(&second_pre_norm);
-        self.attention.normalize(&mut encoded, runtime);
+        runtime.recycle_matrix(ffn);
+        let encoded = self
+            .feed_forward_normalization
+            .forward(second_pre_norm, runtime);
 
         let output = self.output_matrix.forward(&encoded, None, runtime, None);
-        self.cache = Some(TransformerCache {
-            second_pre_norm,
-            encoded,
-        });
+        self.cache = Some(TransformerCache { encoded });
         output
     }
 
@@ -178,18 +187,22 @@ impl TrainingTransformer {
             runtime,
         );
 
-        let second_gradient = self.attention.normalization_backward(
-            &cache.second_pre_norm,
-            &encoded_gradient,
-            runtime,
-        );
-        let ffn_input_gradient = self.fcs.backward_accumulate(&second_gradient, runtime);
-        let mut first_output_gradient = second_gradient;
-        first_output_gradient.binary_assign(&ffn_input_gradient, move |lhs,rhs| lhs+rhs, runtime);
+        let second_gradient = self
+            .feed_forward_normalization
+            .backward(encoded_gradient, runtime);
+        let [direct_gradient, ffn_output_gradient]: [Matrix; 2] = self
+            .feed_forward_residual
+            .backward(second_gradient, runtime)
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("residual Add has two inputs"));
+        let ffn_input_gradient = self.fcs.backward_accumulate(&ffn_output_gradient, runtime);
+        runtime.recycle_matrix(ffn_output_gradient);
+        let first_output_gradient = BinaryNode::new(BinaryOp::Add)
+            .forward_owned(vec![direct_gradient, ffn_input_gradient], runtime);
 
         let positioned_gradient = self
             .attention
-            .backward_self_accumulate(&first_output_gradient, runtime);
+            .backward_self_accumulate(first_output_gradient, runtime);
 
         positioned_gradient
     }
