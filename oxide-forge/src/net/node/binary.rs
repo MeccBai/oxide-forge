@@ -17,11 +17,11 @@ impl BinaryNode {
         validate_inputs(self.op, inputs);
 
         let mut output = match self.op {
-            BinaryOp::Add => runtime.matrix_add(inputs[0], inputs[1]),
-            BinaryOp::Sub => runtime.matrix_sub(inputs[0], inputs[1]),
-            BinaryOp::Mul => runtime.matrix_mul(inputs[0], inputs[1]),
-            BinaryOp::Div => runtime.matrix_div(inputs[0], inputs[1]),
-            BinaryOp::MatMul => runtime.matrix_multiply(inputs[0], inputs[1]),
+            BinaryOp::Add => runtime.matrix_add(inputs[0], inputs[1], None),
+            BinaryOp::Sub => runtime.matrix_sub(inputs[0], inputs[1], None),
+            BinaryOp::Mul => runtime.matrix_mul(inputs[0], inputs[1], None),
+            BinaryOp::Div => runtime.matrix_div(inputs[0], inputs[1], None),
+            BinaryOp::MatMul => runtime.matrix_multiply(inputs[0], inputs[1], None),
         };
 
         if let BinaryOp::Add = self.op {
@@ -59,7 +59,7 @@ impl BinaryNode {
                 output
             }
             BinaryOp::MatMul => {
-                let output = runtime.matrix_multiply(&inputs[0], &inputs[1]);
+                let output = runtime.matrix_multiply(&inputs[0], &inputs[1], None);
                 for input in inputs {
                     runtime.recycle_matrix(input);
                 }
@@ -95,9 +95,9 @@ impl TrainingBinaryNode {
             BinaryOp::Mul | BinaryOp::Div | BinaryOp::MatMul => {
                 validate_owned_inputs(self.node.op, &inputs);
                 let output = match self.node.op {
-                    BinaryOp::Mul => runtime.matrix_mul(&inputs[0], &inputs[1]),
-                    BinaryOp::Div => runtime.matrix_div(&inputs[0], &inputs[1]),
-                    BinaryOp::MatMul => runtime.matrix_multiply(&inputs[0], &inputs[1]),
+                    BinaryOp::Mul => runtime.matrix_mul(&inputs[0], &inputs[1], None),
+                    BinaryOp::Div => runtime.matrix_div(&inputs[0], &inputs[1], None),
+                    BinaryOp::MatMul => runtime.matrix_multiply(&inputs[0], &inputs[1], None),
                     _ => unreachable!(),
                 };
                 self.cache = Some(BinaryCache::Inputs(inputs));
@@ -137,29 +137,29 @@ impl TrainingBinaryNode {
             BinaryOp::Add => {
                 let mut gradients = Vec::with_capacity(self.input_count);
                 for _ in 1..self.input_count {
-                    gradients.push(runtime.clone_matrix(&output_gradient));
+                    gradients.push(runtime.clone_matrix(&output_gradient, None));
                 }
                 gradients.push(output_gradient);
                 gradients
             }
             BinaryOp::Sub => {
-                let lhs_gradient = runtime.clone_matrix(&output_gradient);
+                let lhs_gradient = runtime.clone_matrix(&output_gradient, None);
                 output_gradient.scale(-1.0, runtime);
                 vec![lhs_gradient, output_gradient]
             }
             BinaryOp::Mul => {
                 let inputs = take_inputs(&mut self.cache, "Mul");
-                let lhs_gradient = runtime.matrix_mul(&output_gradient, &inputs[1]);
-                let rhs_gradient = runtime.matrix_mul(&output_gradient, &inputs[0]);
+                let lhs_gradient = runtime.matrix_mul(&output_gradient, &inputs[1], None);
+                let rhs_gradient = runtime.matrix_mul(&output_gradient, &inputs[0], None);
                 recycle_backward_inputs(output_gradient, inputs, runtime);
                 vec![lhs_gradient, rhs_gradient]
             }
             BinaryOp::Div => {
                 let inputs = take_inputs(&mut self.cache, "Div");
-                let lhs_gradient = runtime.matrix_div(&output_gradient, &inputs[1]);
-                let denominator = runtime.matrix_mul(&inputs[1], &inputs[1]);
-                let numerator = runtime.matrix_mul(&output_gradient, &inputs[0]);
-                let mut rhs_gradient = runtime.matrix_div(&numerator, &denominator);
+                let lhs_gradient = runtime.matrix_div(&output_gradient, &inputs[1], None);
+                let denominator = runtime.matrix_mul(&inputs[1], &inputs[1], None);
+                let numerator = runtime.matrix_mul(&output_gradient, &inputs[0], None);
+                let mut rhs_gradient = runtime.matrix_div(&numerator, &denominator, None);
                 rhs_gradient.scale(-1.0, runtime);
 
                 runtime.recycle_matrix(denominator);
@@ -169,10 +169,10 @@ impl TrainingBinaryNode {
             }
             BinaryOp::MatMul => {
                 let inputs = take_inputs(&mut self.cache, "MatMul");
-                let rhs_t = runtime.matrix_transpose(&inputs[1]);
-                let lhs_gradient = runtime.matrix_multiply(&output_gradient, &rhs_t);
-                let lhs_t = runtime.matrix_transpose(&inputs[0]);
-                let rhs_gradient = runtime.matrix_multiply(&lhs_t, &output_gradient);
+                let rhs_t = runtime.matrix_transpose(&inputs[1], None);
+                let lhs_gradient = runtime.matrix_multiply(&output_gradient, &rhs_t, None);
+                let lhs_t = runtime.matrix_transpose(&inputs[0], None);
+                let rhs_gradient = runtime.matrix_multiply(&lhs_t, &output_gradient, None);
 
                 runtime.recycle_matrix(rhs_t);
                 runtime.recycle_matrix(lhs_t);

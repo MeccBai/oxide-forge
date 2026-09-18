@@ -202,38 +202,41 @@ impl CudaRuntime {
         values: &[f32],
         rows: usize,
         cols: usize,
+        stream: Option<&CudaStream>,
     ) -> Result<Matrix, DriverError> {
         let len = rows
             .checked_mul(cols)
             .expect("matrix element count overflow");
         assert_eq!(values.len(), len);
+        let stream = self.execution_stream(stream);
         Ok(Matrix {
-            buffer: DeviceBuffer::from_host(self.stream(), values)?,
+            buffer: DeviceBuffer::from_host(stream, values)?,
             rows,
             cols,
         })
     }
 
-    pub fn matrix_multiply(&mut self, mat1: &Matrix, mat2: &Matrix) -> Matrix {
-        let mut result = self.new_uninit_matrix(mat1.rows, mat2.cols);
-        self.matrix_multiply_into_on(self.stream(), mat1, mat2, &mut result);
-        result
-    }
-
-    pub fn matrix_multiply_into(&self, mat1: &Matrix, mat2: &Matrix, result: &mut Matrix) {
-        self.matrix_multiply_into_on(self.stream(), mat1, mat2, result);
-    }
-
-    pub(crate) fn matrix_multiply_on(
+    pub fn matrix_multiply(
         &mut self,
-        stream: &CudaStream,
         mat1: &Matrix,
         mat2: &Matrix,
+        stream: Option<&CudaStream>,
     ) -> Matrix {
         let mut result = self.new_uninit_matrix(mat1.rows, mat2.cols);
-        stream.join(self.stream()).unwrap();
+        let stream = self.execution_stream(stream);
         self.matrix_multiply_into_on(stream, mat1, mat2, &mut result);
         result
+    }
+
+    pub fn matrix_multiply_into(
+        &self,
+        mat1: &Matrix,
+        mat2: &Matrix,
+        result: &mut Matrix,
+        stream: Option<&CudaStream>,
+    ) {
+        let stream = self.execution_stream(stream);
+        self.matrix_multiply_into_on(stream, mat1, mat2, result);
     }
 
     pub(crate) fn matrix_multiply_into_on(
@@ -277,20 +280,40 @@ impl CudaRuntime {
             .unwrap();
     }
 
-    pub fn matrix_add(&mut self, mat1: &Matrix, mat2: &Matrix) -> Matrix {
-        self.matrix_binary(mat1, mat2, move |lhs, rhs| lhs + rhs)
+    pub fn matrix_add(
+        &mut self,
+        mat1: &Matrix,
+        mat2: &Matrix,
+        stream: Option<&CudaStream>,
+    ) -> Matrix {
+        self.matrix_binary(mat1, mat2, move |lhs, rhs| lhs + rhs, stream)
     }
 
-    pub fn matrix_sub(&mut self, mat1: &Matrix, mat2: &Matrix) -> Matrix {
-        self.matrix_binary(mat1, mat2, move |lhs, rhs| lhs - rhs)
+    pub fn matrix_sub(
+        &mut self,
+        mat1: &Matrix,
+        mat2: &Matrix,
+        stream: Option<&CudaStream>,
+    ) -> Matrix {
+        self.matrix_binary(mat1, mat2, move |lhs, rhs| lhs - rhs, stream)
     }
 
-    pub fn matrix_mul(&mut self, mat1: &Matrix, mat2: &Matrix) -> Matrix {
-        self.matrix_binary(mat1, mat2, move |lhs, rhs| lhs * rhs)
+    pub fn matrix_mul(
+        &mut self,
+        mat1: &Matrix,
+        mat2: &Matrix,
+        stream: Option<&CudaStream>,
+    ) -> Matrix {
+        self.matrix_binary(mat1, mat2, move |lhs, rhs| lhs * rhs, stream)
     }
 
-    pub fn matrix_div(&mut self, mat1: &Matrix, mat2: &Matrix) -> Matrix {
-        self.matrix_binary(mat1, mat2, move |lhs, rhs| lhs / rhs)
+    pub fn matrix_div(
+        &mut self,
+        mat1: &Matrix,
+        mat2: &Matrix,
+        stream: Option<&CudaStream>,
+    ) -> Matrix {
+        self.matrix_binary(mat1, mat2, move |lhs, rhs| lhs / rhs, stream)
     }
 
     pub fn matrix_binary(
@@ -298,6 +321,7 @@ impl CudaRuntime {
         mat1: &Matrix,
         mat2: &Matrix,
         f: impl Fn(f32, f32) -> f32 + Copy,
+        stream: Option<&CudaStream>,
     ) -> Matrix {
         assert_eq!(mat1.rows, mat2.rows);
         assert_eq!(mat1.cols, mat2.cols);
@@ -312,42 +336,7 @@ impl CudaRuntime {
         let lhs = DeviceSpan::from_buffer(&mat1.buffer, 0, mat1.buffer.len());
         let rhs = DeviceSpan::from_buffer(&mat2.buffer, 0, mat2.buffer.len());
         let output = DeviceSpanMut::from_buffer(&mut result_buffer, 0, rows * cols);
-
-        self.module()
-            .slice_binary(
-                self.stream(),
-                &prepared,
-                lhs.descriptor(),
-                rhs.descriptor(),
-                output.descriptor(),
-                elements_per_thread,
-                f,
-            )
-            .unwrap();
-        self.create_matrix(result_buffer, rows, cols)
-    }
-
-    pub(crate) fn matrix_binary_on(
-        &mut self,
-        stream: &CudaStream,
-        mat1: &Matrix,
-        mat2: &Matrix,
-        f: impl Fn(f32, f32) -> f32 + Copy,
-    ) -> Matrix {
-        assert_eq!(mat1.rows, mat2.rows);
-        assert_eq!(mat1.cols, mat2.cols);
-
-        let rows = mat1.rows;
-        let cols = mat1.cols;
-        let mut result_buffer = self.get_uninit_buffer(rows * cols);
-        stream.join(self.stream()).unwrap();
-
-        let (config, elements_per_thread) =
-            self.get_elementwise_launch_config(mat1.buffer.len(), DEFAULT_BLOCK_SIZE);
-        let prepared = self.module().prepare_slice_binary(config).unwrap();
-        let lhs = DeviceSpan::from_buffer(&mat1.buffer, 0, mat1.buffer.len());
-        let rhs = DeviceSpan::from_buffer(&mat2.buffer, 0, mat2.buffer.len());
-        let output = DeviceSpanMut::from_buffer(&mut result_buffer, 0, rows * cols);
+        let stream = self.execution_stream(stream);
 
         self.module()
             .slice_binary(
@@ -368,22 +357,31 @@ impl CudaRuntime {
         self.recycle_buffer(matrix.buffer);
     }
 
-    pub fn new_matrix(&mut self, init_type: InitType, rows: usize, cols: usize) -> Matrix {
+    pub fn new_matrix(
+        &mut self,
+        init_type: InitType,
+        rows: usize,
+        cols: usize,
+        stream: Option<&CudaStream>,
+    ) -> Matrix {
         let size = rows * cols;
         if init_type.is_zero() {
-            let buffer = self.get_zerod_buffer(size);
+            let mut buffer = self.get_uninit_buffer(size);
+            let stream = self.execution_stream(stream);
+            buffer.zero_async(stream).unwrap();
             return self.create_matrix(buffer, rows, cols);
         }
         let mut buffer = self.get_uninit_buffer(size);
         let (config, elements_per_thread) =
             self.get_elementwise_launch_config(buffer.len(), DEFAULT_BLOCK_SIZE);
+        let stream = self.execution_stream(stream);
         match init_type {
             InitType::Sequence => {
                 let prepared = self.module().prepare_slice_set_seq(config).unwrap();
                 let span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
                 self.module()
                     .slice_set_seq(
-                        self.stream(),
+                        stream,
                         &prepared,
                         span.descriptor(),
                         elements_per_thread,
@@ -398,7 +396,7 @@ impl CudaRuntime {
                 let span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
                 self.module()
                     .slice_set_seq(
-                        self.stream(),
+                        stream,
                         &prepared,
                         span.descriptor(),
                         elements_per_thread,
@@ -414,7 +412,7 @@ impl CudaRuntime {
                 let span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
                 self.module()
                     .slice_set_random(
-                        self.stream(),
+                        stream,
                         &prepared,
                         span.descriptor(),
                         elements_per_thread,
@@ -444,14 +442,9 @@ impl CudaRuntime {
         Matrix { buffer, rows, cols }
     }
 
-    pub fn clone_matrix(&mut self, matrix: &Matrix) -> Matrix {
-        let buffer = self.clone_buffer(&matrix.buffer);
-        self.create_matrix(buffer, matrix.rows, matrix.cols)
-    }
-
-    pub(crate) fn clone_matrix_on(&mut self, matrix: &Matrix, stream: &CudaStream) -> Matrix {
+    pub fn clone_matrix(&mut self, matrix: &Matrix, stream: Option<&CudaStream>) -> Matrix {
         let mut buffer = self.get_uninit_buffer(matrix.buffer.len());
-        stream.join(self.stream()).unwrap();
+        let stream = self.execution_stream(stream);
         buffer
             .copy_from_device_async(&matrix.buffer, stream)
             .unwrap();

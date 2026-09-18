@@ -15,7 +15,7 @@ impl RowReduceNode {
     pub fn forward(&self, input: Matrix, runtime: &mut CudaRuntime) -> Matrix {
         assert!(input.cols() > 0, "row reduction requires non-empty rows");
         let cols = input.cols();
-        let output = runtime.matrix_sum_rows(&input);
+        let output = runtime.matrix_sum_rows(&input, None);
         runtime.recycle_matrix(input);
         let mut output = runtime.vector_into_matrix(output);
         if let RowReduction::Mean = self.reduction {
@@ -51,9 +51,9 @@ impl TrainingRowReduceNode {
         assert_eq!(output_gradient.cols(), 1, "row gradient must be [rows, 1]");
 
         let gradient = runtime.matrix_into_vector(output_gradient);
-        let expanded_t = runtime.broadcast(&gradient, cols);
+        let expanded_t = runtime.broadcast(&gradient, cols, None);
         runtime.recycle_vector(gradient);
-        let mut expanded = runtime.matrix_transpose(&expanded_t);
+        let mut expanded = runtime.matrix_transpose(&expanded_t, None);
         runtime.recycle_matrix(expanded_t);
         if let RowReduction::Mean = self.node.reduction {
             expanded.scale(1.0 / cols as f32, runtime);

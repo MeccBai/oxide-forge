@@ -254,7 +254,7 @@ impl Attention {
         let projected = self.qkv.project(&input, &input, runtime);
         let probabilities = self.attention_probabilities(&projected, runtime);
         self.qkv.wait_for_value(runtime);
-        let attention = runtime.matrix_multiply(&probabilities, &projected.value);
+        let attention = runtime.matrix_multiply(&probabilities, &projected.value, None);
         let pre_norm = self
             .training_residual
             .forward_borrowed(&[&input, &attention], runtime);
@@ -289,20 +289,20 @@ impl Attention {
             .try_into()
             .unwrap_or_else(|_| unreachable!("residual Add has two inputs"));
 
-        let value_t = runtime.matrix_transpose(&cache.value);
-        let probabilities_gradient = runtime.matrix_multiply(&attention_gradient, &value_t);
-        let probabilities_t = runtime.matrix_transpose(&cache.probabilities);
-        let value_gradient = runtime.matrix_multiply(&probabilities_t, &attention_gradient);
+        let value_t = runtime.matrix_transpose(&cache.value, None);
+        let probabilities_gradient = runtime.matrix_multiply(&attention_gradient, &value_t, None);
+        let probabilities_t = runtime.matrix_transpose(&cache.probabilities, None);
+        let value_gradient = runtime.matrix_multiply(&probabilities_t, &attention_gradient, None);
 
         let score_gradient =
-            runtime.softmax_rows_backward(&cache.probabilities, &probabilities_gradient);
+            runtime.softmax_rows_backward(&cache.probabilities, &probabilities_gradient, None);
         let score_gradient =
             SingleNode::new(SingleType::Scale(1.0 / (cache.query.cols() as f32).sqrt()))
                 .forward(score_gradient, runtime);
 
-        let query_gradient = runtime.matrix_multiply(&score_gradient, &cache.key);
-        let score_gradient_t = runtime.matrix_transpose(&score_gradient);
-        let key_gradient = runtime.matrix_multiply(&score_gradient_t, &cache.query);
+        let query_gradient = runtime.matrix_multiply(&score_gradient, &cache.key, None);
+        let score_gradient_t = runtime.matrix_transpose(&score_gradient, None);
+        let key_gradient = runtime.matrix_multiply(&score_gradient_t, &cache.query, None);
 
         let projection_gradient = self.qkv.backward_self_accumulate(
             &cache.input,
@@ -357,9 +357,9 @@ impl Attention {
     ) -> Matrix {
         self.qkv.wait_for_query_key(runtime);
         let query_width = query.cols();
-        let key_t = runtime.matrix_transpose(&key);
+        let key_t = runtime.matrix_transpose(&key, None);
         runtime.recycle_matrix(key);
-        let scores = runtime.matrix_multiply(&query, &key_t);
+        let scores = runtime.matrix_multiply(&query, &key_t, None);
         runtime.recycle_matrix(query);
         runtime.recycle_matrix(key_t);
         SingleNode::new(SingleType::Scale(1.0 / (query_width as f32).sqrt()))
@@ -373,7 +373,7 @@ impl Attention {
         runtime: &mut CudaRuntime,
     ) -> Matrix {
         self.qkv.wait_for_value(runtime);
-        let attention = runtime.matrix_multiply(&probabilities, &value);
+        let attention = runtime.matrix_multiply(&probabilities, &value, None);
         runtime.recycle_matrix(probabilities);
         runtime.recycle_matrix(value);
         attention
@@ -385,8 +385,8 @@ impl Attention {
         runtime: &mut CudaRuntime,
     ) -> Matrix {
         self.qkv.wait_for_query_key(runtime);
-        let key_t = runtime.matrix_transpose(&projected.key);
-        let scores = runtime.matrix_multiply(&projected.query, &key_t);
+        let key_t = runtime.matrix_transpose(&projected.key, None);
+        let scores = runtime.matrix_multiply(&projected.query, &key_t, None);
         runtime.recycle_matrix(key_t);
         let scores = SingleNode::new(SingleType::Scale(
             1.0 / (projected.query.cols() as f32).sqrt(),

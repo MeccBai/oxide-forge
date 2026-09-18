@@ -144,6 +144,14 @@ impl DeviceSpan<'_, f32> {
         copy_to_buffer(self.ptr as usize as u64, self.len, runtime)
     }
 
+    pub(crate) fn to_buffer_on(
+        &self,
+        runtime: &mut CudaRuntime,
+        stream: &cuda_core::CudaStream,
+    ) -> DeviceBuffer<f32> {
+        copy_to_buffer_on(self.ptr as usize as u64, self.len, runtime, stream)
+    }
+
     pub fn sum(&self, runtime: &mut CudaRuntime) -> f32 {
         self.map_reduce(runtime, 0.0, move |value| value, move |lhs, rhs| lhs + rhs)
     }
@@ -581,16 +589,39 @@ fn copy_to_buffer_async(src: u64, len: usize, runtime: &mut CudaRuntime) -> Devi
     result
 }
 
+fn copy_to_buffer_on(
+    src: u64,
+    len: usize,
+    runtime: &mut CudaRuntime,
+    stream: &cuda_core::CudaStream,
+) -> DeviceBuffer<f32> {
+    let result = runtime.get_uninit_buffer(len);
+    stream.join(runtime.stream()).unwrap();
+    if len == 0 {
+        return result;
+    }
+    let byte_len = len
+        .checked_mul(core::mem::size_of::<f32>())
+        .expect("device span copy size overflow");
+    unsafe {
+        memory::memcpy_dtod_async(result.cu_deviceptr(), src, byte_len, stream.cu_stream())
+            .unwrap();
+    }
+    result
+}
+
 impl CudaRuntime {
-    pub(crate) fn concat_buffers_from_span(
+    pub(crate) fn concat_buffers_from_span_on(
         &mut self,
         spans: &[DeviceSpan<'_, f32>],
+        stream: Option<&cuda_core::CudaStream>,
     ) -> DeviceBuffer<f32> {
         let total_len = spans
             .iter()
             .try_fold(0usize, |total, span| total.checked_add(span.len))
             .expect("concatenated device span length overflow");
         let result = self.get_uninit_buffer(total_len);
+        let stream = self.execution_stream(stream);
         let mut destination_offset = 0usize;
 
         for span in spans {
@@ -609,7 +640,7 @@ impl CudaRuntime {
                     destination,
                     span.ptr as usize as u64,
                     byte_len,
-                    self.stream().cu_stream(),
+                    stream.cu_stream(),
                 )
                 .unwrap();
             }

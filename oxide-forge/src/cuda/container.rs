@@ -23,3 +23,9 @@ pub struct Matrix {
     rows: usize,
     cols: usize,
 }
+
+impl Matrix {
+    pub fn shape(&self) -> (usize, usize) {
+        (self.rows, self.cols)
+    }
+}

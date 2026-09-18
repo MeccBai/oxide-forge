@@ -32,6 +32,12 @@ pub enum RowReduction {
     Mean,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanOutMode {
+    Copy,
+    Average,
+}
+
 /// Stateless multi-input operation used by inference paths.
 pub struct BinaryNode {
     op: BinaryOp,
@@ -86,6 +92,18 @@ pub struct SplitNode {
 /// Split node that validates forward/backward pairing.
 pub struct TrainingSplitNode {
     node: SplitNode,
+    forward_pending: bool,
+}
+
+/// Duplicates one Matrix into independent branch-owned allocations.
+pub struct FanOutNode {
+    mode: FanOutMode,
+    output_count: usize,
+}
+
+/// Fan-out node that validates one forward/backward pair.
+pub struct TrainingFanOutNode {
+    node: FanOutNode,
     forward_pending: bool,
 }
 

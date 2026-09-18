@@ -1,4 +1,3 @@
-
 use crate::cuda::container::Matrix;
 use crate::cuda::container::Vector;
 use crate::cuda::runtime::CudaRuntime;
@@ -30,10 +29,10 @@ impl Loss {
         runtime: &mut CudaRuntime,
     ) -> Vector {
         validate_binary_loss_inputs(output, target, positive_weight);
-        let mut loss = runtime.clone_matrix(output);
+        let mut loss = runtime.clone_matrix(output, None);
         match self {
             Self::MeanSquaredError => {
-                loss.binary_assign(target, move |lhs,rhs| lhs-rhs, runtime);
+                loss.binary_assign(target, move |lhs, rhs| lhs - rhs, runtime);
                 loss.for_each(runtime, |value| 0.5 * value * value);
             }
             Self::BinaryCrossEntropyWithLogits => {
@@ -41,26 +40,26 @@ impl Loss {
                 loss.for_each(runtime, |value| {
                     value.max(0.0) + (1.0 + (-value.abs()).exp()).ln()
                 });
-                let product = runtime.matrix_mul(output, target);
-                loss.binary_assign(&product, move |lhs,rhs| lhs-rhs, runtime);
+                let product = runtime.matrix_mul(output, target, None);
+                loss.binary_assign(&product, move |lhs, rhs| lhs - rhs, runtime);
                 runtime.recycle_matrix(product);
 
                 if positive_weight != 1.0 {
                     // move |lhs,rhs| lhs+rhs (positive_weight - 1) * target * softplus(-logit).
-                    let mut positive = runtime.clone_matrix(output);
+                    let mut positive = runtime.clone_matrix(output, None);
                     positive.for_each(runtime, move |value| {
                         (positive_weight - 1.0)
                             * ((-value).max(0.0) + (1.0 + (-value.abs()).exp()).ln())
                     });
-                    positive.binary_assign(target, move |lhs,rhs| lhs*rhs, runtime);
-                    loss.binary_assign(&positive, move |lhs,rhs| lhs+rhs, runtime);
+                    positive.binary_assign(target, move |lhs, rhs| lhs * rhs, runtime);
+                    loss.binary_assign(&positive, move |lhs, rhs| lhs + rhs, runtime);
                     runtime.recycle_matrix(positive);
                 }
             }
         }
 
         let cols = loss.cols() as f32;
-        let mut rows = runtime.matrix_sum_rows(&loss);
+        let mut rows = runtime.matrix_sum_rows(&loss, None);
         rows.scale(1.0 / cols, runtime);
         runtime.recycle_matrix(loss);
         rows
@@ -74,26 +73,28 @@ impl Loss {
         runtime: &mut CudaRuntime,
     ) -> Matrix {
         validate_binary_loss_inputs(output, target, positive_weight);
-        let mut gradient = runtime.clone_matrix(output);
+        let mut gradient = runtime.clone_matrix(output, None);
         match self {
-            Self::MeanSquaredError => gradient.binary_assign(target, move |lhs,rhs| lhs-rhs, runtime),
+            Self::MeanSquaredError => {
+                gradient.binary_assign(target, move |lhs, rhs| lhs - rhs, runtime)
+            }
             Self::BinaryCrossEntropyWithLogits => {
                 gradient.sigmoid(runtime);
                 if positive_weight == 1.0 {
-                    gradient.binary_assign(target, move |lhs,rhs| lhs-rhs, runtime);
+                    gradient.binary_assign(target, move |lhs, rhs| lhs - rhs, runtime);
                 } else {
                     // sigmoid(logit) * (1 - target + weight * target)
                     //     - weight * target
                     // remains correct for both hard and soft target values.
-                    let mut weights = runtime.clone_matrix(target);
+                    let mut weights = runtime.clone_matrix(target, None);
                     weights.scale(positive_weight - 1.0, runtime);
                     weights.add_scalar(1.0, runtime);
-                    gradient.binary_assign(&weights, move |lhs,rhs| lhs*rhs, runtime);
+                    gradient.binary_assign(&weights, move |lhs, rhs| lhs * rhs, runtime);
                     runtime.recycle_matrix(weights);
 
-                    let mut weighted_target = runtime.clone_matrix(target);
+                    let mut weighted_target = runtime.clone_matrix(target, None);
                     weighted_target.scale(positive_weight, runtime);
-                    gradient.binary_assign(&weighted_target, move |lhs,rhs| lhs-rhs, runtime);
+                    gradient.binary_assign(&weighted_target, move |lhs, rhs| lhs - rhs, runtime);
                     runtime.recycle_matrix(weighted_target);
                 }
             }
@@ -125,7 +126,7 @@ impl Loss {
             "Dice loss requires binary cross-entropy with logits"
         );
 
-        let mut probabilities = runtime.clone_matrix(output);
+        let mut probabilities = runtime.clone_matrix(output, None);
         probabilities.sigmoid(runtime);
         let intersection = probabilities.zip_map_reduce(
             target,
@@ -141,18 +142,18 @@ impl Loss {
         loss_rows.add_scalar(dice_weight * dice_loss, runtime);
 
         // d(1 - Dice)/dp = (numerator - 2 * target * denominator) / denominator²
-        let mut dice_gradient = runtime.clone_matrix(target);
+        let mut dice_gradient = runtime.clone_matrix(target, None);
         dice_gradient.scale(-2.0 * denominator, runtime);
         dice_gradient.add_scalar(numerator, runtime);
         dice_gradient.scale(dice_weight / (denominator * denominator), runtime);
 
         // Convert dL/dp to dL/dlogit with sigmoid'(logit) = p * (1 - p).
-        let mut sigmoid_derivative = runtime.clone_matrix(&probabilities);
+        let mut sigmoid_derivative = runtime.clone_matrix(&probabilities, None);
         sigmoid_derivative.scale(-1.0, runtime);
         sigmoid_derivative.add_scalar(1.0, runtime);
-        sigmoid_derivative.binary_assign(&probabilities, move |lhs,rhs| lhs*rhs, runtime);
-        dice_gradient.binary_assign(&sigmoid_derivative, move |lhs,rhs| lhs*rhs, runtime);
-        gradient.binary_assign(&dice_gradient, move |lhs,rhs| lhs+rhs, runtime);
+        sigmoid_derivative.binary_assign(&probabilities, move |lhs, rhs| lhs * rhs, runtime);
+        dice_gradient.binary_assign(&sigmoid_derivative, move |lhs, rhs| lhs * rhs, runtime);
+        gradient.binary_assign(&dice_gradient, move |lhs, rhs| lhs + rhs, runtime);
 
         runtime.recycle_matrix(probabilities);
         runtime.recycle_matrix(sigmoid_derivative);
@@ -220,7 +221,7 @@ impl MlpExecutor {
         for (index, layer) in self.layers.iter().enumerate() {
             let layer_input = output.as_ref().unwrap_or(input);
             if self.res_range.is_some_and(|(start, _)| index == start) {
-                residual_cache = Some(runtime.clone_matrix(layer_input));
+                residual_cache = Some(runtime.clone_matrix(layer_input, None));
             }
             let consumes_residual = self.res_range.is_some_and(|(_, end)| index + 1 == end);
             let residual = if consumes_residual {
@@ -329,7 +330,7 @@ impl MlpExecutor {
         assert_eq!(layer_inputs.len(), self.layers.len());
         assert_eq!(optimizers.len(), self.layers.len());
 
-        let mut gradient = runtime.clone_matrix(output_gradient);
+        let mut gradient = runtime.clone_matrix(output_gradient, None);
         let mut residual_gradient: Option<(usize, Matrix)> = None;
         for index in (0..self.layers.len()).rev() {
             let residual_index = self
@@ -345,14 +346,14 @@ impl MlpExecutor {
                 self.layers[index].input_gradient(&layer_gradient, runtime, None);
 
             if let Some(source) = residual_index {
-                residual_gradient = Some((source, runtime.clone_matrix(&layer_gradient)));
+                residual_gradient = Some((source, runtime.clone_matrix(&layer_gradient, None)));
             }
             if residual_gradient
                 .as_ref()
                 .is_some_and(|(source, _)| *source == index)
             {
                 let (_, skip_gradient) = residual_gradient.take().unwrap();
-                input_gradient.binary_assign(&skip_gradient, move |lhs,rhs| lhs+rhs, runtime);
+                input_gradient.binary_assign(&skip_gradient, move |lhs, rhs| lhs + rhs, runtime);
             }
 
             optimizers[index].accumulate(

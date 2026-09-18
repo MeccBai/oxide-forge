@@ -15,7 +15,7 @@ impl SingleNode {
     /// necessarily creates a differently laid out result.
     pub fn forward(&self, mut input: Matrix, runtime: &mut CudaRuntime) -> Matrix {
         if let SingleType::Transpose = self.op {
-            let output = runtime.matrix_transpose(&input);
+            let output = runtime.matrix_transpose(&input, None);
             runtime.recycle_matrix(input);
             return output;
         }
@@ -48,14 +48,14 @@ impl TrainingSingleNode {
                 self.node.forward(input, runtime)
             }
             SingleType::Activation(_) | SingleType::LayerNorm | SingleType::RmsNorm => {
-                let mut output = runtime.clone_matrix(&input);
+                let mut output = runtime.clone_matrix(&input, None);
                 apply_in_place(self.node.op, &mut output, runtime);
                 self.cache = Some(SingleCache::Input(input));
                 output
             }
             SingleType::Softmax => {
                 let output = self.node.forward(input, runtime);
-                self.cache = Some(SingleCache::Output(runtime.clone_matrix(&output)));
+                self.cache = Some(SingleCache::Output(runtime.clone_matrix(&output, None)));
                 output
             }
         }
@@ -101,7 +101,8 @@ impl TrainingSingleNode {
                 else {
                     unreachable!()
                 };
-                let gradient = runtime.softmax_rows_backward(&probabilities, &output_gradient);
+                let gradient =
+                    runtime.softmax_rows_backward(&probabilities, &output_gradient, None);
                 runtime.recycle_matrix(probabilities);
                 runtime.recycle_matrix(output_gradient);
                 gradient
@@ -114,7 +115,7 @@ impl TrainingSingleNode {
                 else {
                     unreachable!()
                 };
-                let gradient = runtime.layer_norm_backward(&input, &output_gradient);
+                let gradient = runtime.layer_norm_backward(&input, &output_gradient, None);
                 runtime.recycle_matrix(input);
                 runtime.recycle_matrix(output_gradient);
                 gradient
@@ -127,7 +128,7 @@ impl TrainingSingleNode {
                 else {
                     unreachable!()
                 };
-                let gradient = runtime.rms_norm_backward(&input, &output_gradient);
+                let gradient = runtime.rms_norm_backward(&input, &output_gradient, None);
                 runtime.recycle_matrix(input);
                 runtime.recycle_matrix(output_gradient);
                 gradient

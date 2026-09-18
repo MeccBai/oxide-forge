@@ -343,7 +343,7 @@ fn load_matrix(
 ) -> CheckpointResult<Matrix> {
     let len = checked_elements(metadata.rows, metadata.cols)?;
     let values = reader.read_f32(metadata.byte_start, metadata.byte_end, len)?;
-    Ok(runtime.matrix_from_host(&values, metadata.rows, metadata.cols)?)
+    Ok(runtime.matrix_from_host(&values, metadata.rows, metadata.cols, None)?)
 }
 
 fn load_vector(
@@ -352,7 +352,7 @@ fn load_vector(
     runtime: &CudaRuntime,
 ) -> CheckpointResult<Vector> {
     let values = reader.read_f32(metadata.byte_start, metadata.byte_end, metadata.len)?;
-    Ok(runtime.vector_from_host(&values)?)
+    Ok(runtime.vector_from_host(&values, None)?)
 }
 
 fn validate_header(

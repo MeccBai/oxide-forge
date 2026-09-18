@@ -3,4 +3,5 @@ pub mod linear;
 pub mod metadata;
 pub mod mlp;
 pub mod node;
+pub mod swiglu;
 pub mod transformer;

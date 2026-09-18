@@ -1,4 +1,4 @@
-use cuda_core::LaunchConfig1D;
+use cuda_core::{CudaStream, LaunchConfig1D};
 
 use crate::cuda::{DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, runtime::CudaRuntime};
 
@@ -74,6 +74,7 @@ impl CudaRuntime {
         &mut self,
         probabilities: &Matrix,
         output_gradient: &Matrix,
+        stream: Option<&CudaStream>,
     ) -> Matrix {
         assert_eq!(probabilities.rows, output_gradient.rows);
         assert_eq!(probabilities.cols, output_gradient.cols);
@@ -87,9 +88,10 @@ impl CudaRuntime {
             DeviceSpan::from_buffer(&output_gradient.buffer, 0, output_gradient.buffer.len());
         let len = buffer.len();
         let result = DeviceSpanMut::from_buffer(&mut buffer, 0, len);
+        let stream = self.execution_stream(stream);
         self.module()
             .softmax_rows_backward(
-                self.stream(),
+                stream,
                 &prepared,
                 probabilities_span.descriptor(),
                 output_gradient_span.descriptor(),
@@ -100,7 +102,12 @@ impl CudaRuntime {
         self.create_matrix(buffer, probabilities.rows, probabilities.cols)
     }
 
-    pub fn layer_norm_backward(&mut self, input: &Matrix, output_gradient: &Matrix) -> Matrix {
+    pub fn layer_norm_backward(
+        &mut self,
+        input: &Matrix,
+        output_gradient: &Matrix,
+        stream: Option<&CudaStream>,
+    ) -> Matrix {
         assert_eq!(input.rows, output_gradient.rows);
         assert_eq!(input.cols, output_gradient.cols);
         assert!(input.cols <= DEFAULT_BLOCK_SIZE);
@@ -112,9 +119,10 @@ impl CudaRuntime {
             DeviceSpan::from_buffer(&output_gradient.buffer, 0, output_gradient.buffer.len());
         let len = buffer.len();
         let result = DeviceSpanMut::from_buffer(&mut buffer, 0, len);
+        let stream = self.execution_stream(stream);
         self.module()
             .layer_norm_backward(
-                self.stream(),
+                stream,
                 &prepared,
                 input_span.descriptor(),
                 output_gradient_span.descriptor(),
@@ -126,7 +134,12 @@ impl CudaRuntime {
         self.create_matrix(buffer, input.rows, input.cols)
     }
 
-    pub fn rms_norm_backward(&mut self, input: &Matrix, output_gradient: &Matrix) -> Matrix {
+    pub fn rms_norm_backward(
+        &mut self,
+        input: &Matrix,
+        output_gradient: &Matrix,
+        stream: Option<&CudaStream>,
+    ) -> Matrix {
         assert_eq!(input.rows, output_gradient.rows);
         assert_eq!(input.cols, output_gradient.cols);
         assert!(input.cols <= DEFAULT_BLOCK_SIZE);
@@ -142,9 +155,10 @@ impl CudaRuntime {
         let len = buffer.len();
 
         let result = DeviceSpanMut::from_buffer(&mut buffer, 0, len);
+        let stream = self.execution_stream(stream);
         self.module()
             .matrix_rms_norm_backward(
-                self.stream(),
+                stream,
                 &prepared,
                 input_span.descriptor(),
                 output_gradient_span.descriptor(),

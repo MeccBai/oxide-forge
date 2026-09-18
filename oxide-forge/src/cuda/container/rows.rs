@@ -5,14 +5,19 @@ use crate::cuda::{DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, runtime::CudaRu
 use super::{Matrix, Vector};
 
 impl Matrix {
-    pub fn binary_assign_by_rows(&mut self, vec: &Vector, f:impl Fn(f32, f32) -> f32 + Copy, runtime: &CudaRuntime) {
+    pub fn binary_assign_by_rows(
+        &mut self,
+        vec: &Vector,
+        f: impl Fn(f32, f32) -> f32 + Copy,
+        runtime: &CudaRuntime,
+    ) {
         self.binary_assign_by_rows_on(vec, f, runtime, runtime.stream());
     }
 
     pub(crate) fn binary_assign_by_rows_on(
         &mut self,
         vec: &Vector,
-        f:impl Fn(f32, f32) -> f32 + Copy,
+        f: impl Fn(f32, f32) -> f32 + Copy,
         runtime: &CudaRuntime,
         stream: &CudaStream,
     ) {
@@ -36,30 +41,20 @@ impl Matrix {
                 matrix.descriptor(),
                 rhs.descriptor(),
                 self.cols,
-                f
+                f,
             )
             .unwrap();
     }
 }
 
 impl CudaRuntime {
-    pub fn matrix_sum_rows(&mut self, matrix: &Matrix) -> Vector {
+    pub fn matrix_sum_rows(&mut self, matrix: &Matrix, stream: Option<&CudaStream>) -> Vector {
         if matrix.rows == 0 {
             let buffer = self.get_uninit_buffer(0);
             return self.create_vector(buffer);
         }
         let mut buffer = self.get_uninit_buffer(matrix.rows);
-        self.matrix_sum_rows_into_on(matrix, &mut buffer, self.stream());
-        self.create_vector(buffer)
-    }
-
-    pub(crate) fn matrix_sum_rows_on(&mut self, matrix: &Matrix, stream: &CudaStream) -> Vector {
-        if matrix.rows == 0 {
-            let buffer = self.get_uninit_buffer(0);
-            return self.create_vector(buffer);
-        }
-        let mut buffer = self.get_uninit_buffer(matrix.rows);
-        stream.join(self.stream()).unwrap();
+        let stream = self.execution_stream(stream);
         self.matrix_sum_rows_into_on(matrix, &mut buffer, stream);
         self.create_vector(buffer)
     }

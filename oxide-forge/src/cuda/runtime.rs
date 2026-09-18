@@ -118,6 +118,15 @@ impl CudaRuntime {
         &self.stream
     }
 
+    pub(crate) fn execution_stream<'a>(&'a self, stream: Option<&'a CudaStream>) -> &'a CudaStream {
+        if let Some(stream) = stream {
+            stream.join(&self.stream).unwrap();
+            stream
+        } else {
+            &self.stream
+        }
+    }
+
     pub fn module(&self) -> &kernels::LoadedModule {
         &self.module
     }
@@ -150,12 +159,21 @@ impl CudaRuntime {
     }
 
     pub fn concat_buffers(&mut self, buffers: &[&DeviceBuffer<f32>]) -> DeviceBuffer<f32> {
+        self.concat_buffers_on(buffers, None)
+    }
+
+    pub(crate) fn concat_buffers_on(
+        &mut self,
+        buffers: &[&DeviceBuffer<f32>],
+        stream: Option<&CudaStream>,
+    ) -> DeviceBuffer<f32> {
         let total_len = buffers
             .iter()
             .try_fold(0usize, |total, buffer| total.checked_add(buffer.len()))
             .expect("concatenated buffer length overflow");
 
         let result = self.get_uninit_buffer(total_len);
+        let stream = self.execution_stream(stream);
         let mut offset = 0usize;
 
         for buffer in buffers {
@@ -182,7 +200,7 @@ impl CudaRuntime {
                     destination,
                     buffer.cu_deviceptr(),
                     byte_len,
-                    self.stream().cu_stream(),
+                    stream.cu_stream(),
                 )
                 .unwrap();
             }

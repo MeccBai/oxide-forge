@@ -1,6 +1,9 @@
 use crate::cuda::{CudaRuntime, container::Matrix};
 
-use super::{ConcatNode, MatrixAxis, SplitNode, TrainingConcatNode, TrainingSplitNode};
+use super::{
+    BinaryNode, BinaryOp, ConcatNode, FanOutMode, FanOutNode, MatrixAxis, SplitNode,
+    TrainingConcatNode, TrainingFanOutNode, TrainingSplitNode,
+};
 
 impl ConcatNode {
     pub fn new(axis: MatrixAxis) -> Self {
@@ -14,8 +17,8 @@ impl ConcatNode {
     pub fn forward(&self, inputs: &[&Matrix], runtime: &mut CudaRuntime) -> Matrix {
         assert!(inputs.len() >= 2, "Concat requires at least two inputs");
         match self.axis {
-            MatrixAxis::Rows => runtime.matrix_concat_rows(inputs),
-            MatrixAxis::Columns => runtime.matrix_concat_cols(inputs),
+            MatrixAxis::Rows => runtime.matrix_concat_rows(inputs, None),
+            MatrixAxis::Columns => runtime.matrix_concat_cols(inputs, None),
         }
     }
 
@@ -158,6 +161,91 @@ impl TrainingSplitNode {
     }
 }
 
+impl FanOutNode {
+    pub fn new(mode: FanOutMode, output_count: usize) -> Self {
+        assert!(output_count >= 2, "fan-out requires at least two outputs");
+        Self { mode, output_count }
+    }
+
+    pub fn mode(&self) -> FanOutMode {
+        self.mode
+    }
+
+    pub fn output_count(&self) -> usize {
+        self.output_count
+    }
+
+    /// Consumes one Matrix and returns independently owned, equal-shaped
+    /// outputs. Average distributes `input / output_count` to every branch.
+    pub fn forward(&self, mut input: Matrix, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        if let FanOutMode::Average = self.mode {
+            input.scale(1.0 / self.output_count as f32, runtime);
+        }
+
+        let mut outputs = Vec::with_capacity(self.output_count);
+        for _ in 1..self.output_count {
+            outputs.push(runtime.clone_matrix(&input, None));
+        }
+        outputs.push(input);
+        outputs
+    }
+
+    /// Rejoins branch gradients according to the fan-out derivative.
+    pub fn backward(&self, output_gradients: Vec<Matrix>, runtime: &mut CudaRuntime) -> Matrix {
+        assert_eq!(
+            output_gradients.len(),
+            self.output_count,
+            "fan-out gradient count mismatch"
+        );
+        let mut gradient = BinaryNode::new(BinaryOp::Add).forward_owned(output_gradients, runtime);
+        if let FanOutMode::Average = self.mode {
+            gradient.scale(1.0 / self.output_count as f32, runtime);
+        }
+        gradient
+    }
+}
+
+impl TrainingFanOutNode {
+    pub fn new(mode: FanOutMode, output_count: usize) -> Self {
+        Self {
+            node: FanOutNode::new(mode, output_count),
+            forward_pending: false,
+        }
+    }
+
+    pub fn mode(&self) -> FanOutMode {
+        self.node.mode()
+    }
+
+    pub fn output_count(&self) -> usize {
+        self.node.output_count()
+    }
+
+    pub fn forward(&mut self, input: Matrix, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert!(
+            !self.forward_pending,
+            "fan-out forward called twice without backward"
+        );
+        let outputs = self.node.forward(input, runtime);
+        self.forward_pending = true;
+        outputs
+    }
+
+    pub fn backward(&mut self, output_gradients: Vec<Matrix>, runtime: &mut CudaRuntime) -> Matrix {
+        assert!(
+            self.forward_pending,
+            "fan-out backward requires a preceding forward"
+        );
+        let gradient = self.node.backward(output_gradients, runtime);
+        self.forward_pending = false;
+        gradient
+    }
+
+    pub fn clear_cache(&mut self) {
+        self.forward_pending = false;
+    }
+}
+
 fn concatenated_shape(axis: MatrixAxis, shapes: &[(usize, usize)]) -> (usize, usize) {
     let (first_rows, first_cols) = shapes[0];
     match axis {
@@ -193,7 +281,7 @@ fn split(
     runtime: &mut CudaRuntime,
 ) -> Vec<Matrix> {
     match axis {
-        MatrixAxis::Rows => runtime.matrix_split_rows(input, sizes),
-        MatrixAxis::Columns => runtime.matrix_split_cols(input, sizes),
+        MatrixAxis::Rows => runtime.matrix_split_rows(input, sizes, None),
+        MatrixAxis::Columns => runtime.matrix_split_cols(input, sizes, None),
     }
 }

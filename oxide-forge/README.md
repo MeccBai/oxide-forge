@@ -33,7 +33,9 @@ Implemented capabilities include:
   residual connections, and their backward paths;
 - explicit differentiable compute nodes for element-wise arithmetic, MatMul,
   activations, normalization, transpose, row reduction, and contiguous
-  concat/split;
+  concat/split/fan-out;
+- inference and training SwiGLU blocks assembled from reusable Linear,
+  activation, product, and optimizer components;
 - single-head Post-Norm Transformer executors with selectable LayerNorm/RMSNorm
   inference and training;
 - parameter checkpoint save/load for MLP and Transformer executors;
@@ -141,9 +143,9 @@ layer:
 ```rust
 let mut runtime = CudaRuntime::new()?;
 
-let input = runtime.new_matrix(InitType::Random, 256, 128);
+let input = runtime.new_matrix(InitType::Random, 256, 128, None);
 let projection = Linear::new(
-    runtime.new_matrix(InitType::Random, 128, 64),
+    runtime.new_matrix(InitType::Random, 128, 64, None),
     None,
     Activation::Identity,
 );
@@ -172,6 +174,7 @@ src/
     ├── metadata.rs        public parameter metadata and host data
     ├── mlp.rs             inference/training MLP executors
     ├── node/              explicit differentiable composition operations
+    ├── swiglu.rs          inference/training SwiGLU feed-forward block
     └── transformer/       attention, encoder, decoder, and position encoding
 docs/
 └── api.md                 complete runtime API reference

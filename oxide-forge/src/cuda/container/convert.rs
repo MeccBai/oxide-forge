@@ -15,7 +15,11 @@ impl Matrix {
 
 impl CudaRuntime {
     /// Concatenates equally wide matrices by appending complete rows.
-    pub fn matrix_concat_rows(&mut self, matrices: &[&Matrix]) -> Matrix {
+    pub fn matrix_concat_rows(
+        &mut self,
+        matrices: &[&Matrix],
+        stream: Option<&CudaStream>,
+    ) -> Matrix {
         assert!(
             !matrices.is_empty(),
             "matrix concat requires at least one input"
@@ -33,13 +37,17 @@ impl CudaRuntime {
             .iter()
             .map(|matrix| &matrix.buffer)
             .collect::<Vec<_>>();
-        let buffer = self.concat_buffers(&buffers);
+        let buffer = self.concat_buffers_on(&buffers, stream);
         self.create_matrix(buffer, rows, cols)
     }
 
     /// Concatenates equally tall matrices by physically interleaving each
     /// row's contiguous segments into a new row-major allocation.
-    pub fn matrix_concat_cols(&mut self, matrices: &[&Matrix]) -> Matrix {
+    pub fn matrix_concat_cols(
+        &mut self,
+        matrices: &[&Matrix],
+        stream: Option<&CudaStream>,
+    ) -> Matrix {
         assert!(
             !matrices.is_empty(),
             "matrix concat requires at least one input"
@@ -64,11 +72,16 @@ impl CudaRuntime {
                 ));
             }
         }
-        let buffer = self.concat_buffers_from_span(&spans);
+        let buffer = self.concat_buffers_from_span_on(&spans, stream);
         self.create_matrix(buffer, rows, cols)
     }
 
-    pub fn matrix_split_rows(&mut self, matrix: &Matrix, row_sizes: &[usize]) -> Vec<Matrix> {
+    pub fn matrix_split_rows(
+        &mut self,
+        matrix: &Matrix,
+        row_sizes: &[usize],
+        stream: Option<&CudaStream>,
+    ) -> Vec<Matrix> {
         validate_partition(row_sizes, matrix.rows, "row");
         let mut offset = 0usize;
         row_sizes
@@ -79,13 +92,22 @@ impl CudaRuntime {
                     .expect("row split size overflow");
                 let span = DeviceSpan::from_buffer(&matrix.buffer, offset, len);
                 offset += len;
-                let buffer = span.to_buffer(self);
+                let buffer = if let Some(stream) = stream {
+                    span.to_buffer_on(self, stream)
+                } else {
+                    span.to_buffer(self)
+                };
                 self.create_matrix(buffer, rows, matrix.cols)
             })
             .collect()
     }
 
-    pub fn matrix_split_cols(&mut self, matrix: &Matrix, col_sizes: &[usize]) -> Vec<Matrix> {
+    pub fn matrix_split_cols(
+        &mut self,
+        matrix: &Matrix,
+        col_sizes: &[usize],
+        stream: Option<&CudaStream>,
+    ) -> Vec<Matrix> {
         validate_partition(col_sizes, matrix.cols, "column");
         let mut column_offset = 0usize;
         col_sizes
@@ -103,25 +125,17 @@ impl CudaRuntime {
                     })
                     .collect::<Vec<_>>();
                 column_offset += cols;
-                let buffer = self.concat_buffers_from_span(&spans);
+                let buffer = self.concat_buffers_from_span_on(&spans, stream);
                 self.create_matrix(buffer, matrix.rows, cols)
             })
             .collect()
     }
 
-    pub fn matrix_transpose(&mut self, mat: &Matrix) -> Matrix {
+    pub fn matrix_transpose(&mut self, mat: &Matrix, stream: Option<&CudaStream>) -> Matrix {
         let rows = mat.cols;
         let cols = mat.rows;
         let mut result_buffer = self.get_uninit_buffer(rows * cols);
-        self.matrix_transpose_into_on(self.stream(), mat, &mut result_buffer);
-        self.create_matrix(result_buffer, rows, cols)
-    }
-
-    pub(crate) fn matrix_transpose_on(&mut self, mat: &Matrix, stream: &CudaStream) -> Matrix {
-        let rows = mat.cols;
-        let cols = mat.rows;
-        let mut result_buffer = self.get_uninit_buffer(rows * cols);
-        stream.join(self.stream()).unwrap();
+        let stream = self.execution_stream(stream);
         self.matrix_transpose_into_on(stream, mat, &mut result_buffer);
         self.create_matrix(result_buffer, rows, cols)
     }
@@ -157,32 +171,41 @@ impl CudaRuntime {
             .unwrap();
     }
 
-    pub fn vector_zip(&mut self, vecs: &[Vector]) -> Matrix {
+    pub fn vector_zip(&mut self, vecs: &[Vector], stream: Option<&CudaStream>) -> Matrix {
         let spans = vecs.iter().map(|v| v.as_span()).collect::<Vec<_>>();
         let rows = spans.len();
         let cols = spans[0].len();
-        let buffer = self.concat_buffers_from_span(&spans);
+        let buffer = self.concat_buffers_from_span_on(&spans, stream);
 
         self.create_matrix(buffer, rows, cols)
     }
 
-    pub fn matrix_split(&mut self, matrix: &Matrix) -> Vec<Vector> {
+    pub fn matrix_split(&mut self, matrix: &Matrix, stream: Option<&CudaStream>) -> Vec<Vector> {
         let spans = DeviceSpan::chunks(&matrix.buffer, matrix.cols);
         let mut vectors = Vec::with_capacity(spans.len());
         for span in spans {
-            let buffer = span.to_buffer(self);
+            let buffer = if let Some(stream) = stream {
+                span.to_buffer_on(self, stream)
+            } else {
+                span.to_buffer(self)
+            };
             vectors.push(self.create_vector(buffer));
         }
         vectors
     }
 
-    pub fn broadcast(&mut self, vector: &Vector, copies: usize) -> Matrix {
+    pub fn broadcast(
+        &mut self,
+        vector: &Vector,
+        copies: usize,
+        stream: Option<&CudaStream>,
+    ) -> Matrix {
         let spans = vec![vector.as_span(); copies];
-        let buffer = self.concat_buffers_from_span(&spans);
+        let buffer = self.concat_buffers_from_span_on(&spans, stream);
         self.create_matrix(buffer, copies, vector.len())
     }
 
-    pub fn extract_vector(&mut self, matrix: Matrix) -> Vector {
+    pub fn extract_vector(&mut self, matrix: Matrix, stream: Option<&CudaStream>) -> Vector {
         assert!(
             matrix.rows > 0,
             "cannot extract a vector from an empty matrix"
@@ -193,11 +216,21 @@ impl CudaRuntime {
         }
 
         let span = DeviceSpan::from_buffer(&matrix.buffer, 0, matrix.cols);
-        let buffer = span.to_buffer(self);
+        let buffer = if let Some(stream) = stream {
+            span.to_buffer_on(self, stream)
+        } else {
+            span.to_buffer(self)
+        };
         self.create_vector(buffer)
     }
 
-    pub fn matrix_slice(&mut self, matrix: &Matrix, cols: usize, rows: usize) -> Vec<Matrix> {
+    pub fn matrix_slice(
+        &mut self,
+        matrix: &Matrix,
+        cols: usize,
+        rows: usize,
+        stream: Option<&CudaStream>,
+    ) -> Vec<Matrix> {
         assert!(cols > 0, "matrix slice cols must be non-zero");
         assert!(rows > 0, "matrix slice rows must be non-zero");
         assert_eq!(
@@ -227,7 +260,7 @@ impl CudaRuntime {
                     tile_spans.push(spans[span_index].clone());
                 }
 
-                let buffer = self.concat_buffers_from_span(&tile_spans);
+                let buffer = self.concat_buffers_from_span_on(&tile_spans, stream);
                 result.push(self.create_matrix(buffer, rows, cols));
             }
         }

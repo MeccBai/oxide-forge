@@ -1,7 +1,4 @@
-use crate::cuda::{
-    self,
-    runtime::CudaRuntime,
-};
+use crate::cuda::{self, runtime::CudaRuntime};
 use cuda::container::{Matrix, Vector};
 use cuda_core::CudaStream;
 use serde::{Deserialize, Serialize};
@@ -98,12 +95,12 @@ impl LinearMomentum {
         bias_gradient: Option<&Vector>,
         runtime: &mut CudaRuntime,
     ) {
-        let input_transpose = runtime.matrix_transpose(input);
-        let weight_gradient = runtime.matrix_multiply(&input_transpose, gradient);
+        let input_transpose = runtime.matrix_transpose(input, None);
+        let weight_gradient = runtime.matrix_multiply(&input_transpose, gradient, None);
         runtime.recycle_matrix(input_transpose);
 
         if let Some(total) = &mut self.weight_gradient {
-            total.binary_assign(&weight_gradient,move | lhs, rhs| {lhs + rhs },runtime);
+            total.binary_assign(&weight_gradient, move |lhs, rhs| lhs + rhs, runtime);
             runtime.recycle_matrix(weight_gradient);
         } else {
             self.weight_gradient = Some(weight_gradient);
@@ -112,9 +109,9 @@ impl LinearMomentum {
         match bias_gradient {
             Some(bias_gradient) => {
                 if let Some(total) = &mut self.bias_gradient {
-                    total.binary_assign(bias_gradient,  runtime,move | lhs, rhs| lhs + rhs);
+                    total.binary_assign(bias_gradient, runtime, move |lhs, rhs| lhs + rhs);
                 } else {
-                    self.bias_gradient = Some(runtime.clone_vector(bias_gradient));
+                    self.bias_gradient = Some(runtime.clone_vector(bias_gradient, None));
                 }
             }
             None => assert!(
@@ -150,15 +147,17 @@ impl LinearMomentum {
         weight_gradient.scale(inverse_batch, runtime);
         if let Some(velocity) = &mut self.weight_velocity {
             velocity.scale(momentum, runtime);
-            velocity.binary_assign(&weight_gradient, move | lhs, rhs| lhs + rhs, runtime);
+            velocity.binary_assign(&weight_gradient, move |lhs, rhs| lhs + rhs, runtime);
             runtime.recycle_matrix(weight_gradient);
         } else {
             self.weight_velocity = Some(weight_gradient);
         }
 
-        let mut weight_update = runtime.clone_matrix(self.weight_velocity.as_ref().unwrap());
+        let mut weight_update = runtime.clone_matrix(self.weight_velocity.as_ref().unwrap(), None);
         weight_update.scale(learning_rate, runtime);
-        linear.weights.binary_assign(&weight_update, move | lhs, rhs| lhs - rhs, runtime);
+        linear
+            .weights
+            .binary_assign(&weight_update, move |lhs, rhs| lhs - rhs, runtime);
         runtime.recycle_matrix(weight_update);
 
         match (&mut linear.bias, self.bias_gradient.take()) {
@@ -166,15 +165,16 @@ impl LinearMomentum {
                 bias_gradient.scale(inverse_batch, runtime);
                 if let Some(velocity) = &mut self.bias_velocity {
                     velocity.scale(momentum, runtime);
-                    velocity.binary_assign(&bias_gradient, runtime,move | lhs, rhs| lhs + rhs);
+                    velocity.binary_assign(&bias_gradient, runtime, move |lhs, rhs| lhs + rhs);
                     runtime.recycle_vector(bias_gradient);
                 } else {
                     self.bias_velocity = Some(bias_gradient);
                 }
 
-                let mut bias_update = runtime.clone_vector(self.bias_velocity.as_ref().unwrap());
+                let mut bias_update =
+                    runtime.clone_vector(self.bias_velocity.as_ref().unwrap(), None);
                 bias_update.scale(learning_rate, runtime);
-                bias.binary_assign(&bias_update,  runtime,move | lhs, rhs| lhs - rhs);
+                bias.binary_assign(&bias_update, runtime, move |lhs, rhs| lhs - rhs);
                 runtime.recycle_vector(bias_update);
             }
             (None, None) => {}
@@ -304,12 +304,12 @@ impl Linear {
         runtime.matrix_multiply_into_on(stream, input, &self.weights, output);
         if let Some(ref bias) = self.bias {
             assert_eq!(output.cols(), bias.len());
-            output.binary_assign_by_rows_on(bias, move | lhs, rhs| lhs + rhs, runtime, stream);
+            output.binary_assign_by_rows_on(bias, move |lhs, rhs| lhs + rhs, runtime, stream);
         }
         if let Some(residual_matrix) = residual {
             assert_eq!(output.rows(), residual_matrix.rows());
             assert_eq!(output.cols(), residual_matrix.cols());
-            output.binary_assign_on(residual_matrix, move | lhs, rhs| lhs + rhs, runtime, stream);
+            output.binary_assign_on(residual_matrix, move |lhs, rhs| lhs + rhs, runtime, stream);
         }
     }
 
@@ -357,7 +357,7 @@ impl Linear {
         output_gradient: &Matrix,
         runtime: &mut CudaRuntime,
     ) -> (Matrix, Option<Vector>) {
-        let mut gradient = runtime.clone_matrix(output_gradient);
+        let mut gradient = runtime.clone_matrix(output_gradient, None);
 
         if !matches!(self.activation, Activation::Identity) {
             let pre_activation =
@@ -365,16 +365,16 @@ impl Linear {
             assert_eq!(pre_activation.rows(), output_gradient.rows());
             assert_eq!(pre_activation.cols(), output_gradient.cols());
             let activation = self.activation;
-            let mut derivative = runtime.clone_matrix(pre_activation);
+            let mut derivative = runtime.clone_matrix(pre_activation, None);
 
             derivative.for_each(runtime, move |x| activation.derivative(x));
 
-            gradient.binary_assign(&derivative, move | lhs, rhs| lhs * rhs, runtime);
+            gradient.binary_assign(&derivative, move |lhs, rhs| lhs * rhs, runtime);
         }
 
         let bias_gradient = if self.bias.is_some() {
-            let transposed = runtime.matrix_transpose(&gradient);
-            Some(runtime.matrix_sum_rows(&transposed))
+            let transposed = runtime.matrix_transpose(&gradient, None);
+            Some(runtime.matrix_sum_rows(&transposed, None))
         } else {
             None
         };
@@ -389,7 +389,7 @@ impl Linear {
         runtime: &mut CudaRuntime,
         stream: &CudaStream,
     ) -> (Matrix, Option<Vector>) {
-        let mut gradient = runtime.clone_matrix_on(output_gradient, stream);
+        let mut gradient = runtime.clone_matrix(output_gradient, Some(stream));
 
         if !matches!(self.activation, Activation::Identity) {
             let pre_activation =
@@ -397,15 +397,15 @@ impl Linear {
             assert_eq!(pre_activation.rows(), output_gradient.rows());
             assert_eq!(pre_activation.cols(), output_gradient.cols());
             let activation = self.activation;
-            let mut derivative = runtime.clone_matrix_on(pre_activation, stream);
+            let mut derivative = runtime.clone_matrix(pre_activation, Some(stream));
 
             derivative.for_each_on(runtime, stream, move |x| activation.derivative(x));
-            gradient.binary_assign_on(&derivative, move | lhs, rhs| lhs * rhs, runtime, stream);
+            gradient.binary_assign_on(&derivative, move |lhs, rhs| lhs * rhs, runtime, stream);
         }
 
         let bias_gradient = if self.bias.is_some() {
-            let transposed = runtime.matrix_transpose_on(&gradient, stream);
-            Some(runtime.matrix_sum_rows_on(&transposed, stream))
+            let transposed = runtime.matrix_transpose(&gradient, Some(stream));
+            Some(runtime.matrix_sum_rows(&transposed, Some(stream)))
         } else {
             None
         };
@@ -431,11 +431,11 @@ impl Linear {
     }
 
     fn loss_rows_default(output: &Matrix, target: &Matrix, runtime: &mut CudaRuntime) -> Vector {
-        let mut loss = runtime.matrix_binary(output, target, move | lhs, rhs| lhs - rhs);
+        let mut loss = runtime.matrix_binary(output, target, move |lhs, rhs| lhs - rhs, None);
         loss.for_each(runtime, |x| 0.5 * x * x);
 
         let cols = loss.cols() as f32;
-        let mut row_loss = runtime.matrix_sum_rows(&loss);
+        let mut row_loss = runtime.matrix_sum_rows(&loss, None);
         row_loss.scale(1.0 / cols, runtime);
         row_loss
     }
@@ -446,11 +446,12 @@ impl Linear {
         runtime: &mut CudaRuntime,
         stream: &CudaStream,
     ) -> Vector {
-        let mut loss = runtime.matrix_binary_on(stream, output, target, move | lhs, rhs| lhs - rhs);
+        let mut loss =
+            runtime.matrix_binary(output, target, move |lhs, rhs| lhs - rhs, Some(stream));
         loss.for_each_on(runtime, stream, |x| 0.5 * x * x);
 
         let cols = loss.cols() as f32;
-        let mut row_loss = runtime.matrix_sum_rows_on(&loss, stream);
+        let mut row_loss = runtime.matrix_sum_rows(&loss, Some(stream));
         row_loss.scale_on(1.0 / cols, runtime, stream);
         row_loss
     }
@@ -486,15 +487,18 @@ impl Linear {
         learning_rate: f32,
         runtime: &mut CudaRuntime,
     ) {
-        let input_transpose = runtime.matrix_transpose(input);
-        let mut weight_gradient = runtime.matrix_multiply(&input_transpose, gradient);
+        let input_transpose = runtime.matrix_transpose(input, None);
+        let mut weight_gradient = runtime.matrix_multiply(&input_transpose, gradient, None);
         weight_gradient.scale(learning_rate, runtime);
-        self.weights.binary_assign(&weight_gradient, move | lhs, rhs| lhs - rhs, runtime);
+        self.weights
+            .binary_assign(&weight_gradient, move |lhs, rhs| lhs - rhs, runtime);
         if let Some(ref mut bias) = self.bias {
-            let mut scaled_bias_gradient = runtime
-                .clone_vector(bias_gradient.expect("missing bias gradient for biased Linear"));
+            let mut scaled_bias_gradient = runtime.clone_vector(
+                bias_gradient.expect("missing bias gradient for biased Linear"),
+                None,
+            );
             scaled_bias_gradient.scale(learning_rate, runtime);
-            bias.binary_assign(&scaled_bias_gradient, runtime,move| lhs, rhs| lhs - rhs);
+            bias.binary_assign(&scaled_bias_gradient, runtime, move |lhs, rhs| lhs - rhs);
         }
     }
 
@@ -507,18 +511,23 @@ impl Linear {
         runtime: &mut CudaRuntime,
         stream: &CudaStream,
     ) {
-        let input_transpose = runtime.matrix_transpose_on(input, stream);
-        let mut weight_gradient = runtime.matrix_multiply_on(stream, &input_transpose, gradient);
+        let input_transpose = runtime.matrix_transpose(input, Some(stream));
+        let mut weight_gradient = runtime.matrix_multiply(&input_transpose, gradient, Some(stream));
         weight_gradient.for_each_on(runtime, stream, move |x| x * learning_rate);
         self.weights
-            .binary_assign_on(&weight_gradient, move | lhs, rhs| lhs - rhs, runtime, stream);
+            .binary_assign_on(&weight_gradient, move |lhs, rhs| lhs - rhs, runtime, stream);
         if let Some(ref mut bias) = self.bias {
-            let mut scaled_bias_gradient = runtime.clone_vector_on(
+            let mut scaled_bias_gradient = runtime.clone_vector(
                 bias_gradient.expect("missing bias gradient for biased Linear"),
-                stream,
+                Some(stream),
             );
             scaled_bias_gradient.scale_on(learning_rate, runtime, stream);
-            bias.binary_assign_on(&scaled_bias_gradient, move | lhs, rhs| lhs - rhs, runtime, stream);
+            bias.binary_assign_on(
+                &scaled_bias_gradient,
+                move |lhs, rhs| lhs - rhs,
+                runtime,
+                stream,
+            );
         }
     }
 
@@ -537,8 +546,8 @@ impl Linear {
     }
 
     fn input_gradient_default(&self, gradient: &Matrix, runtime: &mut CudaRuntime) -> Matrix {
-        let weights_transpose = runtime.matrix_transpose(&self.weights);
-        runtime.matrix_multiply(gradient, &weights_transpose)
+        let weights_transpose = runtime.matrix_transpose(&self.weights, None);
+        runtime.matrix_multiply(gradient, &weights_transpose, None)
     }
 
     fn input_gradient_on(
@@ -547,8 +556,8 @@ impl Linear {
         runtime: &mut CudaRuntime,
         stream: &CudaStream,
     ) -> Matrix {
-        let weights_transpose = runtime.matrix_transpose_on(&self.weights, stream);
-        runtime.matrix_multiply_on(stream, gradient, &weights_transpose)
+        let weights_transpose = runtime.matrix_transpose(&self.weights, Some(stream));
+        runtime.matrix_multiply(gradient, &weights_transpose, Some(stream))
     }
 
     pub fn backward_with_res(
@@ -584,21 +593,21 @@ impl Linear {
         assert_eq!(output_gradient.rows(), residual_gradient.rows());
         assert_eq!(output_gradient.cols(), residual_gradient.cols());
 
-        let mut gradient = runtime.clone_matrix(output_gradient);
-        gradient.binary_assign(residual_gradient, move | lhs, rhs| lhs + rhs, runtime);
+        let mut gradient = runtime.clone_matrix(output_gradient, None);
+        gradient.binary_assign(residual_gradient, move |lhs, rhs| lhs + rhs, runtime);
 
         if !matches!(self.activation, Activation::Identity) {
             let activation = self.activation;
-            let mut derivative = runtime.clone_matrix(pre_activation);
+            let mut derivative = runtime.clone_matrix(pre_activation, None);
 
             derivative.for_each(runtime, move |x| activation.derivative(x));
 
-            gradient.binary_assign(&derivative, move | lhs, rhs| lhs * rhs, runtime);
+            gradient.binary_assign(&derivative, move |lhs, rhs| lhs * rhs, runtime);
         }
 
         let bias_gradient = if self.bias.is_some() {
-            let transposed = runtime.matrix_transpose(&gradient);
-            Some(runtime.matrix_sum_rows(&transposed))
+            let transposed = runtime.matrix_transpose(&gradient, None);
+            Some(runtime.matrix_sum_rows(&transposed, None))
         } else {
             None
         };
@@ -619,19 +628,24 @@ impl Linear {
         assert_eq!(output_gradient.rows(), residual_gradient.rows());
         assert_eq!(output_gradient.cols(), residual_gradient.cols());
 
-        let mut gradient = runtime.clone_matrix_on(output_gradient, stream);
-        gradient.binary_assign_on(residual_gradient, move | lhs, rhs| lhs + rhs, runtime, stream);
+        let mut gradient = runtime.clone_matrix(output_gradient, Some(stream));
+        gradient.binary_assign_on(
+            residual_gradient,
+            move |lhs, rhs| lhs + rhs,
+            runtime,
+            stream,
+        );
 
         if !matches!(self.activation, Activation::Identity) {
             let activation = self.activation;
-            let mut derivative = runtime.clone_matrix_on(pre_activation, stream);
+            let mut derivative = runtime.clone_matrix(pre_activation, Some(stream));
             derivative.for_each_on(runtime, stream, move |x| activation.derivative(x));
-            gradient.binary_assign_on(&derivative, move | lhs, rhs| lhs * rhs, runtime, stream);
+            gradient.binary_assign_on(&derivative, move |lhs, rhs| lhs * rhs, runtime, stream);
         }
 
         let bias_gradient = if self.bias.is_some() {
-            let transposed = runtime.matrix_transpose_on(&gradient, stream);
-            Some(runtime.matrix_sum_rows_on(&transposed, stream))
+            let transposed = runtime.matrix_transpose(&gradient, Some(stream));
+            Some(runtime.matrix_sum_rows(&transposed, Some(stream)))
         } else {
             None
         };

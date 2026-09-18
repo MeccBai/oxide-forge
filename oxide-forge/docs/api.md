@@ -104,7 +104,7 @@ pub enum InitType {
 ### Construction and properties
 
 ```rust
-let matrix = runtime.new_matrix(InitType::Random, rows, cols);
+let matrix = runtime.new_matrix(InitType::Random, rows, cols, None);
 
 matrix.rows();
 matrix.cols();
@@ -120,16 +120,16 @@ index = row * cols + col
 ### CudaRuntime: operations that create containers
 
 ```rust
-let product = runtime.matrix_multiply(&a, &b);
-let sum = runtime.matrix_add(&a, &b);
-let transposed = runtime.matrix_transpose(&a);
-let row_sums = runtime.matrix_sum_rows(&a);
+let product = runtime.matrix_multiply(&a, &b, None);
+let sum = runtime.matrix_add(&a, &b, None);
+let transposed = runtime.matrix_transpose(&a, None);
+let row_sums = runtime.matrix_sum_rows(&a, None);
 ```
 
 Element-wise container arithmetic accepts a device-compilable closure:
 
 ```rust
-let c = runtime.matrix_binary(&a, &b, move |lhs, rhs| lhs * rhs);
+let c = runtime.matrix_binary(&a, &b, move |lhs, rhs| lhs * rhs, None);
 matrix.binary_assign(&rhs, move |lhs, rhs| lhs + rhs, &runtime);
 matrix.binary_assign_by_rows(&bias, move |lhs, rhs| lhs + rhs, &runtime);
 ```
@@ -145,25 +145,21 @@ code and introduces no dynamic dispatch or additional kernel launch.
 
 | API | Constraint | Output shape |
 | --- | --- | --- |
-| `matrix_multiply(a, b)` | `a.cols == b.rows`; SM80+; M/K/N must currently be multiples of 16 | `[a.rows, b.cols]` |
-| `matrix_add(a, b)` | Identical shapes | Input shape |
-| `matrix_transpose(a)` | No additional shape constraint | `[a.cols, a.rows]` |
-| `matrix_sum_rows(a)` | Non-empty rows | Vector with `a.rows` elements |
-| `softmax_rows_backward(p, dy)` | Identical shapes; at most 1024 columns | `dScores`, same shape |
-| `layer_norm_backward(x, dy)` | Identical shapes; at most 1024 columns | `dX`, same shape |
+| `matrix_multiply(a, b, stream)` | `a.cols == b.rows`; SM80+; M/K/N must currently be multiples of 16 | `[a.rows, b.cols]` |
+| `matrix_add(a, b, stream)` | Identical shapes | Input shape |
+| `matrix_transpose(a, stream)` | No additional shape constraint | `[a.cols, a.rows]` |
+| `matrix_sum_rows(a, stream)` | Non-empty rows | Vector with `a.rows` elements |
+| `softmax_rows_backward(p, dy, stream)` | Identical shapes; at most 1024 columns | `dScores`, same shape |
+| `layer_norm_backward(x, dy, stream)` | Identical shapes; at most 1024 columns | `dX`, same shape |
 
 `matrix_multiply` uses Tensor Core TF32 products with `f32` accumulation and
 output. This trades a small amount of input-mantissa precision for substantially
 higher throughput; it is not a strict IEEE FP32 GEMM.
 
-The allocating `matrix_multiply` entry point is a thin wrapper around the
-internal `matrix_multiply_into_on`. The latter accepts a preallocated output and
-an explicit stream, allowing model executors to schedule independent GEMMs
-without exposing stream selection through the ordinary container API.
-
-These operations submit work to the primary stream asynchronously. A later
-kernel on the same stream may consume the returned Matrix without an explicit
-synchronization.
+Every allocating Matrix/Vector runtime API accepts a final `Option<&CudaStream>`.
+Pass `None` for the primary stream or `Some(stream)` for an explicit stream.
+Both forms submit asynchronously; synchronize or join streams only at an actual
+dependency boundary.
 
 ### Scalar reductions
 
@@ -239,17 +235,17 @@ reduction is involved.
 | --- | --- | --- |
 | `vector_zip(vectors)` | Equal-length Vectors become Matrix rows | Yes |
 | `matrix.row_views()` | A `Vec<VectorView>` over Matrix rows | No |
-| `matrix_split(matrix)` | Independent Vector for every row | Yes |
+| `matrix_split(matrix, stream)` | Independent Vector for every row | Yes |
 | `broadcast(vector, copies)` | `[copies, vector.len]` Matrix | Yes |
 | `extract_vector(matrix)` | Transfers a single-row buffer; copies the first row otherwise | Depends |
 | `matrix_slice(matrix, cols, rows)` | Physically rearranged contiguous matrix blocks | Yes |
-| `matrix_concat_rows(matrices)` | Concatenate complete row ranges | Yes |
-| `matrix_concat_cols(matrices)` | Physically interleave row segments by columns | Yes |
-| `matrix_split_rows(matrix, sizes)` | Independently owned row partitions | Yes |
-| `matrix_split_cols(matrix, sizes)` | Physically rearranged column partitions | Yes |
+| `matrix_concat_rows(matrices, stream)` | Concatenate complete row ranges | Yes |
+| `matrix_concat_cols(matrices, stream)` | Physically interleave row segments by columns | Yes |
+| `matrix_split_rows(matrix, sizes, stream)` | Independently owned row partitions | Yes |
+| `matrix_split_cols(matrix, sizes, stream)` | Physically rearranged column partitions | Yes |
 | `matrix_into_vector(matrix)` | Consumes the Matrix and transfers its entire buffer | No |
 | `vector_into_matrix(vector)` | Consumes the Vector and transfers its buffer as one column | No |
-| `clone_matrix(matrix)` | Independent Matrix with the same shape | Yes |
+| `clone_matrix(matrix, stream)` | Independent Matrix with the same shape | Yes |
 
 While values returned by `row_views` are alive, the source Matrix remains
 exclusively borrowed. Transpose before column-wise processing.
@@ -259,8 +255,8 @@ exclusively borrowed. Transpose before column-wise processing.
 ### Construction and properties
 
 ```rust
-let vector = runtime.new_vector(InitType::Random, len);
-let cloned = runtime.clone_vector(&vector);
+let vector = runtime.new_vector(InitType::Random, len, None);
+let cloned = runtime.clone_vector(&vector, None);
 
 vector.len();
 vector.to_host(&runtime);
@@ -284,8 +280,8 @@ let squared_sum = vector.map_sum(&mut runtime, move |x| x * x);
 let custom = vector.map_reduce(&mut runtime, 0.0, move |x| x, move |a, b| a + b);
 vector.softmax(&mut runtime);
 
-let c = runtime.vector_add(&a, &b);
-let product = runtime.vector_binary(&a, &b, move |lhs, rhs| lhs * rhs);
+let c = runtime.vector_add(&a, &b, None);
+let product = runtime.vector_binary(&a, &b, move |lhs, rhs| lhs * rhs, None);
 vector.binary_assign(&rhs, &runtime, move |lhs, rhs| lhs + rhs);
 let dot = a.dot(&b, &mut runtime);
 ```
@@ -456,6 +452,21 @@ rows and columns. Sizes describe row counts for `Rows` and column counts for
 contiguous row-major storage. Column operations physically rearrange data rather
 than creating a strided view.
 
+### FanOutNode
+
+```rust
+use oxide_forge::net::node::{FanOutMode, TrainingFanOutNode};
+
+let mut branches = TrainingFanOutNode::new(FanOutMode::Copy, 3);
+let outputs = branches.forward(input, &mut runtime);
+let input_gradient = branches.backward(output_gradients, &mut runtime);
+```
+
+`FanOutMode::Copy` creates `n` independently owned copies of the input; its
+backward sums all branch gradients. `FanOutMode::Average` sends `input / n` to
+each branch and returns `sum(branch_gradients) / n` during backward. Both modes
+require at least two outputs and retain no numerical forward cache.
+
 ### RowReduceNode
 
 ```rust
@@ -573,6 +584,28 @@ the old weights before
 applying its SGD update. Residual gradients are accumulated at the source
 activation.
 
+### SwiGLU
+
+`InferenceSwiglu` and `TrainingSwiglu` implement the standard three-projection
+SwiGLU block:
+
+```text
+gate   = input @ W_gate
+up     = input @ W_up
+hidden = SiLU(gate) * up
+output = hidden @ W_down
+```
+
+`W_gate` and `W_up` have shape `[input_features, hidden_features]`; `W_down`
+has shape `[hidden_features, output_features]`. The constructors accept these
+three weight matrices and create bias-free Identity Linear projections.
+
+Training forward consumes its input. The activation and product nodes retain
+their own minimal backward state, while `TrainingSwiglu` retains only the input
+and hidden Matrix required for the three parameter gradients. It exposes the
+same `backward_accumulate` plus `step(learning_rate, momentum, batch_len)` model
+as `TrainingMlp`; `backward` is the one-sample zero-momentum convenience path.
+
 ### Transformer
 
 ```text
@@ -595,7 +628,7 @@ owned closure that maps an input Matrix to a newly allocated Matrix:
 
 ```rust
 let position_encoding = move |input: &Matrix, runtime: &mut CudaRuntime| {
-    runtime.matrix_add(input, &position)
+    runtime.matrix_add(input, &position, None)
 };
 
 let transformer = InferenceTransformer::new(
