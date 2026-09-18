@@ -36,8 +36,8 @@ Implemented capabilities include:
   concat/split/fan-out;
 - inference and training SwiGLU blocks assembled from reusable Linear,
   activation, product, and optimizer components;
-- single-head Post-Norm Transformer executors with selectable LayerNorm/RMSNorm
-  inference and training;
+- const-generic multi-head Post-Norm Transformer executors with selectable
+  LayerNorm/RMSNorm inference and training;
 - parameter checkpoint save/load for MLP and Transformer executors;
 - asynchronous submission on the primary stream and explicit fork/join for
   additional streams.
@@ -95,7 +95,7 @@ The current Transformer consumes a `[sequence, hidden]` matrix:
 ```text
 X = position_encoding(input)
     ├── Q ──┐
-    ├── K ──┴── QKᵀ / √hidden ── row softmax ──┐
+    ├── K ──┴── QₕKₕᵀ / √head_dim ── row softmax ──┐
     └── V ─────────────────────────────────────┴── attention value
                                                        │
 X ───────────────── residual ── Norm ── FFN ── residual ── Norm
@@ -193,8 +193,9 @@ synchronization, and network-layer reference.
   multiples of 16;
 - row Softmax, LayerNorm, and RMSNorm backward currently support at most 1024
   elements per row;
-- the current Transformer is single-head and Post-Norm; inference and training
-  support LayerNorm or RMSNorm;
+- the Transformer is Post-Norm and uses a compile-time head count; the Q/K/V
+  buffers stay contiguous and are addressed as per-head ranges without a
+  physical split;
 - parameter updates currently use classical Momentum SGD rather than a general
   optimizer abstraction;
 - checkpoint format version 1 stores little-endian `f32` parameters; unsupported

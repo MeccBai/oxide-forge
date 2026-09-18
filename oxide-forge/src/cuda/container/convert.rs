@@ -140,6 +140,44 @@ impl CudaRuntime {
         self.create_matrix(result_buffer, rows, cols)
     }
 
+    pub(crate) fn matrix_transpose_batches(
+        &mut self,
+        matrix: &Matrix,
+        batch_count: usize,
+        rows: usize,
+        cols: usize,
+        stream: Option<&CudaStream>,
+    ) -> Matrix {
+        assert!(batch_count > 0 && rows > 0 && cols > 0);
+        assert_eq!(matrix.buffer.len(), batch_count * rows * cols);
+        let mut result = self.new_uninit_matrix(batch_count * cols, rows);
+        let grid = (
+            cols.div_ceil(32) as u32,
+            (batch_count * rows.div_ceil(32)) as u32,
+        );
+        let config = LaunchConfig2D::new(grid, (32, 8), 0);
+        let prepared = self
+            .module()
+            .prepare_matrix_transpose_batches(config)
+            .unwrap();
+        let input = DeviceSpan::from_buffer(&matrix.buffer, 0, matrix.buffer.len());
+        let output_len = result.buffer.len();
+        let output = DeviceSpanMut::from_buffer(&mut result.buffer, 0, output_len);
+        let stream = self.execution_stream(stream);
+        self.module()
+            .matrix_transpose_batches(
+                stream,
+                &prepared,
+                input.descriptor(),
+                output.descriptor(),
+                rows,
+                cols,
+                batch_count,
+            )
+            .unwrap();
+        result
+    }
+
     fn matrix_transpose_into_on(
         &self,
         stream: &CudaStream,

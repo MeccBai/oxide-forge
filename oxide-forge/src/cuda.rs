@@ -1,6 +1,5 @@
 const DEFAULT_BLOCK_SIZE: usize = 1024;
 
-
 #[inline(always)]
 pub(crate) fn sigmoid_f32(value: f32) -> f32 {
     if value >= 0.0 {

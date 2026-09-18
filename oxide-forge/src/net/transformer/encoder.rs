@@ -3,18 +3,19 @@ use crate::net::linear::{Linear, LinearMomentum};
 use crate::net::metadata::{HostData, MetadataCursor};
 use crate::net::mlp::{InferenceMLP, TrainingMlp};
 use crate::net::node::{BinaryNode, BinaryOp, SingleType, TrainingBinaryNode, TrainingSingleNode};
+use crate::net::transformer::attention::multi::Attention;
 use cuda_core::CudaStream;
 
 use std::sync::Arc;
 
 pub use super::inference::TransformerMetadata;
-use super::{NormType, PositionEncoding, attention::Attention, inference::InferenceBlock};
+use super::{NormType, PositionEncoding, inference::InferenceBlock};
 
-pub struct InferenceTransformer {
-    block: InferenceBlock,
+pub struct InferenceTransformer<const HEADS: usize = 1> {
+    block: InferenceBlock<HEADS>,
 }
 
-impl InferenceTransformer {
+impl<const HEADS: usize> InferenceTransformer<HEADS> {
     pub fn new<F>(
         q_matrix: Linear,
         k_matrix: Linear,
@@ -55,8 +56,8 @@ impl InferenceTransformer {
     }
 }
 
-pub struct TrainingTransformer {
-    attention: Attention,
+pub struct TrainingTransformer<const HEADS: usize = 1> {
+    attention: Attention<HEADS>,
     position_encoding: PositionEncoding,
     fcs: TrainingMlp,
     output_matrix: Linear,
@@ -70,7 +71,7 @@ struct TransformerCache {
     encoded: Matrix,
 }
 
-impl TrainingTransformer {
+impl<const HEADS: usize> TrainingTransformer<HEADS> {
     pub fn new<F>(
         q_matrix: Linear,
         k_matrix: Linear,
@@ -102,6 +103,7 @@ impl TrainingTransformer {
         let qkv = self.attention.get_meta_data(cursor);
         TransformerMetadata {
             block_count: 1,
+            attention_heads: HEADS,
             attention_residual: true,
             feed_forward_residual: true,
             normalization: self.attention.norm_type(),

@@ -173,7 +173,32 @@ impl Matrix {
         let matrix = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
         runtime
             .module()
-            .matrix_causal_mask(runtime.stream(), &prepared, matrix.descriptor(), self.cols)
+            .matrix_causal_mask(
+                runtime.stream(),
+                &prepared,
+                matrix.descriptor(),
+                self.cols,
+                self.rows,
+            )
+            .unwrap();
+    }
+
+    pub(crate) fn causal_mask_heads(&mut self, head_rows: usize, runtime: &CudaRuntime) {
+        assert!(head_rows > 0 && self.rows % head_rows == 0);
+        assert_eq!(self.cols, head_rows);
+        let config = LaunchConfig1D::new(self.rows as u32, self.cols as u32, 0);
+        let prepared = runtime.module().prepare_matrix_causal_mask(config).unwrap();
+        let len = self.buffer.len();
+        let matrix = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
+        runtime
+            .module()
+            .matrix_causal_mask(
+                runtime.stream(),
+                &prepared,
+                matrix.descriptor(),
+                self.cols,
+                head_rows,
+            )
             .unwrap();
     }
 
@@ -276,6 +301,82 @@ impl CudaRuntime {
                 len,
                 rows,
                 cols,
+            )
+            .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn matrix_multiply_batched_strided_into(
+        &self,
+        mat1: &Matrix,
+        mat2: &Matrix,
+        result: &mut Matrix,
+        inner: usize,
+        rows: usize,
+        cols: usize,
+        batch_count: usize,
+        a_offset: usize,
+        a_row_stride: usize,
+        a_batch_stride: usize,
+        b_offset: usize,
+        b_row_stride: usize,
+        b_batch_stride: usize,
+        result_offset: usize,
+        result_row_stride: usize,
+        result_batch_stride: usize,
+    ) {
+        assert!(rows > 0 && cols > 0 && inner > 0 && batch_count > 0);
+        assert_eq!(rows % 16, 0);
+        assert_eq!(cols % 16, 0);
+        assert_eq!(inner % 16, 0);
+        let last_batch = batch_count - 1;
+        assert!(
+            a_offset + last_batch * a_batch_stride + (rows - 1) * a_row_stride + inner
+                <= mat1.buffer.len()
+        );
+        assert!(
+            b_offset + last_batch * b_batch_stride + (inner - 1) * b_row_stride + cols
+                <= mat2.buffer.len()
+        );
+        assert!(
+            result_offset
+                + last_batch * result_batch_stride
+                + (rows - 1) * result_row_stride
+                + cols
+                <= result.buffer.len()
+        );
+
+        let blocks_per_batch = rows.div_ceil(32) * cols.div_ceil(32);
+        let config = LaunchConfig1D::new((batch_count * blocks_per_batch) as u32, 128, 0);
+        let prepared = self
+            .module()
+            .prepare_matrix_multiply_batched_strided(config)
+            .unwrap();
+        let lhs = DeviceSpan::from_buffer(&mat1.buffer, 0, mat1.buffer.len());
+        let rhs = DeviceSpan::from_buffer(&mat2.buffer, 0, mat2.buffer.len());
+        let result_len = result.buffer.len();
+        let output = DeviceSpanMut::from_buffer(&mut result.buffer, 0, result_len);
+
+        self.module()
+            .matrix_multiply_batched_strided(
+                self.stream(),
+                &prepared,
+                lhs.descriptor(),
+                rhs.descriptor(),
+                output.descriptor(),
+                inner,
+                rows,
+                cols,
+                batch_count,
+                a_offset,
+                a_row_stride,
+                a_batch_stride,
+                b_offset,
+                b_row_stride,
+                b_batch_stride,
+                result_offset,
+                result_row_stride,
+                result_batch_stride,
             )
             .unwrap();
     }

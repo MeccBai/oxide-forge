@@ -194,6 +194,14 @@ pub struct LinearMetadata {
 }
 
 impl Linear {
+    pub fn input_neurons(&self) -> usize {
+        self.weights.rows()
+    }
+
+    pub fn output_neurons(&self) -> usize {
+        self.weights.cols()
+    }
+
     pub fn new(weights: Matrix, bias: Option<Vector>, activation: Activation) -> Self {
         Self {
             weights,

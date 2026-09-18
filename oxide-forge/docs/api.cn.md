@@ -429,8 +429,8 @@ affine GEMM。每层先
 input                 [sequence,hidden]
 position_encoding     [sequence,hidden]
 Q/K/V                 [sequence,hidden]
-QKᵀ                   [sequence,sequence]
-softmax(QKᵀ/√hidden)  [sequence,sequence]
+QₕKₕᵀ                 [heads × sequence,sequence]
+softmax(QₕKₕᵀ/√head)  [heads × sequence,sequence]
 attention             [sequence,hidden]
 residual + norm       [sequence,hidden]
 MLP + residual + norm [sequence,hidden]
@@ -447,7 +447,7 @@ let position_encoding = move |input: &Matrix, runtime: &mut CudaRuntime| {
     runtime.matrix_add(input, &position)
 };
 
-let transformer = InferenceTransformer::new(
+let transformer = InferenceTransformer::<8>::new(
     query,
     key,
     value,
@@ -465,9 +465,12 @@ key/value 使用不同输入，因此后续 decoder cross-attention 可直接复
 负责 scaled score、row Softmax、value GEMM、residual norm 和训练 cache，encoder
 的 inference/training 不再各自实现调度逻辑。
 
-主 stream 在 `QK^T` 前只 join Q/K，V 继续与 score 路径重叠，并在 attention GEMM
-前才 join V。这些 join 都是 CUDA event 依赖，不会同步 CPU。后续多头实现可以复用
-`QkvProjection`，只替换投影结果的 head 布局与逐头 score 计算。
+头数由 `InferenceTransformer<const HEADS: usize>`（训练版本同理）在编译期指定；构造时
+断言投影宽度可以被 `HEADS` 整除。Q/K/V 始终保持为单个连续的
+`[sequence, hidden]` 矩阵，不做物理拆分。batched-strided GEMM kernel 从全局 block
+索引推导 head，各 head 的所有 tile 由一次 launch 提交，而每个 block 通过 stride
+访问对应的 Q/K/V 范围。主 stream 在 score 计算前只等待 Q/K，V 仍可并行，直到
+value GEMM 前才等待。这些依赖都是 CUDA event，不同步 CPU。
 
 ```text
 output projection
@@ -529,7 +532,7 @@ Transformer 时由调用方重新提供。推理模型加载后延迟重建 stre
 TOML 保存以下信息：
 
 - 格式版本、模型类型、标量编码、BIN 文件名和大小；
-- 损失函数、Transformer block 数量和 normalization type；
+- 损失函数、Transformer block 数量、编译期 attention head 数和 normalization type；
 - MLP 层数和可选 residual 范围 `[start,end)`；
 - 每个 Linear 的输入/输出神经元数、activation；
 - Matrix/Vector 形状和参数的 `[byte_start,byte_end)`；

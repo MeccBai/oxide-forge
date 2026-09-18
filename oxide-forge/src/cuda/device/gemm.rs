@@ -47,6 +47,8 @@ pub(super) fn tile_sources(
     inner: usize,
     rows: usize,
     cols: usize,
+    a_row_stride: usize,
+    b_row_stride: usize,
 ) -> TileSources {
     let subtile = thread_id / 64;
     let chunk = thread_id % 64;
@@ -71,12 +73,12 @@ pub(super) fn tile_sources(
     let a = if a_valid == 0 {
         matrix_a
     } else {
-        unsafe { matrix_a.add(a_row * inner + a_col) }
+        unsafe { matrix_a.add(a_row * a_row_stride + a_col) }
     };
     let b = if b_valid == 0 {
         matrix_b
     } else {
-        unsafe { matrix_b.add(b_row * cols + b_col) }
+        unsafe { matrix_b.add(b_row * b_row_stride + b_col) }
     };
 
     TileSources {
@@ -144,18 +146,84 @@ pub(super) fn matrix_multiply_device(
     rows: usize,
     cols: usize,
 ) {
+    matrix_multiply_strided_device(
+        matrix_a, matrix_b, result, inner, rows, cols, 0, inner, 0, cols, 0, cols,
+    );
+}
+
+#[device]
+pub(super) fn matrix_multiply_strided_device(
+    matrix_a: span::DeviceSliceDescriptor<f32>,
+    matrix_b: span::DeviceSliceDescriptor<f32>,
+    result: span::DeviceSliceMutDescriptor<f32>,
+    inner: usize,
+    rows: usize,
+    cols: usize,
+    a_offset: usize,
+    a_row_stride: usize,
+    b_offset: usize,
+    b_row_stride: usize,
+    result_offset: usize,
+    result_row_stride: usize,
+) {
+    matrix_multiply_batched_strided_device(
+        matrix_a,
+        matrix_b,
+        result,
+        inner,
+        rows,
+        cols,
+        1,
+        a_offset,
+        a_row_stride,
+        0,
+        b_offset,
+        b_row_stride,
+        0,
+        result_offset,
+        result_row_stride,
+        0,
+    );
+}
+
+#[device]
+pub(super) fn matrix_multiply_batched_strided_device(
+    matrix_a: span::DeviceSliceDescriptor<f32>,
+    matrix_b: span::DeviceSliceDescriptor<f32>,
+    result: span::DeviceSliceMutDescriptor<f32>,
+    inner: usize,
+    rows: usize,
+    cols: usize,
+    batch_count: usize,
+    a_offset: usize,
+    a_row_stride: usize,
+    a_batch_stride: usize,
+    b_offset: usize,
+    b_row_stride: usize,
+    b_batch_stride: usize,
+    result_offset: usize,
+    result_row_stride: usize,
+    result_batch_stride: usize,
+) {
     static mut MATA0: shared::SharedArray<f32, STAGE_SIZE> = shared::SharedArray::UNINIT;
     static mut MATA1: shared::SharedArray<f32, STAGE_SIZE> = shared::SharedArray::UNINIT;
     static mut MATB0: shared::SharedArray<f32, STAGE_SIZE> = shared::SharedArray::UNINIT;
     static mut MATB1: shared::SharedArray<f32, STAGE_SIZE> = shared::SharedArray::UNINIT;
 
     let local_warp = tools::index::get_warp_id();
-    let block_id = tools::index::get_block_id_1d();
+    let global_block_id = tools::index::get_block_id_1d();
     let thread_id = tools::index::get_thread_id_1d();
     let lane = tools::index::get_lane_id();
     let tile_rows = rows.div_ceil(TILE_SIZE);
     let tile_cols = cols.div_ceil(TILE_SIZE);
     let block_tile_cols = tile_cols.div_ceil(BLOCK_TILE_AXIS);
+    let block_tile_rows = tile_rows.div_ceil(BLOCK_TILE_AXIS);
+    let blocks_per_batch = block_tile_rows * block_tile_cols;
+    let batch = global_block_id / blocks_per_batch;
+    if batch >= batch_count {
+        return;
+    }
+    let block_id = global_block_id % blocks_per_batch;
     let block_row = block_id / block_tile_cols;
     let block_col = block_id % block_tile_cols;
     let warp_row = local_warp / BLOCK_TILE_AXIS;
@@ -168,7 +236,12 @@ pub(super) fn matrix_multiply_device(
     let a_stage1 = (&raw mut MATA1).cast::<f32>();
     let b_stage0 = (&raw mut MATB0).cast::<f32>();
     let b_stage1 = (&raw mut MATB1).cast::<f32>();
-    let source_base = (matrix_a.as_ptr(), matrix_b.as_ptr());
+    let source_base = unsafe {
+        (
+            matrix_a.as_ptr().add(a_offset + batch * a_batch_stride),
+            matrix_b.as_ptr().add(b_offset + batch * b_batch_stride),
+        )
+    };
     let initial = tile_sources(
         source_base.0,
         source_base.1,
@@ -179,6 +252,8 @@ pub(super) fn matrix_multiply_device(
         inner,
         rows,
         cols,
+        a_row_stride,
+        b_row_stride,
     );
 
     let mut a_buffer = unsafe {
@@ -220,6 +295,8 @@ pub(super) fn matrix_multiply_device(
                 inner,
                 rows,
                 cols,
+                a_row_stride,
+                b_row_stride,
             );
             unsafe {
                 a_buffer.copy_async(next.destination, next.a, next.a_valid, 4);
@@ -259,11 +336,21 @@ pub(super) fn matrix_multiply_device(
         let output_row = tile_row * TILE_SIZE + group + if register >= 2 { 8 } else { 0 };
         let output_col = tile_col * TILE_SIZE + thread * 2 + register % 2;
         if active && output_row < rows && output_col < cols {
-            result.write(output_row * cols + output_col, accumulator_left[register]);
+            result.write(
+                result_offset
+                    + batch * result_batch_stride
+                    + output_row * result_row_stride
+                    + output_col,
+                accumulator_left[register],
+            );
         }
         if active && output_row < rows && output_col + 8 < cols {
             result.write(
-                output_row * cols + output_col + 8,
+                result_offset
+                    + batch * result_batch_stride
+                    + output_row * result_row_stride
+                    + output_col
+                    + 8,
                 accumulator_right[register],
             );
         }

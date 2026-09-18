@@ -135,8 +135,8 @@ pub fn load_training_mlp<P: AsRef<Path>>(
     Ok(TrainingMlp::with_loss(layers, residual, metadata.mlp.loss))
 }
 
-pub fn dump_transformer<P: AsRef<Path>>(
-    model: &InferenceTransformer,
+pub fn dump_transformer<const HEADS: usize, P: AsRef<Path>>(
+    model: &InferenceTransformer<HEADS>,
     path: P,
     runtime: &CudaRuntime,
 ) -> CheckpointResult<()> {
@@ -147,17 +147,18 @@ pub fn dump_transformer<P: AsRef<Path>>(
     )
 }
 
-pub fn load_transformer<P, F>(
+pub fn load_transformer<const HEADS: usize, P, F>(
     path: P,
     position_encoding: F,
     runtime: &CudaRuntime,
-) -> CheckpointResult<InferenceTransformer>
+) -> CheckpointResult<InferenceTransformer<HEADS>>
 where
     P: AsRef<Path>,
     F: Fn(&Matrix, &mut CudaRuntime) -> Matrix + 'static,
 {
     let (metadata, mut reader) = open_transformer(path.as_ref())?;
     let transformer = &metadata.transformer;
+    validate_head_count::<HEADS>(transformer)?;
     let q_matrix = load_linear_parameter(&transformer.query, &mut reader, runtime)?;
     let k_matrix = load_linear_parameter(&transformer.key, &mut reader, runtime)?;
     let v_matrix = load_linear_parameter(&transformer.value, &mut reader, runtime)?;
@@ -175,8 +176,8 @@ where
     ))
 }
 
-pub fn dump_training_transformer<P: AsRef<Path>>(
-    model: &TrainingTransformer,
+pub fn dump_training_transformer<const HEADS: usize, P: AsRef<Path>>(
+    model: &TrainingTransformer<HEADS>,
     path: P,
     runtime: &CudaRuntime,
 ) -> CheckpointResult<()> {
@@ -187,17 +188,18 @@ pub fn dump_training_transformer<P: AsRef<Path>>(
     )
 }
 
-pub fn load_training_transformer<P, F>(
+pub fn load_training_transformer<const HEADS: usize, P, F>(
     path: P,
     position_encoding: F,
     runtime: &CudaRuntime,
-) -> CheckpointResult<TrainingTransformer>
+) -> CheckpointResult<TrainingTransformer<HEADS>>
 where
     P: AsRef<Path>,
     F: Fn(&Matrix, &mut CudaRuntime) -> Matrix + 'static,
 {
     let (metadata, mut reader) = open_transformer(path.as_ref())?;
     let transformer = &metadata.transformer;
+    validate_head_count::<HEADS>(transformer)?;
     let q_matrix = load_linear_parameter(&transformer.query, &mut reader, runtime)?;
     let k_matrix = load_linear_parameter(&transformer.key, &mut reader, runtime)?;
     let v_matrix = load_linear_parameter(&transformer.value, &mut reader, runtime)?;
@@ -456,6 +458,14 @@ fn validate_transformer(
     if metadata.block_count != 1 {
         return Err(invalid_data("this Transformer executor requires exactly one block").into());
     }
+    if metadata.attention_heads == 0
+        || metadata.query.output_neurons % metadata.attention_heads != 0
+    {
+        return Err(invalid_data(
+            "attention head count must be non-zero and divide the projection width",
+        )
+        .into());
+    }
     if !metadata.attention_residual || !metadata.feed_forward_residual {
         return Err(invalid_data("this Transformer executor requires both residual paths").into());
     }
@@ -484,6 +494,17 @@ fn validate_transformer(
     }
     if metadata.output.input_neurons != embedding {
         return Err(invalid_data("output projection input must match the embedding size").into());
+    }
+    Ok(())
+}
+
+fn validate_head_count<const HEADS: usize>(metadata: &TransformerMetadata) -> CheckpointResult<()> {
+    if metadata.attention_heads != HEADS {
+        return Err(invalid_data(format!(
+            "checkpoint has {} attention heads, but the requested model type has {HEADS}",
+            metadata.attention_heads
+        ))
+        .into());
     }
     Ok(())
 }

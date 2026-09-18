@@ -179,6 +179,47 @@ pub(in crate::cuda) mod kernels {
     }
 
     #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(domain = 1, block = (128, 1, 1))]
+    pub fn matrix_multiply_batched_strided(
+        matrix1: span::DeviceSliceDescriptor<f32>,
+        matrix2: span::DeviceSliceDescriptor<f32>,
+        result: span::DeviceSliceMutDescriptor<f32>,
+        inner: usize,
+        rows: usize,
+        cols: usize,
+        batch_count: usize,
+        a_offset: usize,
+        a_row_stride: usize,
+        a_batch_stride: usize,
+        b_offset: usize,
+        b_row_stride: usize,
+        b_batch_stride: usize,
+        result_offset: usize,
+        result_row_stride: usize,
+        result_batch_stride: usize,
+    ) {
+        gemm::matrix_multiply_batched_strided_device(
+            matrix1,
+            matrix2,
+            result,
+            inner,
+            rows,
+            cols,
+            batch_count,
+            a_offset,
+            a_row_stride,
+            a_batch_stride,
+            b_offset,
+            b_row_stride,
+            b_batch_stride,
+            result_offset,
+            result_row_stride,
+            result_batch_stride,
+        );
+    }
+
+    #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(domain = 2, block = (32, 8, 1))]
     pub fn matrix_transpose(
@@ -188,6 +229,19 @@ pub(in crate::cuda) mod kernels {
         input_cols: usize,
     ) {
         layout::matrix_transpose_device(matrix, result, input_rows, input_cols);
+    }
+
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(domain = 2, block = (32, 8, 1))]
+    pub fn matrix_transpose_batches(
+        input: span::DeviceSliceDescriptor<f32>,
+        output: span::DeviceSliceMutDescriptor<f32>,
+        rows: usize,
+        cols: usize,
+        batch_count: usize,
+    ) {
+        layout::matrix_transpose_batches_device(input, output, rows, cols, batch_count);
     }
 
     #[kernel]
@@ -233,8 +287,12 @@ pub(in crate::cuda) mod kernels {
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn matrix_causal_mask(matrix: span::DeviceSliceMutDescriptor<f32>, cols: usize) {
-        row::matrix_causal_mask_device(matrix, cols);
+    pub fn matrix_causal_mask(
+        matrix: span::DeviceSliceMutDescriptor<f32>,
+        cols: usize,
+        row_period: usize,
+    ) {
+        row::matrix_causal_mask_device(matrix, cols, row_period);
     }
 
     #[kernel]

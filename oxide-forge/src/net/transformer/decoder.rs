@@ -10,11 +10,11 @@ use crate::net::metadata::{HostData, MetadataCursor};
 pub use super::inference::TransformerMetadata;
 use super::{NormType, inference::InferenceBlock};
 
-pub struct InferenceTransformer {
-    block: InferenceBlock,
+pub struct InferenceTransformer<const HEADS: usize = 1> {
+    block: InferenceBlock<HEADS>,
 }
 
-impl InferenceTransformer {
+impl<const HEADS: usize> InferenceTransformer<HEADS> {
     pub fn new<F>(
         q_matrix: Linear,
         k_matrix: Linear,

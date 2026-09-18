@@ -2,12 +2,17 @@ use crate::cuda::span;
 use cuda_device::{device, shared, thread, warp};
 
 #[device]
-pub(super) fn matrix_causal_mask_device(matrix: span::DeviceSliceMutDescriptor<f32>, cols: usize) {
+pub(super) fn matrix_causal_mask_device(
+    matrix: span::DeviceSliceMutDescriptor<f32>,
+    cols: usize,
+    row_period: usize,
+) {
     let row = thread::blockIdx_x() as usize;
+    let local_row = row % row_period;
     let col = thread::threadIdx_x() as usize;
     let index = row * cols + col;
 
-    if col < cols && index < matrix.len() && col > row {
+    if col < cols && index < matrix.len() && col > local_row {
         matrix.write(index, f32::NEG_INFINITY);
     }
 }

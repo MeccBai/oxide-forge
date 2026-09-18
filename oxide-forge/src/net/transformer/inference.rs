@@ -8,11 +8,12 @@ use cuda_core::CudaStream;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use super::{NormType, PositionEncoding, attention::Attention};
+use super::{NormType, PositionEncoding, attention::multi::Attention};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransformerMetadata {
     pub block_count: usize,
+    pub attention_heads: usize,
     pub attention_residual: bool,
     pub feed_forward_residual: bool,
     pub normalization: NormType,
@@ -23,8 +24,8 @@ pub struct TransformerMetadata {
     pub output: LinearMetadata,
 }
 
-pub(super) struct InferenceBlock {
-    attention: Attention,
+pub(super) struct InferenceBlock<const HEADS: usize = 1> {
+    attention: Attention<HEADS>,
     position_encoding: PositionEncoding,
     fcs: InferenceMLP,
     output_matrix: Linear,
@@ -32,7 +33,7 @@ pub(super) struct InferenceBlock {
     feed_forward_normalization: SingleNode,
 }
 
-impl InferenceBlock {
+impl<const HEADS: usize> InferenceBlock<HEADS> {
     pub(super) fn new(
         query: Linear,
         key: Linear,
@@ -60,6 +61,7 @@ impl InferenceBlock {
         let qkv = self.attention.get_meta_data(cursor);
         TransformerMetadata {
             block_count: 1,
+            attention_heads: HEADS,
             attention_residual: true,
             feed_forward_residual: true,
             normalization: self.attention.norm_type(),

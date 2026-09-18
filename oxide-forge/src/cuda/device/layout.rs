@@ -1,3 +1,4 @@
+use crate::cuda::span;
 use cuda_device::{DisjointSlice, device, shared, thread};
 
 const TRANSPOSE_TILE_SIZE: usize = 32;
@@ -50,6 +51,52 @@ pub(super) fn matrix_transpose_device(
             unsafe {
                 *result.get_unchecked_mut(output_index) = TILE[tx * TRANSPOSE_STRIDE + local_row];
             }
+        }
+    }
+}
+
+#[device]
+pub(super) fn matrix_transpose_batches_device(
+    input: span::DeviceSliceDescriptor<f32>,
+    output: span::DeviceSliceMutDescriptor<f32>,
+    rows: usize,
+    cols: usize,
+    batch_count: usize,
+) {
+    let tx = thread::threadIdx_x() as usize;
+    let ty = thread::threadIdx_y() as usize;
+    let tile_rows = rows.div_ceil(TRANSPOSE_TILE_SIZE);
+    let batch = thread::blockIdx_y() as usize / tile_rows;
+    let block_row = thread::blockIdx_y() as usize % tile_rows;
+    if batch >= batch_count {
+        return;
+    }
+    let input_col = thread::blockIdx_x() as usize * TRANSPOSE_TILE_SIZE + tx;
+    let batch_offset = batch * rows * cols;
+
+    static mut TILE: shared::SharedArray<f32, TRANSPOSE_SHARED_SIZE> = shared::SharedArray::UNINIT;
+
+    for row_offset in [0, TRANSPOSE_BLOCK_ROWS, 16, 24] {
+        let local_row = ty + row_offset;
+        let input_row = block_row * TRANSPOSE_TILE_SIZE + local_row;
+        unsafe {
+            TILE[local_row * TRANSPOSE_STRIDE + tx] = if input_row < rows && input_col < cols {
+                input.read(batch_offset + input_row * cols + input_col)
+            } else {
+                0.0
+            };
+        }
+    }
+
+    thread::sync_threads();
+    let output_col = block_row * TRANSPOSE_TILE_SIZE + tx;
+    for row_offset in [0, TRANSPOSE_BLOCK_ROWS, 16, 24] {
+        let local_row = ty + row_offset;
+        let output_row = thread::blockIdx_x() as usize * TRANSPOSE_TILE_SIZE + local_row;
+        if output_row < cols && output_col < rows {
+            output.write(batch_offset + output_row * rows + output_col, unsafe {
+                TILE[tx * TRANSPOSE_STRIDE + local_row]
+            });
         }
     }
 }

@@ -612,8 +612,8 @@ as `TrainingMlp`; `backward` is the one-sample zero-momentum convenience path.
 input                 [sequence, hidden]
 position_encoding     [sequence, hidden]
 Q/K/V                 [sequence, hidden]
-QKᵀ                   [sequence, sequence]
-softmax(QKᵀ/√hidden)  [sequence, sequence]
+QₕKₕᵀ                 [heads × sequence, sequence]
+softmax(QₕKₕᵀ/√head)  [heads × sequence, sequence]
 attention             [sequence, hidden]
 residual + norm       [sequence, hidden]
 MLP + residual + norm [sequence, hidden]
@@ -631,7 +631,7 @@ let position_encoding = move |input: &Matrix, runtime: &mut CudaRuntime| {
     runtime.matrix_add(input, &position, None)
 };
 
-let transformer = InferenceTransformer::new(
+let transformer = InferenceTransformer::<8>::new(
     query,
     key,
     value,
@@ -650,11 +650,14 @@ inputs, so decoder cross-attention can reuse it. `Attention` owns scaled score
 calculation, row Softmax, the value GEMM, residual normalization, and its training
 cache. Encoder inference and training therefore share the same scheduling code.
 
-The primary stream joins Q and K before `QK^T`, while V remains eligible to
-overlap the score path and is joined only before the attention GEMM. These joins
-are CUDA event dependencies, not host synchronization. A future multi-head path
-can reuse `QkvProjection` and replace only the projected-matrix head layout and
-per-head score calculation.
+The head count is `InferenceTransformer<const HEADS: usize>` (and likewise for
+training). Construction asserts that the projection width is divisible by
+`HEADS`. Q/K/V remain single contiguous `[sequence, hidden]` matrices: no head
+buffers are materialized. A batched-strided GEMM kernel derives the head index
+from its global block index, so all head tiles are submitted by one launch while
+each block addresses the appropriate Q/K/V range. The primary stream joins Q
+and K before scores, while V can overlap until the value GEMM. These are CUDA
+event dependencies rather than host synchronizations.
 
 ```text
 output projection
@@ -721,7 +724,8 @@ The complete association-layer entry points are `dump_linear/load_linear`,
 The TOML document records:
 
 - format version, model type, scalar encoding, binary file name and size;
-- loss function, Transformer block count, and normalization type;
+- loss function, Transformer block count, compile-time attention head count,
+  and normalization type;
 - MLP layer count and optional residual range `[start, end)`;
 - the input/output neuron count and activation of each Linear layer;
 - Matrix/Vector shapes and each parameter's `[byte_start, byte_end)` range;
