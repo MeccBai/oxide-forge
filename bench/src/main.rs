@@ -1,7 +1,4 @@
-use oxide_forge::cuda::{
-    CudaRuntime,
-    InitType::Random,
-};
+use oxide_forge::cuda::{CudaRuntime, InitType::Random};
 use std::time::Instant;
 
 const SIZE: usize = 512;

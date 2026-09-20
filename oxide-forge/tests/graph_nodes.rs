@@ -1,5 +1,5 @@
 use oxide_forge::cuda::{CudaRuntime, InitType};
-use oxide_forge::graph::{GraphNode, LearnConfig};
+use oxide_forge::graph::{Branch, Graph, GraphNode, LearnConfig};
 use oxide_forge::net::linear::{Activation, Linear, TrainingLinear};
 use oxide_forge::net::mlp::{InferenceMLP, TrainingMlp};
 use oxide_forge::net::node::{
@@ -16,6 +16,10 @@ fn assert_graph_node<T: GraphNode>() {}
 
 #[test]
 fn linear_and_transformers_are_graph_nodes() {
+    assert_graph_node::<Graph<false>>();
+    assert_graph_node::<Graph<true>>();
+    assert_graph_node::<Branch<false>>();
+    assert_graph_node::<Branch<true>>();
     assert_graph_node::<Linear>();
     assert_graph_node::<TrainingLinear>();
     assert_graph_node::<InferenceEncoder<1>>();

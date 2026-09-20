@@ -1,11 +1,5 @@
-pub struct GraphBuilder {}
+mod branch;
+mod root;
 
-impl GraphBuilder {
-    pub fn start() -> Self {
-        Self {}
-    }
-
-    pub fn end() -> Self {
-        Self {}
-    }
-}
+pub use branch::BranchBuilder;
+pub use root::GraphBuilder;
