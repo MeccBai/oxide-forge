@@ -24,6 +24,62 @@
 | 返回标量或 host 副本 | 源容器自身 |
 | 回收拥有所有权的显存 | `CudaRuntime` |
 
+## Graph
+
+`GraphBuilder` 记录显式的静态拓扑，不追踪运行时操作。`then` 追加与设备无关的
+配置，`copy`、`map` 和 `concat` 描述分支；Draft 构建期间会传播并验证形状。
+
+```rust
+let draft = GraphBuilder::start(MatrixConfig::new(rows, width))
+    .then(LinearConfig::new(
+        MatrixConfig::new(width, hidden),
+        true,
+        Activation::Gelu,
+    ))
+    .then(LinearConfig::new(
+        MatrixConfig::new(hidden, output_width),
+        true,
+        Activation::Identity,
+    ))
+    .end();
+
+let mut graph: Graph<true> = draft.init(
+    &mut runtime,
+    InitConfig::Random {
+        loss: Loss::MeanSquaredError,
+        learning_rate: LearningRateScheduler::new(1.0e-3),
+    },
+)?;
+
+let loss = graph.train_step(input, &target, 1.0, 0.0, 0.9, &mut runtime);
+```
+
+`LinearConfig` 只包含权重形状、是否包含 bias 和 activation，不分配显存。
+`InitConfig::Random` 在 `GraphDraft::init` 时通过传入的 runtime 创建随机权重和零 bias。
+训练能力由 `Graph<true>` 决定，而不是由另一套 Linear 或 Block 类型决定。
+
+| Builder API | 作用 |
+| --- | --- |
+| `GraphBuilder::start(config)` | 以一个 Matrix 值开始建图 |
+| `then(linear_config)` | 追加一个 Linear 配置 |
+| `then_node(node)` | 追加已初始化的底层 `GraphNode` |
+| `copy(count)` | 为分支创建独立拥有所有权的值 |
+| `map(branches)` | 为每个当前值运行一条 Branch |
+| `concat(axis)` | 将分支结果拼成一个连续 Matrix |
+| `end()` | 验证唯一输出并生成 `GraphDraft` |
+
+Forward 按声明顺序执行，backward 沿同一拓扑反向执行。`Graph::step` 更新所有可训练
+节点，并且每次只推进一次图级学习率调度器。`Graph<false>` 只允许 forward；训练入口
+会立即失败。
+
+| 执行 API | 说明 |
+| --- | --- |
+| `Graph<TRAINING>::forward(input, runtime)` | 消费输入并返回拥有所有权的输出 |
+| `Graph<true>::backward(gradient, runtime)` | 反向传播并累积参数梯度 |
+| `Graph<true>::step(momentum, batch_len, runtime)` | 应用梯度并推进一次学习率 |
+| `Graph<true>::train_step(...)` | Forward、loss、backward 和一次更新 |
+| `get_input_config()` / `get_output_config()` | 查询静态验证后的边界形状 |
+
 ## CudaRuntime
 
 ### 生命周期与同步
@@ -366,25 +422,24 @@ workspace 或梯度生命周期；这些由拥有完整局部数据流的 MLP �
 当前 activation 包括 `Identity`、`Gelu`、`Relu`、`Silu` 和 `Sigmoid`。Sigmoid 对正负
 输入使用不同的数值分支，避免指数溢出。
 
-### MlpExecutor、InferenceMLP 与 TrainingMlp
+### MlpExecutor 与 Mlp
 
 ```rust
-let mlp = InferenceMLP::new(vec![layer1, layer2], None);
+let mlp = Mlp::new(vec![layer1, layer2], None);
 let output = mlp.forward(&input, &mut runtime);
 ```
 
 `Loss::MeanSquaredError` 直接使用模型输出。`Loss::BinaryCrossEntropyWithLogits` 保持
 最后一层输出为 logits，以稳定地计算 loss 和梯度；推理时调用
-`InferenceMLP::predict`（或 `Loss::activate_output`）应用 Sigmoid 得到概率。共享的
+`Mlp::predict`（或 `Loss::activate_output`）应用 Sigmoid 得到概率。共享的
 `loss_rows` 与 `output_gradient` 接受正类别权重，可复用于类别不平衡的二分类和分割。
 
 `loss_and_output_gradient` 可通过非负 Dice 权重加入 soft Dice loss，并同时返回逐行 loss
 和组合后的 logit 梯度。Dice 权重为零时就是原加权 BCE 路径。Dice 需要对整张 Matrix
 执行归约并产生同步，因此主要用于分割目标。
 
-`MlpExecutor` 统一保存 Linear 和 residual 配置，并提供 forward/backward 执行逻辑。
-`InferenceMLP` 只委托 forward；`TrainingMlp` 额外持有 forward activation tape 并委托
-backward。Linear 本身不缓存运行数据。
+`MlpExecutor` 统一保存 Linear 和 residual 配置，`Mlp` 是公开的 forward block。
+它和 Linear 都不拥有训练 tape 或 optimizer；这些生命周期统一由 `Graph<true>` 管理。
 
 典型的两层 FFN 可以表示为：
 
@@ -393,35 +448,8 @@ features → hidden（GELU）→ features（Identity）
 ```
 
 Residual range `(start,end)` 表示从第 `start` 层输入到第 `end-1` 层输出的 skip。
-TrainingMlp 只保存 `layer_inputs[i]`，即第 `i` 层 backward 所需的输入。每层产生的
-新 Matrix 直接移动为下一层输入，移动进 Vec 只转移所有权句柄，不复制设备数据。
-最后一层输出不由 MLP 缓存，而是按所有权返回给上级模型，由模型决定是否保留。
-训练 forward 消费输入 Matrix 并直接移入 tape，不执行隐式设备复制。如果上级还需要
-保留该输入，应由上级在调用前明确复制，或在 forward 后通过 `input()` 借用 tape
-中的第一个输入。
-
-mini-batch 训练使用 `backward_accumulate`：它立即计算 `dX`，但参数梯度只累积到
-`TrainingMlp` 持有的 optimizer 状态中。随后调用
-`step(learning_rate, momentum, batch_len, runtime)`，对梯度取 batch 平均、更新经典
-Momentum velocity、修改参数并清空累积量。`Linear` 仍然不持有 optimizer 或 tape。
-原有 `backward(..., learning_rate, ...)` 是单样本、零 momentum 的便捷路径。
-
-`TrainingEncoder` 提供相同的 `backward_accumulate`/`step` 分离接口，用同一个 batch
-边界更新 output projection、FFN 和 Q/K/V。optimizer velocity 属于运行期状态，不写入
-参数 checkpoint。
-
-```rust
-let output: Matrix = training_mlp.forward(input, runtime);
-let input_gradient = training_mlp.backward(
-    &output_gradient,
-    learning_rate,
-    runtime,
-);
-```
-
-Backward 对非 Identity activation 层按需重算 pre-activation；Identity 层不会重跑
-affine GEMM。每层先
-用旧权重计算 `dX`，再执行 SGD 参数更新。Residual 梯度在 source activation 处累加。
+当 MLP 被编译进 `Graph<true>` 时，图负责生成反向状态、累积参数梯度，并在图级
+`step` 边界统一更新。Matrix 移入图状态只转移拥有所有权的句柄，不复制设备数据。
 
 ### Transformer
 
@@ -437,14 +465,14 @@ MLP + residual + norm [sequence,hidden]
 output projection     [sequence,output]
 ```
 
-`InferenceEncoder` 和 `InferenceDecoder` 在构造时选择 `NormType::Layer` 或 `NormType::Rms`，同时可以传入
+`Encoder` 和 `Decoder` 在构造时选择 `NormType::Layer` 或 `NormType::Rms`，同时可以传入
 三条可复用的 Q/K/V stream；传入的 Vec 必须正好包含三条 stream。传入 `None` 时会在
 第一次 forward 中延迟创建。位置编码是由 Transformer 持有并可序列化的枚举：
 
 ```rust
 let position_encoding = PositionEncoding::additive(position);
 
-let transformer = InferenceEncoder::<8>::new(
+let transformer = Encoder::<8>::new(
     query,
     key,
     value,
@@ -459,11 +487,9 @@ let transformer = InferenceEncoder::<8>::new(
 两种执行器都采用 Post-Norm。LayerNorm 与 RMSNorm 均已提供 forward 和 backward。
 `QkvProjection` 统一持有三个 Linear 投影和可复用 stream，并支持 query 与
 key/value 使用不同输入，因此后续 decoder cross-attention 可直接复用。`Attention`
-负责 scaled score、row Softmax、value GEMM、residual norm 和训练 cache，encoder
-的 inference/training 不再各自实现调度逻辑。
+负责 scaled score、row Softmax、value GEMM 和 residual norm。
 
-头数由 `InferenceEncoder<const HEADS: usize>`、`InferenceDecoder<const HEADS: usize>`、
-`TrainingEncoder<const HEADS: usize>` 和 `TrainingDecoder<const HEADS: usize>` 在编译期指定；构造时
+头数由 `Encoder<const HEADS: usize>` 和 `Decoder<const HEADS: usize>` 在编译期指定；构造时
 断言投影宽度可以被 `HEADS` 整除。Q/K/V 始终保持为单个连续的
 `[sequence, hidden]` 矩阵，不做物理拆分。batched-strided GEMM kernel 从全局 block
 索引推导 head，各 head 的所有 tile 由一次 launch 提交，而每个 block 通过 stride
@@ -482,8 +508,8 @@ output projection
 → position encoding
 ```
 
-`TrainingEncoder::backward` 返回输入梯度，并使用传入 learning rate 更新 Linear
-参数。Identity 与加法式位置编码对输入的导数均为恒等映射。
+Transformer 编译进 `Graph<true>` 后，反向执行和参数更新均由图负责。Identity 与
+加法式位置编码对输入的导数均为恒等映射。
 
 ## 模型存档
 
@@ -511,16 +537,11 @@ let model = checkpoint::load_transformer("model.toml", &runtime)?;
 ```
 
 所有文件操作都只存在于 `net::checkpoint`；`Linear`、MLP 和 Transformer 不提供
-文件方法。该模块另外提供明确的 inference/training MLP 以及 training Transformer
-变体。推理版和训练版使用相同的持久参数表示。forward cache 与 Q/K/V stream
-属于运行时状态，不会保存。位置编码的类型和加法参数会随 Transformer 一起保存。
-推理模型加载后延迟重建 stream，训练模型的 cache
-从空状态开始；加载训练 checkpoint 时会保留其选择的 LayerNorm 或 RMSNorm 类型。
+文件方法。Graph 训练状态与 Q/K/V stream 都属于运行时状态，不会保存。位置编码的
+类型和加法参数会随 Transformer 一起保存；加载后 stream 会延迟重建。
 
-模型关联层的完整入口为 `dump_linear/load_linear`、`dump_mlp/load_mlp`、
-`dump_inference_mlp/load_inference_mlp`、`dump_training_mlp/load_training_mlp`、
-`dump_transformer/load_transformer` 和
-`dump_training_transformer/load_training_transformer`。
+模型关联层入口为 `dump_linear/load_linear`、`dump_mlp/load_mlp` 和
+`dump_transformer/load_transformer`。
 
 TOML 保存以下信息：
 
@@ -531,7 +552,7 @@ TOML 保存以下信息：
 - Matrix/Vector 形状和参数的 `[byte_start,byte_end)`；
 - Transformer 固定存在的 attention 与 feed-forward residual 连接。
 
-`MlpExecutor::new`、`InferenceMLP::new` 和 `TrainingMlp::new` 默认使用
+`MlpExecutor::new` 和 `Mlp::new` 默认使用
 `Loss::MeanSquaredError`；需要明确指定要持久化的损失函数时使用 `with_loss`。格式版本
 1 当前只定义均方误差。
 

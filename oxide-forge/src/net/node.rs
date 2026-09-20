@@ -58,7 +58,7 @@ enum SingleCache {
 }
 
 /// Binary/multi-input node with the state required by one backward pass.
-pub struct TrainingBinaryNode {
+pub(crate) struct TrainingBinaryNode {
     node: BinaryNode,
     input_count: usize,
     forward_pending: bool,
@@ -66,7 +66,7 @@ pub struct TrainingBinaryNode {
 }
 
 /// Single-input node with the state required by one backward pass.
-pub struct TrainingSingleNode {
+pub(crate) struct TrainingSingleNode {
     node: SingleNode,
     forward_pending: bool,
     cache: Option<SingleCache>,
@@ -78,7 +78,7 @@ pub struct ConcatNode {
 }
 
 /// Concat node that retains only input shapes for its split backward pass.
-pub struct TrainingConcatNode {
+pub(crate) struct TrainingConcatNode {
     node: ConcatNode,
     input_shapes: Option<Vec<(usize, usize)>>,
 }
@@ -90,7 +90,7 @@ pub struct SplitNode {
 }
 
 /// Split node that validates forward/backward pairing.
-pub struct TrainingSplitNode {
+pub(crate) struct TrainingSplitNode {
     node: SplitNode,
     forward_pending: bool,
 }
@@ -101,7 +101,7 @@ pub struct CopyNode {
 }
 
 /// Copy node that validates one forward/backward pair.
-pub struct TrainingCopyNode {
+pub(crate) struct TrainingCopyNode {
     node: CopyNode,
     forward_pending: bool,
 }
@@ -113,7 +113,7 @@ pub struct ReduceNode {
 }
 
 /// Reduce node that validates one forward/backward pair.
-pub struct TrainingReduceNode {
+pub(crate) struct TrainingReduceNode {
     node: ReduceNode,
     forward_pending: bool,
 }
@@ -124,7 +124,7 @@ pub struct RowReduceNode {
 }
 
 /// Row reduction with the input width required to broadcast its gradient.
-pub struct TrainingRowReduceNode {
+pub(crate) struct TrainingRowReduceNode {
     node: RowReduceNode,
     input_shape: Option<(usize, usize)>,
 }

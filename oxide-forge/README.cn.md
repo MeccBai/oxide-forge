@@ -141,7 +141,7 @@ src/
     ├── checkpoint/        元数据、二进制 I/O 与模型组装
     ├── linear.rs          Linear、activation 与参数更新
     ├── metadata.rs        公开参数元数据与 host data
-    ├── mlp.rs             inference/training MLP executor
+    ├── mlp.rs             通用 MLP executor 与图节点
     └── transformer/       attention、encoder、decoder 与位置编码
 docs/
 └── api.md                 完整运行时 API

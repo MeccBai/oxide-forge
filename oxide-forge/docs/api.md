@@ -440,30 +440,18 @@ runtime.concat_buffers_from_span(&spans);
 
 ## Explicit Compute Nodes
 
-`net::node` fills the composition layer between complete modules such as MLPs
-and Transformers. It deliberately does not build an automatic graph. Model code
-writes forward in execution order and calls the matching training nodes in
-reverse order during backward.
-
-All node values operate on `Matrix`. A row may represent one logical feature
-vector, while preserving the shape information required by row Softmax and
-normalization. Stateless nodes are intended for inference. Their `Training*`
-counterparts retain only the state mathematically required by one backward pass.
+`net::node` contains the public primitive operations used to compose a graph.
+All node values operate on contiguous `Matrix` objects. Training mode is not a
+node type: `Graph<true>` owns the tape, gradients, optimizer state, and reverse
+execution, while `Graph<false>` keeps only forward execution state.
 
 ### BinaryNode
 
 ```rust
-use oxide_forge::net::node::{BinaryNode, BinaryOp, TrainingBinaryNode};
+use oxide_forge::net::node::{BinaryNode, BinaryOp};
 
 let add = BinaryNode::new(BinaryOp::Add);
 let output = add.forward(&[&left, &right], &mut runtime);
-
-let mut multiply = TrainingBinaryNode::new(BinaryOp::Mul);
-let output = multiply.forward(vec![left, right], &mut runtime);
-let [left_gradient, right_gradient]: [Matrix; 2] = multiply
-    .backward(output_gradient, &mut runtime)
-    .try_into()
-    .unwrap();
 ```
 
 | `BinaryOp` | Forward | Backward state |
@@ -474,12 +462,10 @@ let [left_gradient, right_gradient]: [Matrix; 2] = multiply
 | `Div` | Element-wise `lhs / rhs` | Both inputs |
 | `MatMul` | Matrix product | Both inputs |
 
-`forward_owned` consumes inference inputs. Element-wise operations reuse the
+`forward_owned` consumes inputs. Element-wise operations reuse the
 first allocation as output; MatMul allocates its differently shaped result.
-`TrainingBinaryNode::forward` also consumes inputs, moving Mul/Div/MatMul
-operands directly into its cache without a device copy. `forward_borrowed` is
-available only for Add and Sub because their derivatives do not depend on the
-forward values.
+`forward_borrowed` is available only for Add and Sub. The training graph retains
+Mul/Div/MatMul operands internally because their derivatives depend on them.
 
 MatMul backward computes `dA = dY @ B^T` and `dB = A^T @ dY`; therefore the
 same Tensor Core shape constraints as `CudaRuntime::matrix_multiply` apply to
@@ -490,15 +476,11 @@ its forward and backward products.
 ```rust
 use oxide_forge::net::{
     linear::Activation,
-    node::{SingleNode, SingleType, TrainingSingleNode},
+    node::{SingleNode, SingleType},
 };
 
 let relu = SingleNode::new(SingleType::Activation(Activation::Relu));
 let output = relu.forward(input, &mut runtime);
-
-let mut norm = TrainingSingleNode::new(SingleType::LayerNorm);
-let output = norm.forward(input, &mut runtime);
-let input_gradient = norm.backward(output_gradient, &mut runtime);
 ```
 
 `SingleType` supports `Activation(Identity/Gelu/Relu/Silu/Sigmoid)`, `Scale`,
@@ -510,21 +492,17 @@ another physical transpose.
 ### Concat and Split
 
 ```rust
-use oxide_forge::net::node::{
-    MatrixAxis, TrainingConcatNode, TrainingSplitNode,
-};
+use oxide_forge::net::node::{ConcatNode, MatrixAxis, SplitNode};
 
-let mut concat = TrainingConcatNode::new(MatrixAxis::Columns);
-let joined = concat.forward(vec![left, right], &mut runtime);
-let branch_gradients = concat.backward(joined_gradient, &mut runtime);
+let concat = ConcatNode::new(MatrixAxis::Columns);
+let joined = concat.forward(&[&left, &right], &mut runtime);
 
-let mut split = TrainingSplitNode::new(MatrixAxis::Rows, vec![16, 32]);
-let branches = split.forward(input, &mut runtime);
-let input_gradient = split.backward(branch_gradients, &mut runtime);
+let split = SplitNode::new(MatrixAxis::Rows, vec![16, 32]);
+let branches = split.forward(&input, &mut runtime);
 ```
 
-`ConcatNode`/`TrainingConcatNode` and `SplitNode`/`TrainingSplitNode` support
-rows and columns. Sizes describe row counts for `Rows` and column counts for
+`ConcatNode` and `SplitNode` support rows and columns. Sizes describe row
+counts for `Rows` and column counts for
 `Columns`, must be non-zero, and must cover the input exactly. Every output owns
 contiguous row-major storage. Column operations physically rearrange data rather
 than creating a strided view.
@@ -547,16 +525,15 @@ gradient to every input and applies the Mean scale when required.
 ### RowReduceNode
 
 ```rust
-use oxide_forge::net::node::{RowReduction, TrainingRowReduceNode};
+use oxide_forge::net::node::{RowReduceNode, RowReduction};
 
-let mut mean = TrainingRowReduceNode::new(RowReduction::Mean);
-let row_means = mean.forward(input, &mut runtime); // [rows, 1]
-let input_gradient = mean.backward(row_gradient, &mut runtime);
+let mean = RowReduceNode::new(RowReduction::Mean);
+let row_means = mean.forward(&input, &mut runtime); // [rows, 1]
 ```
 
-`RowReduction::Sum` and `Mean` reduce `[rows, cols]` to `[rows, 1]`. Training
-retains only the input shape. Backward physically broadcasts each row gradient
-to a new contiguous `[rows, cols]` Matrix; Mean additionally divides by `cols`.
+`RowReduction::Sum` and `Mean` reduce `[rows, cols]` to `[rows, 1]`. During
+training, the graph retains only the input shape. Backward physically broadcasts
+each row gradient to a contiguous `[rows, cols]` Matrix; Mean divides by `cols`.
 
 ## Network Layers
 
@@ -589,16 +566,16 @@ layer owns scheduling because it sees the complete local data flow.
 Available activations are `Identity`, `Gelu`, `Relu`, `Silu`, and `Sigmoid`.
 Sigmoid uses separate positive/negative branches to avoid overflow.
 
-### MlpExecutor, InferenceMLP, and TrainingMlp
+### MlpExecutor and Mlp
 
 ```rust
-let mlp = InferenceMLP::new(vec![layer1, layer2], None);
+let mlp = Mlp::new(vec![layer1, layer2], None);
 let output = mlp.forward(&input, &mut runtime);
 ```
 
 `Loss::MeanSquaredError` consumes ordinary model outputs.
 `Loss::BinaryCrossEntropyWithLogits` keeps the final output as logits for stable
-loss and gradient computation. Call `InferenceMLP::predict` (or
+loss and gradient computation. Call `Mlp::predict` (or
 `Loss::activate_output`) to apply Sigmoid and obtain probabilities. The shared
 `loss_rows` and `output_gradient` paths accept a positive-class weight for
 imbalanced binary classification and segmentation.
@@ -608,10 +585,9 @@ Dice weight and returns both row losses and the combined logit gradient. A zero
 Dice weight is exactly the weighted-BCE path. Dice uses whole-matrix reductions,
 so it introduces synchronization and is intended for segmentation objectives.
 
-`MlpExecutor` owns the Linear layers and residual configuration and provides the
-shared forward/backward execution logic. `InferenceMLP` delegates forward only;
-`TrainingMlp` additionally owns the forward activation tape and delegates
-backward. Linear itself remains cache-free.
+`MlpExecutor` owns the Linear layers and residual configuration. `Mlp` is the
+public forward block. Neither it nor `Linear` owns a training tape or optimizer;
+those lifetimes belong to `Graph<true>`.
 
 A typical two-layer FFN is:
 
@@ -622,49 +598,14 @@ features → hidden (GELU) → features (Identity)
 A residual range `(start, end)` represents a skip from the input of layer
 `start` to the output of layer `end - 1`.
 
-`TrainingMlp` stores only `layer_inputs[i]`, the input needed to run backward for
-layer `i`. Each newly allocated Matrix moves directly into the next layer's
-input slot; moving it into a `Vec` transfers only the owning handle and does not
-copy device data. The last layer's output is returned by value instead of being
-cached, allowing the parent model to decide whether to retain it.
-
-For mini-batch training, `backward_accumulate` computes `dX` immediately but
-only adds parameter gradients to optimizer state owned by `TrainingMlp`.
-`step(learning_rate, momentum, batch_len, runtime)` averages those gradients,
-updates a persistent classical-momentum velocity, applies the parameters, and
-clears the accumulators. `Linear` remains optimizer- and tape-free. The older
-`backward(..., learning_rate, ...)` entry is the one-sample, zero-momentum
-convenience path.
-
-`TrainingEncoder` exposes the same `backward_accumulate`/`step` split and
-applies a single batch boundary to its output projection, feed-forward MLP, and
-Q/K/V projections. Optimizer velocity is runtime state and is not serialized in
-the parameter checkpoint.
-
-Training forward consumes its input Matrix and moves it into the tape without
-an implicit device copy. A caller that still needs the input must explicitly
-copy it before the call or borrow the first tape entry afterward through
-`input()`.
-
-```rust
-let output: Matrix = training_mlp.forward(input, runtime);
-let input_gradient = training_mlp.backward(
-    &output_gradient,
-    learning_rate,
-    runtime,
-);
-```
-
-Backward recomputes pre-activation only for non-Identity activation layers;
-Identity layers do not repeat the affine GEMM. Each layer computes `dX` using
-the old weights before
-applying its SGD update. Residual gradients are accumulated at the source
-activation.
+When used in `Graph<true>`, the graph compiler creates the required backward
+state, accumulates parameter gradients, and applies updates at the graph-level
+`step` boundary. Moving a Matrix into graph state transfers only its owning
+handle and does not copy device data.
 
 ### SwiGLU
 
-`InferenceSwiglu` and `TrainingSwiglu` implement the standard three-projection
-SwiGLU block:
+`Swiglu` implements the standard three-projection SwiGLU block:
 
 ```text
 gate   = input @ W_gate
@@ -677,11 +618,7 @@ output = hidden @ W_down
 has shape `[hidden_features, output_features]`. The constructors accept these
 three weight matrices and create bias-free Identity Linear projections.
 
-Training forward consumes its input. The activation and product nodes retain
-their own minimal backward state, while `TrainingSwiglu` retains only the input
-and hidden Matrix required for the three parameter gradients. It exposes the
-same `backward_accumulate` plus `step(learning_rate, momentum, batch_len)` model
-as `TrainingMlp`; `backward` is the one-sample zero-momentum convenience path.
+Training state for these operations is generated and owned by `Graph<true>`.
 
 ### Transformer
 
@@ -697,7 +634,7 @@ MLP + residual + norm [sequence, hidden]
 output projection     [sequence, output]
 ```
 
-`InferenceEncoder` and `InferenceDecoder` select `NormType::Layer` or `NormType::Rms` at
+`Encoder` and `Decoder` select `NormType::Layer` or `NormType::Rms` at
 construction. It also accepts an optional set of three reusable Q/K/V streams;
 the supplied vector must contain exactly three streams. Passing `None` creates
 them lazily on the first forward call. Positional encoding is an owned,
@@ -706,7 +643,7 @@ serializable enum:
 ```rust
 let position_encoding = PositionEncoding::additive(position);
 
-let transformer = InferenceEncoder::<8>::new(
+let transformer = Encoder::<8>::new(
     query,
     key,
     value,
@@ -722,12 +659,10 @@ Both executors use a Post-Norm layout. LayerNorm and RMSNorm both provide forwar
 and backward paths. `QkvProjection` owns the three
 Linear projections and reusable streams. It accepts separate query and key/value
 inputs, so decoder cross-attention can reuse it. `Attention` owns scaled score
-calculation, row Softmax, the value GEMM, residual normalization, and its training
-cache. Encoder inference and training therefore share the same scheduling code.
+calculation, row Softmax, the value GEMM, and residual normalization.
 
-The head count is carried by `InferenceEncoder<const HEADS: usize>`,
-`InferenceDecoder<const HEADS: usize>`, `TrainingEncoder<const HEADS: usize>`, and
-`TrainingDecoder<const HEADS: usize>`.
+The head count is carried by `Encoder<const HEADS: usize>` and
+`Decoder<const HEADS: usize>`.
 Construction asserts that the projection width is divisible by
 `HEADS`. Q/K/V remain single contiguous `[sequence, hidden]` matrices: no head
 buffers are materialized. A batched-strided GEMM kernel derives the head index
@@ -748,8 +683,8 @@ output projection
 → position encoding
 ```
 
-`TrainingEncoder::backward` returns the input gradient and updates Linear
-parameters with the supplied learning rate. Identity and additive positional
+When a Transformer is compiled into `Graph<true>`, backward execution and
+parameter updates are graph responsibilities. Identity and additive positional
 encoding both have an identity derivative with respect to the input.
 
 ## Model Checkpoints
@@ -779,19 +714,12 @@ let model = checkpoint::load_transformer("model.toml", &runtime)?;
 ```
 
 All file operations live in `net::checkpoint`; `Linear`, MLP, and Transformer do
-not expose file methods. The module also provides explicit inference/training MLP
-and training Transformer variants. Inference and training forms share the same
-persistent parameter representation. Forward caches and Q/K/V streams are runtime
-state and are not saved. Positional encoding metadata and additive values are
-stored with the Transformer. A loaded inference
-Transformer recreates streams lazily, while a loaded training wrapper starts with
-an empty cache. Training checkpoints retain their selected LayerNorm or RMSNorm
-type when loaded.
+not expose file methods. Graph training state and Q/K/V streams are runtime state
+and are not saved. Positional encoding metadata and additive values are stored
+with the Transformer; streams are recreated lazily after loading.
 
-The complete association-layer entry points are `dump_linear/load_linear`,
-`dump_mlp/load_mlp`, `dump_inference_mlp/load_inference_mlp`,
-`dump_training_mlp/load_training_mlp`, `dump_transformer/load_transformer`, and
-`dump_training_transformer/load_training_transformer`.
+The association-layer entry points are `dump_linear/load_linear`,
+`dump_mlp/load_mlp`, and `dump_transformer/load_transformer`.
 
 The TOML document records:
 
@@ -803,7 +731,7 @@ The TOML document records:
 - Matrix/Vector shapes and each parameter's `[byte_start, byte_end)` range;
 - the Transformer's fixed attention and feed-forward residual connections.
 
-`MlpExecutor::new`, `InferenceMLP::new`, and `TrainingMlp::new` default to
+`MlpExecutor::new` and `Mlp::new` default to
 `Loss::MeanSquaredError`. Use `with_loss` when selecting the persisted loss
 explicitly. Version 1 currently defines only mean squared error.
 

@@ -2,7 +2,7 @@ use crate::cuda::container::Matrix;
 use crate::cuda::container::Vector;
 use crate::cuda::runtime::CudaRuntime;
 use crate::graph::{GraphNode, LearnConfig, NodeTrainState};
-use crate::net::linear::{Linear, LinearMetadata, LinearTrainingState};
+use crate::net::linear::{Linear, LinearMetadata};
 use crate::net::metadata::{HostData, HostDataCursor, MetadataCursor};
 use serde::{Deserialize, Serialize};
 
@@ -343,67 +343,13 @@ impl MlpExecutor {
             layer.set_data(data, runtime);
         }
     }
-
-    fn backward_accumulate(
-        &mut self,
-        layer_inputs: &[Matrix],
-        output_gradient: &Matrix,
-        training: &mut [LinearTrainingState],
-        runtime: &mut CudaRuntime,
-    ) -> Matrix {
-        assert_eq!(layer_inputs.len(), self.layers.len());
-        assert_eq!(training.len(), self.layers.len());
-
-        let mut gradient = runtime.clone_matrix(output_gradient, None);
-        let mut residual_gradient: Option<(usize, Matrix)> = None;
-        for index in (0..self.layers.len()).rev() {
-            let residual_index = self
-                .res_range
-                .and_then(|(start, end)| (index + 1 == end).then_some(start));
-            let pre_activation = self.layers[index].needs_pre_activation().then(|| {
-                let residual = residual_index.map(|source| &layer_inputs[source]);
-                self.layers[index].affine(&layer_inputs[index], residual, runtime, None)
-            });
-            let (layer_gradient, bias_gradient) =
-                self.layers[index].backward(pre_activation.as_ref(), &gradient, runtime, None);
-            let mut input_gradient =
-                self.layers[index].input_gradient(&layer_gradient, runtime, None);
-
-            if let Some(source) = residual_index {
-                residual_gradient = Some((source, runtime.clone_matrix(&layer_gradient, None)));
-            }
-            if residual_gradient
-                .as_ref()
-                .is_some_and(|(source, _)| *source == index)
-            {
-                let (_, skip_gradient) = residual_gradient.take().unwrap();
-                input_gradient.binary_assign(
-                    &skip_gradient,
-                    move |lhs, rhs| lhs + rhs,
-                    runtime,
-                    None,
-                );
-            }
-
-            self.layers[index].accumulate_training(
-                &mut training[index],
-                &layer_inputs[index],
-                &layer_gradient,
-                bias_gradient.as_ref(),
-                runtime,
-            );
-            gradient = input_gradient;
-        }
-        assert!(residual_gradient.is_none(), "unresolved residual gradient");
-        gradient
-    }
 }
 
-pub struct InferenceMLP {
+pub struct Mlp {
     executor: MlpExecutor,
 }
 
-impl InferenceMLP {
+impl Mlp {
     pub fn new(layers: Vec<Linear>, res_range: Option<(usize, usize)>) -> Self {
         Self::with_loss(layers, res_range, Loss::MeanSquaredError)
     }
@@ -441,156 +387,7 @@ impl InferenceMLP {
     }
 }
 
-pub struct TrainingMlp {
-    /// `layer_inputs[i]` owns the input consumed by layer `i`.
-    layer_inputs: Vec<Matrix>,
-    executor: MlpExecutor,
-    training: Vec<LinearTrainingState>,
-}
-
-impl TrainingMlp {
-    pub fn new(layers: Vec<Linear>, res_range: Option<(usize, usize)>) -> Self {
-        Self::with_loss(layers, res_range, Loss::MeanSquaredError)
-    }
-
-    pub fn with_loss(layers: Vec<Linear>, res_range: Option<(usize, usize)>, loss: Loss) -> Self {
-        let layer_count = layers.len();
-        Self {
-            layer_inputs: Vec::new(),
-            executor: MlpExecutor::with_loss(layers, res_range, loss),
-            training: (0..layer_count)
-                .map(|_| LinearTrainingState::with_parameter_count(2))
-                .collect(),
-        }
-    }
-
-    pub fn get_meta_data(&self, cursor: &mut MetadataCursor) -> MlpMetadata {
-        self.executor.get_meta_data(cursor)
-    }
-
-    pub fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
-        self.executor.get_data(runtime)
-    }
-
-    pub fn set_data(&mut self, data: &mut HostDataCursor, runtime: &CudaRuntime) {
-        self.executor.set_data(data, runtime);
-    }
-
-    pub fn loss(&self) -> Loss {
-        self.executor.loss()
-    }
-
-    pub fn activate_output(&self, output: &mut Matrix, runtime: &CudaRuntime) {
-        self.executor.activate_output(output, runtime);
-    }
-
-    pub fn loss_rows(
-        &self,
-        output: &Matrix,
-        target: &Matrix,
-        positive_weight: f32,
-        runtime: &mut CudaRuntime,
-    ) -> Vector {
-        self.executor
-            .loss_rows(output, target, positive_weight, runtime)
-    }
-
-    pub fn output_gradient(
-        &self,
-        output: &Matrix,
-        target: &Matrix,
-        positive_weight: f32,
-        runtime: &mut CudaRuntime,
-    ) -> Matrix {
-        self.executor
-            .output_gradient(output, target, positive_weight, runtime)
-    }
-
-    pub fn loss_and_output_gradient(
-        &self,
-        output: &Matrix,
-        target: &Matrix,
-        positive_weight: f32,
-        dice_weight: f32,
-        runtime: &mut CudaRuntime,
-    ) -> (Vector, Matrix) {
-        self.executor.loss_and_output_gradient(
-            output,
-            target,
-            positive_weight,
-            dice_weight,
-            runtime,
-        )
-    }
-
-    pub fn forward(&mut self, input: Matrix, runtime: &mut CudaRuntime) -> Matrix {
-        self.clear_cache(runtime);
-        self.layer_inputs.reserve(self.executor.layers.len());
-        self.layer_inputs.push(input);
-
-        for index in 0..self.executor.layers.len() {
-            let residual_index = self
-                .executor
-                .res_range
-                .and_then(|(start, end)| (index + 1 == end).then_some(start));
-            let output = {
-                let layer_input = &self.layer_inputs[index];
-                let residual = residual_index.map(|source| &self.layer_inputs[source]);
-                self.executor.layers[index].forward(layer_input, residual, runtime, None)
-            };
-            if index + 1 == self.executor.layers.len() {
-                return output;
-            }
-            self.layer_inputs.push(output);
-        }
-        unreachable!("MLP always contains at least one layer")
-    }
-
-    pub fn backward(&mut self, output_gradient: &Matrix, runtime: &mut CudaRuntime) -> Matrix {
-        self.backward_accumulate(output_gradient, runtime)
-    }
-
-    /// Backpropagates one sample and accumulates its parameter gradients into
-    /// the current mini-batch without changing any parameters.
-    pub fn backward_accumulate(
-        &mut self,
-        output_gradient: &Matrix,
-        runtime: &mut CudaRuntime,
-    ) -> Matrix {
-        self.executor.backward_accumulate(
-            &self.layer_inputs,
-            output_gradient,
-            &mut self.training,
-            runtime,
-        )
-    }
-
-    /// Applies the mean gradient of the accumulated mini-batch using classical
-    /// momentum SGD, then clears only the gradient accumulators.
-    pub fn learn(
-        &mut self,
-        learning_rate: f32,
-        momentum: f32,
-        batch_len: usize,
-        runtime: &mut CudaRuntime,
-    ) {
-        for (layer, training) in self.executor.layers.iter_mut().zip(&mut self.training) {
-            layer.learn_from_state(training, learning_rate, momentum, batch_len, runtime);
-        }
-    }
-
-    pub fn input(&self) -> Option<&Matrix> {
-        self.layer_inputs.first()
-    }
-
-    pub fn clear_cache(&mut self, runtime: &mut CudaRuntime) {
-        for input in self.layer_inputs.drain(..) {
-            runtime.recycle_matrix(input);
-        }
-    }
-}
-
-impl GraphNode for InferenceMLP {
+impl GraphNode for Mlp {
     fn create_train_state(&self) -> NodeTrainState {
         NodeTrainState::with_children(
             self.executor
@@ -604,64 +401,26 @@ impl GraphNode for InferenceMLP {
     fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
         assert_eq!(inputs.len(), 1, "MLP forward expects one matrix");
         let input = inputs.pop().unwrap();
-        let output = InferenceMLP::forward(self, &input, runtime);
+        let output = Mlp::forward(self, &input, runtime);
         runtime.recycle_matrix(input);
         vec![output]
     }
 
     fn backward(&mut self, _gradients: Vec<Matrix>, _runtime: &mut CudaRuntime) -> Vec<Matrix> {
-        panic!("inference MLP does not support backward; use TrainingMlp")
+        panic!("MLP training is assembled and owned by Graph<true>")
     }
 
     fn learn(&mut self, _config: LearnConfig, _runtime: &mut CudaRuntime) {
-        panic!("inference MLP does not support learning; use TrainingMlp")
+        panic!("MLP training is assembled and owned by Graph<true>")
     }
 
     fn clear_cache(&mut self, _runtime: &mut CudaRuntime) {}
 
     fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
-        InferenceMLP::get_data(self, runtime)
+        Mlp::get_data(self, runtime)
     }
 
     fn set_data(&mut self, data: &mut HostDataCursor, runtime: &CudaRuntime) {
-        InferenceMLP::set_data(self, data, runtime);
-    }
-}
-
-impl GraphNode for TrainingMlp {
-    fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
-        assert_eq!(inputs.len(), 1, "MLP forward expects one matrix");
-        vec![TrainingMlp::forward(self, inputs.pop().unwrap(), runtime)]
-    }
-
-    fn backward(&mut self, mut gradients: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
-        assert_eq!(gradients.len(), 1, "MLP backward expects one gradient");
-        let output_gradient = gradients.pop().unwrap();
-        let input_gradient = self.backward_accumulate(&output_gradient, runtime);
-        runtime.recycle_matrix(output_gradient);
-        self.clear_cache(runtime);
-        vec![input_gradient]
-    }
-
-    fn learn(&mut self, config: LearnConfig, runtime: &mut CudaRuntime) {
-        TrainingMlp::learn(
-            self,
-            config.learning_rate,
-            config.momentum,
-            config.batch_len,
-            runtime,
-        );
-    }
-
-    fn clear_cache(&mut self, runtime: &mut CudaRuntime) {
-        TrainingMlp::clear_cache(self, runtime);
-    }
-
-    fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
-        TrainingMlp::get_data(self, runtime)
-    }
-
-    fn set_data(&mut self, data: &mut HostDataCursor, runtime: &CudaRuntime) {
-        TrainingMlp::set_data(self, data, runtime);
+        Mlp::set_data(self, data, runtime);
     }
 }

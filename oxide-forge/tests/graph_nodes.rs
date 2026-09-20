@@ -4,16 +4,12 @@ use oxide_forge::graph::{
 };
 use oxide_forge::net::linear::{Activation, Linear, LinearConfig};
 use oxide_forge::net::mlp::Loss;
-use oxide_forge::net::mlp::{InferenceMLP, TrainingMlp};
+use oxide_forge::net::mlp::Mlp;
 use oxide_forge::net::node::{
-    BinaryNode, ConcatNode, CopyNode, ReduceNode, ReduceOp, RowReduceNode, SingleNode, SplitNode,
-    TrainingBinaryNode, TrainingConcatNode, TrainingCopyNode, TrainingReduceNode,
-    TrainingRowReduceNode, TrainingSingleNode, TrainingSplitNode,
+    BinaryNode, ConcatNode, CopyNode, ReduceNode, RowReduceNode, SingleNode, SplitNode,
 };
-use oxide_forge::net::swiglu::{InferenceSwiglu, TrainingSwiglu};
-use oxide_forge::net::transformer::{
-    InferenceDecoder, InferenceEncoder, TrainingDecoder, TrainingEncoder,
-};
+use oxide_forge::net::swiglu::Swiglu;
+use oxide_forge::net::transformer::{Decoder, Encoder};
 
 fn assert_graph_node<T: GraphNode>() {}
 
@@ -24,28 +20,17 @@ fn linear_and_transformers_are_graph_nodes() {
     assert_graph_node::<Branch<false>>();
     assert_graph_node::<Branch<true>>();
     assert_graph_node::<Linear>();
-    assert_graph_node::<InferenceEncoder<1>>();
-    assert_graph_node::<TrainingEncoder<1>>();
-    assert_graph_node::<InferenceDecoder<1>>();
-    assert_graph_node::<TrainingDecoder<1>>();
-    assert_graph_node::<InferenceMLP>();
-    assert_graph_node::<TrainingMlp>();
-    assert_graph_node::<InferenceSwiglu>();
-    assert_graph_node::<TrainingSwiglu>();
+    assert_graph_node::<Encoder<1>>();
+    assert_graph_node::<Decoder<1>>();
+    assert_graph_node::<Mlp>();
+    assert_graph_node::<Swiglu>();
     assert_graph_node::<BinaryNode>();
-    assert_graph_node::<TrainingBinaryNode>();
     assert_graph_node::<SingleNode>();
-    assert_graph_node::<TrainingSingleNode>();
     assert_graph_node::<ConcatNode>();
-    assert_graph_node::<TrainingConcatNode>();
     assert_graph_node::<SplitNode>();
-    assert_graph_node::<TrainingSplitNode>();
     assert_graph_node::<CopyNode>();
-    assert_graph_node::<TrainingCopyNode>();
     assert_graph_node::<ReduceNode>();
-    assert_graph_node::<TrainingReduceNode>();
     assert_graph_node::<RowReduceNode>();
-    assert_graph_node::<TrainingRowReduceNode>();
 }
 
 #[test]
@@ -113,32 +98,4 @@ fn span_set_initializers_preserve_values() {
             .into_iter()
             .all(|value| (0.0..=1.0).contains(&value))
     );
-}
-
-#[test]
-#[ignore = "requires a CUDA device and a CUDA-Oxide device artifact"]
-fn copy_and_reduce_are_backward_pairs() {
-    let mut runtime = CudaRuntime::new().unwrap();
-
-    let input = runtime.matrix_from_host(&[1.0, 2.0], 1, 2, None).unwrap();
-    let mut copy = TrainingCopyNode::new(2);
-    let outputs = copy.forward(input, &mut runtime);
-    assert_eq!(outputs[0].to_host(&runtime, None), vec![1.0, 2.0]);
-    assert_eq!(outputs[1].to_host(&runtime, None), vec![1.0, 2.0]);
-
-    let lhs = runtime.matrix_from_host(&[1.0, 1.0], 1, 2, None).unwrap();
-    let rhs = runtime.matrix_from_host(&[2.0, 2.0], 1, 2, None).unwrap();
-    let gradient = copy.backward(vec![lhs, rhs], &mut runtime);
-    assert_eq!(gradient.to_host(&runtime, None), vec![3.0, 3.0]);
-
-    let lhs = runtime.matrix_from_host(&[2.0, 4.0], 1, 2, None).unwrap();
-    let rhs = runtime.matrix_from_host(&[4.0, 8.0], 1, 2, None).unwrap();
-    let mut mean = TrainingReduceNode::new(ReduceOp::Mean, 2);
-    let output = mean.forward(vec![lhs, rhs], &mut runtime);
-    assert_eq!(output.to_host(&runtime, None), vec![3.0, 6.0]);
-
-    let upstream = runtime.matrix_from_host(&[2.0, 4.0], 1, 2, None).unwrap();
-    let gradients = mean.backward(upstream, &mut runtime);
-    assert_eq!(gradients[0].to_host(&runtime, None), vec![1.0, 2.0]);
-    assert_eq!(gradients[1].to_host(&runtime, None), vec![1.0, 2.0]);
 }

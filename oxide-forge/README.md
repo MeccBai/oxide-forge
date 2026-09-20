@@ -63,10 +63,10 @@ propagating into every downstream kernel.
 
 `Matrix` and `Vector` own device memory; spans and views borrow it. Operations
 that allocate a new container live on `CudaRuntime`, while in-place operations
-live on the container itself. Training executors retain only the values needed
-by backward. A layer's newly allocated output is moved directly into the next
-layer's cache without an additional device copy. Final outputs are returned by
-value so the parent model controls whether they remain alive.
+live on the container itself. `Graph<true>` retains only the values required by
+backward; layers and reusable blocks do not define separate training variants.
+A newly allocated output moves into graph state without an additional device
+copy. Final outputs are returned by value so the graph controls their lifetime.
 
 ### Synchronization is explicit
 
@@ -109,14 +109,12 @@ X ───────────────── residual ── Norm ─�
                                                       output projection
 ```
 
-Inference and training select `NormType::Layer` or `NormType::Rms` when they are
-constructed. Positional encoding is an owned `Matrix -> Matrix` closure, so it can
-capture its own device-side state without coupling that state to Transformer.
-Both normalization types provide forward and backward paths. Q/K/V
-projections, their reusable streams, scaled
-attention, Softmax, residual normalization, and the attention training cache are
-owned by one shared Attention module. Inference executors do not retain
-activations. Individual Linear layers do not own a tape or workspace.
+`Encoder` and `Decoder` select `NormType::Layer` or `NormType::Rms` when they are
+constructed. Positional encoding is an owned `Matrix -> Matrix` closure, so it
+can capture device-side state without coupling that state to Transformer. Q/K/V
+projections, reusable streams, scaled attention, Softmax, and residual
+normalization are owned by one shared Attention module. Training state belongs
+to `Graph<true>`; individual blocks do not own a tape or optimizer workspace.
 
 ## Requirements
 
@@ -217,9 +215,9 @@ src/
     ├── checkpoint/        metadata, binary I/O, and model assembly
     ├── linear.rs          Linear, activation, and parameter updates
     ├── metadata.rs        public parameter metadata and host data
-    ├── mlp.rs             inference/training MLP executors
+    ├── mlp.rs             shared MLP executor and graph-facing block
     ├── node/              explicit differentiable composition operations
-    ├── swiglu.rs          inference/training SwiGLU feed-forward block
+    ├── swiglu.rs          SwiGLU feed-forward block
     └── transformer/       attention, encoder, decoder, and position encoding
 docs/
 └── api.md                 complete runtime API reference

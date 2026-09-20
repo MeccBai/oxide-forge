@@ -3,7 +3,7 @@ use crate::graph::{GraphNode, LearnConfig};
 use crate::net::linear::Linear;
 use crate::net::linear::LinearMetadata;
 use crate::net::metadata::{HostData, HostDataCursor, MetadataCursor};
-use crate::net::mlp::InferenceMLP;
+use crate::net::mlp::Mlp;
 use crate::net::mlp::MlpMetadata;
 use crate::net::node::{BinaryNode, BinaryOp, SingleNode, SingleType};
 use cuda_core::CudaStream;
@@ -27,25 +27,25 @@ pub struct TransformerMetadata {
     pub output: LinearMetadata,
 }
 
-pub struct InferenceTransformer<const HEADS: usize = 1, const MASKED: bool = false> {
+pub struct Transformer<const HEADS: usize = 1, const MASKED: bool = false> {
     attention: Attention<HEADS>,
     norm_type: NormType,
     attention_residual: BinaryNode,
     attention_normalization: SingleNode,
     position_encoding: PositionEncoding,
-    fcs: InferenceMLP,
+    fcs: Mlp,
     output_matrix: Linear,
     feed_forward_residual: BinaryNode,
     feed_forward_normalization: SingleNode,
 }
 
-impl<const HEADS: usize, const MASKED: bool> InferenceTransformer<HEADS, MASKED> {
+impl<const HEADS: usize, const MASKED: bool> Transformer<HEADS, MASKED> {
     pub fn new(
         q_matrix: Linear,
         k_matrix: Linear,
         v_matrix: Linear,
         position_encoding: PositionEncoding,
-        fcs: InferenceMLP,
+        fcs: Mlp,
         output_matrix: Linear,
         qkv_streams: Option<Vec<Arc<CudaStream>>>,
         norm_type: NormType,
@@ -129,30 +129,30 @@ impl<const HEADS: usize, const MASKED: bool> InferenceTransformer<HEADS, MASKED>
     }
 }
 
-impl<const HEADS: usize, const MASKED: bool> GraphNode for InferenceTransformer<HEADS, MASKED> {
+impl<const HEADS: usize, const MASKED: bool> GraphNode for Transformer<HEADS, MASKED> {
     fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
         assert_eq!(inputs.len(), 1, "Transformer forward expects one matrix");
         let input = inputs.pop().unwrap();
-        let output = InferenceTransformer::forward(self, &input, runtime);
+        let output = Transformer::forward(self, &input, runtime);
         runtime.recycle_matrix(input);
         vec![output]
     }
 
     fn backward(&mut self, _gradients: Vec<Matrix>, _runtime: &mut CudaRuntime) -> Vec<Matrix> {
-        panic!("inference Transformer does not support backward; use TrainingEncoder")
+        panic!("Transformer training is assembled and owned by Graph<true>")
     }
 
     fn learn(&mut self, _config: LearnConfig, _runtime: &mut CudaRuntime) {
-        panic!("inference Transformer does not support optimizer steps; use TrainingEncoder")
+        panic!("Transformer training is assembled and owned by Graph<true>")
     }
 
     fn clear_cache(&mut self, _runtime: &mut CudaRuntime) {}
 
     fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
-        InferenceTransformer::get_data(self, runtime)
+        Transformer::get_data(self, runtime)
     }
 
     fn set_data(&mut self, data: &mut HostDataCursor, runtime: &CudaRuntime) {
-        InferenceTransformer::set_data(self, data, runtime);
+        Transformer::set_data(self, data, runtime);
     }
 }

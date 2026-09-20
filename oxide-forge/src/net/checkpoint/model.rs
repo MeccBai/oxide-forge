@@ -7,10 +7,9 @@ use crate::cuda::container::{Matrix, Vector};
 use crate::cuda::runtime::CudaRuntime;
 use crate::net::linear::{Linear, LinearMetadata};
 use crate::net::metadata::{HostData, MatrixMetadata, MetadataCursor, VectorMetadata};
-use crate::net::mlp::{InferenceMLP, MlpExecutor, MlpMetadata, TrainingMlp};
+use crate::net::mlp::{Mlp, MlpExecutor, MlpMetadata};
 use crate::net::transformer::{
-    InferenceEncoder, PositionEncoding, PositionEncodingMetadata, TrainingEncoder,
-    TransformerMetadata,
+    Encoder, PositionEncoding, PositionEncodingMetadata, TransformerMetadata,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -94,50 +93,8 @@ pub fn load_mlp<P: AsRef<Path>>(path: P, runtime: &CudaRuntime) -> CheckpointRes
     Ok(MlpExecutor::with_loss(layers, residual, metadata.mlp.loss))
 }
 
-pub fn dump_inference_mlp<P: AsRef<Path>>(
-    model: &InferenceMLP,
-    path: P,
-    runtime: &CudaRuntime,
-) -> CheckpointResult<()> {
-    dump_mlp_data(
-        model.get_meta_data(&mut MetadataCursor::new()),
-        path,
-        || model.get_data(runtime),
-    )
-}
-
-pub fn load_inference_mlp<P: AsRef<Path>>(
-    path: P,
-    runtime: &CudaRuntime,
-) -> CheckpointResult<InferenceMLP> {
-    let (metadata, mut reader) = open_mlp(path.as_ref())?;
-    let (layers, residual) = load_mlp_parameters(&metadata.mlp, &mut reader, runtime)?;
-    Ok(InferenceMLP::with_loss(layers, residual, metadata.mlp.loss))
-}
-
-pub fn dump_training_mlp<P: AsRef<Path>>(
-    model: &TrainingMlp,
-    path: P,
-    runtime: &CudaRuntime,
-) -> CheckpointResult<()> {
-    dump_mlp_data(
-        model.get_meta_data(&mut MetadataCursor::new()),
-        path,
-        || model.get_data(runtime),
-    )
-}
-
-pub fn load_training_mlp<P: AsRef<Path>>(
-    path: P,
-    runtime: &CudaRuntime,
-) -> CheckpointResult<TrainingMlp> {
-    let (metadata, mut reader) = open_mlp(path.as_ref())?;
-    let (layers, residual) = load_mlp_parameters(&metadata.mlp, &mut reader, runtime)?;
-    Ok(TrainingMlp::with_loss(layers, residual, metadata.mlp.loss))
-}
-
 pub fn dump_transformer<const HEADS: usize, P: AsRef<Path>>(
-    model: &InferenceEncoder<HEADS>,
+    model: &Encoder<HEADS>,
     path: P,
     runtime: &CudaRuntime,
 ) -> CheckpointResult<()> {
@@ -151,7 +108,7 @@ pub fn dump_transformer<const HEADS: usize, P: AsRef<Path>>(
 pub fn load_transformer<const HEADS: usize, P>(
     path: P,
     runtime: &CudaRuntime,
-) -> CheckpointResult<InferenceEncoder<HEADS>>
+) -> CheckpointResult<Encoder<HEADS>>
 where
     P: AsRef<Path>,
 {
@@ -165,54 +122,14 @@ where
         load_position_encoding(&transformer.position_encoding, &mut reader, runtime)?;
     let (layers, residual) = load_mlp_parameters(&transformer.feed_forward, &mut reader, runtime)?;
     let output_matrix = load_linear_parameter(&transformer.output, &mut reader, runtime)?;
-    Ok(InferenceEncoder::new(
+    Ok(Encoder::new(
         q_matrix,
         k_matrix,
         v_matrix,
         position_encoding,
-        InferenceMLP::with_loss(layers, residual, transformer.feed_forward.loss),
+        Mlp::with_loss(layers, residual, transformer.feed_forward.loss),
         output_matrix,
         None,
-        transformer.normalization,
-    ))
-}
-
-pub fn dump_training_transformer<const HEADS: usize, P: AsRef<Path>>(
-    model: &TrainingEncoder<HEADS>,
-    path: P,
-    runtime: &CudaRuntime,
-) -> CheckpointResult<()> {
-    dump_transformer_data(
-        model.get_meta_data(&mut MetadataCursor::new()),
-        path,
-        || model.get_data(runtime),
-    )
-}
-
-pub fn load_training_transformer<const HEADS: usize, P>(
-    path: P,
-    runtime: &CudaRuntime,
-) -> CheckpointResult<TrainingEncoder<HEADS>>
-where
-    P: AsRef<Path>,
-{
-    let (metadata, mut reader) = open_transformer(path.as_ref())?;
-    let transformer = &metadata.transformer;
-    validate_head_count::<HEADS>(transformer)?;
-    let q_matrix = load_linear_parameter(&transformer.query, &mut reader, runtime)?;
-    let k_matrix = load_linear_parameter(&transformer.key, &mut reader, runtime)?;
-    let v_matrix = load_linear_parameter(&transformer.value, &mut reader, runtime)?;
-    let position_encoding =
-        load_position_encoding(&transformer.position_encoding, &mut reader, runtime)?;
-    let (layers, residual) = load_mlp_parameters(&transformer.feed_forward, &mut reader, runtime)?;
-    let output_matrix = load_linear_parameter(&transformer.output, &mut reader, runtime)?;
-    Ok(TrainingEncoder::new(
-        q_matrix,
-        k_matrix,
-        v_matrix,
-        position_encoding,
-        TrainingMlp::with_loss(layers, residual, transformer.feed_forward.loss),
-        output_matrix,
         transformer.normalization,
     ))
 }
