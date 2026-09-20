@@ -1,7 +1,7 @@
 use crate::cuda::container::Matrix;
 use crate::cuda::container::Vector;
 use crate::cuda::runtime::CudaRuntime;
-use crate::graph::{GraphNode, LearnConfig};
+use crate::graph::{GraphNode, LearnConfig, NodeTrainState};
 use crate::net::linear::{Linear, LinearMetadata, LinearTrainingState};
 use crate::net::metadata::{HostData, HostDataCursor, MetadataCursor};
 use serde::{Deserialize, Serialize};
@@ -385,7 +385,8 @@ impl MlpExecutor {
                 );
             }
 
-            training[index].accumulate(
+            self.layers[index].accumulate_training(
+                &mut training[index],
                 &layer_inputs[index],
                 &layer_gradient,
                 bias_gradient.as_ref(),
@@ -458,7 +459,7 @@ impl TrainingMlp {
             layer_inputs: Vec::new(),
             executor: MlpExecutor::with_loss(layers, res_range, loss),
             training: (0..layer_count)
-                .map(|_| LinearTrainingState::default())
+                .map(|_| LinearTrainingState::with_parameter_count(2))
                 .collect(),
         }
     }
@@ -574,7 +575,7 @@ impl TrainingMlp {
         runtime: &mut CudaRuntime,
     ) {
         for (layer, training) in self.executor.layers.iter_mut().zip(&mut self.training) {
-            training.learn(layer, learning_rate, momentum, batch_len, runtime);
+            layer.learn_from_state(training, learning_rate, momentum, batch_len, runtime);
         }
     }
 
@@ -590,6 +591,16 @@ impl TrainingMlp {
 }
 
 impl GraphNode for InferenceMLP {
+    fn create_train_state(&self) -> NodeTrainState {
+        NodeTrainState::with_children(
+            self.executor
+                .layers
+                .iter()
+                .map(GraphNode::create_train_state)
+                .collect(),
+        )
+    }
+
     fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
         assert_eq!(inputs.len(), 1, "MLP forward expects one matrix");
         let input = inputs.pop().unwrap();

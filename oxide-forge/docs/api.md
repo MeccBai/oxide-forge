@@ -29,6 +29,83 @@ does not aim for unrestricted generality.
 | Returns a scalar or host copy | The source container |
 | Recycles owned device storage | `CudaRuntime` |
 
+## Graph
+
+`GraphBuilder` records an explicit static topology. It does not trace runtime
+operations. `then` appends a device-independent block configuration; `copy`,
+`map`, and `concat` describe branches. Shapes are propagated and validated while
+the draft is built.
+
+```rust
+let draft = GraphBuilder::start(MatrixConfig::new(rows, width))
+    .then(LinearConfig::new(
+        MatrixConfig::new(width, hidden),
+        true,
+        Activation::Gelu,
+    ))
+    .then(LinearConfig::new(
+        MatrixConfig::new(hidden, output_width),
+        true,
+        Activation::Identity,
+    ))
+    .end();
+
+let mut graph: Graph<true> = draft.init(
+    &mut runtime,
+    InitConfig::Random {
+        loss: Loss::MeanSquaredError,
+        learning_rate: LearningRateScheduler::new(1.0e-3),
+    },
+)?;
+
+let loss = graph.train_step(input, &target, 1.0, 0.0, 0.9, &mut runtime);
+```
+
+`LinearConfig` contains only the weight shape, whether a bias exists, and the
+activation kind. It never allocates device memory. Under `InitConfig::Random`,
+`GraphDraft::init` creates random weights and zero biases using the supplied
+runtime. Training is selected by `Graph<true>`, not by a separate Linear type.
+
+| Builder API | Effect |
+| --- | --- |
+| `GraphBuilder::start(config)` | Start a graph with one Matrix value |
+| `then(linear_config)` | Append a configured Linear block |
+| `then_node(node)` | Append an already initialized low-level `GraphNode` |
+| `copy(count)` | Create independently owned values for branches |
+| `map(branches)` | Run one branch for each current value |
+| `concat(axis)` | Join branch outputs into one contiguous Matrix |
+| `end()` | Validate one final output and create `GraphDraft` |
+
+`BranchBuilder::start` creates a shape-independent branch. Its input and output
+shapes are resolved when the branch is attached by `map`.
+
+Forward executes steps in declaration order; backward walks precisely the same
+topology in reverse. `Graph::step` updates every trainable node and advances the
+graph learning-rate schedule exactly once. `Graph<false>` exposes forward only;
+backward and optimizer execution fail immediately.
+
+| Executable API | Description |
+| --- | --- |
+| `Graph<TRAINING>::forward(input, runtime)` | Consume one input and return the owned output |
+| `Graph<true>::backward(gradient, runtime)` | Backpropagate and accumulate parameter gradients |
+| `Graph<true>::step(momentum, batch_len, runtime)` | Apply accumulated gradients and advance LR once |
+| `Graph<true>::train_step(...)` | Forward, loss, backward, and one optimizer step |
+| `learning_rate()` | Inspect the scheduler and current rate |
+| `get_input_config()` / `get_output_config()` | Inspect statically validated boundary shapes |
+
+Branches are constructed independently and attached by `map`:
+
+```rust
+let left = BranchBuilder::start().then(left_linear_config).end();
+let right = BranchBuilder::start().then(right_linear_config).end();
+
+let draft = GraphBuilder::start(input_config)
+    .copy(2)
+    .map([left, right])
+    .concat(MatrixAxis::Columns)
+    .end();
+```
+
 ## CudaRuntime
 
 ### Lifecycle and synchronization
@@ -86,7 +163,7 @@ runtime.span_to_buffer_async(&span);
 ```rust
 pub enum InitType {
     Sequence,
-    Reserve,
+    Reverse,
     Random,
     Zero,
 }
@@ -95,7 +172,7 @@ pub enum InitType {
 | Variant | Contents |
 | --- | --- |
 | `Sequence` | `0, 1, 2, ...` |
-| `Reserve` | `len, len - 1, ...` |
+| `Reverse` | `len, len - 1, ...` |
 | `Random` | Pseudorandom values in `[0, 1]` |
 | `Zero` | All zeroes |
 
@@ -452,20 +529,20 @@ rows and columns. Sizes describe row counts for `Rows` and column counts for
 contiguous row-major storage. Column operations physically rearrange data rather
 than creating a strided view.
 
-### FanOutNode
+### CopyNode and ReduceNode
 
 ```rust
-use oxide_forge::net::node::{FanOutMode, TrainingFanOutNode};
+use oxide_forge::net::node::{CopyNode, ReduceNode, ReduceOp};
 
-let mut branches = TrainingFanOutNode::new(FanOutMode::Copy, 3);
-let outputs = branches.forward(input, &mut runtime);
-let input_gradient = branches.backward(output_gradients, &mut runtime);
+let copy = CopyNode::new(3);
+let sum = ReduceNode::new(ReduceOp::Sum, 3);
+let mean = ReduceNode::new(ReduceOp::Mean, 3);
 ```
 
-`FanOutMode::Copy` creates `n` independently owned copies of the input; its
-backward sums all branch gradients. `FanOutMode::Average` sends `input / n` to
-each branch and returns `sum(branch_gradients) / n` during backward. Both modes
-require at least two outputs and retain no numerical forward cache.
+`CopyNode` creates `n` independently owned copies of one input; its backward
+sums all branch gradients. `ReduceNode` consumes `n` equally shaped inputs and
+reduces them element-wise with Sum or Mean; its backward copies the upstream
+gradient to every input and applies the Mean scale when required.
 
 ### RowReduceNode
 

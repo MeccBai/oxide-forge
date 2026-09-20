@@ -1,5 +1,5 @@
 use crate::cuda::{CudaRuntime, container::Matrix};
-use crate::graph::{GraphNode, LearnConfig};
+use crate::graph::{GraphNode, LearnConfig, NodeTrainState};
 
 use super::{
     linear::{Activation, Linear, LinearTrainingState},
@@ -71,9 +71,9 @@ impl TrainingSwiglu {
             gate: identity_linear(gate),
             up: identity_linear(up),
             down: identity_linear(down),
-            gate_training: LinearTrainingState::default(),
-            up_training: LinearTrainingState::default(),
-            down_training: LinearTrainingState::default(),
+            gate_training: LinearTrainingState::with_parameter_count(2),
+            up_training: LinearTrainingState::with_parameter_count(2),
+            down_training: LinearTrainingState::with_parameter_count(2),
             activation: TrainingSingleNode::new(SingleType::Activation(Activation::Silu)),
             product: TrainingBinaryNode::new(BinaryOp::Mul),
             cache: None,
@@ -110,8 +110,13 @@ impl TrainingSwiglu {
             .expect("SwiGLU forward must run before backward");
 
         let hidden_gradient = self.down.input_gradient(output_gradient, runtime, None);
-        self.down_training
-            .accumulate(&cache.hidden, output_gradient, None, runtime);
+        self.down.accumulate_training(
+            &mut self.down_training,
+            &cache.hidden,
+            output_gradient,
+            None,
+            runtime,
+        );
 
         let [gate_activation_gradient, up_gradient]: [Matrix; 2] = self
             .product
@@ -122,10 +127,20 @@ impl TrainingSwiglu {
 
         let gate_input_gradient = self.gate.input_gradient(&gate_gradient, runtime, None);
         let up_input_gradient = self.up.input_gradient(&up_gradient, runtime, None);
-        self.gate_training
-            .accumulate(&cache.input, &gate_gradient, None, runtime);
-        self.up_training
-            .accumulate(&cache.input, &up_gradient, None, runtime);
+        self.gate.accumulate_training(
+            &mut self.gate_training,
+            &cache.input,
+            &gate_gradient,
+            None,
+            runtime,
+        );
+        self.up.accumulate_training(
+            &mut self.up_training,
+            &cache.input,
+            &up_gradient,
+            None,
+            runtime,
+        );
 
         runtime.recycle_matrix(gate_gradient);
         runtime.recycle_matrix(up_gradient);
@@ -143,12 +158,27 @@ impl TrainingSwiglu {
         batch_len: usize,
         runtime: &mut CudaRuntime,
     ) {
-        self.gate_training
-            .learn(&mut self.gate, learning_rate, momentum, batch_len, runtime);
-        self.up_training
-            .learn(&mut self.up, learning_rate, momentum, batch_len, runtime);
-        self.down_training
-            .learn(&mut self.down, learning_rate, momentum, batch_len, runtime);
+        self.gate.learn_from_state(
+            &mut self.gate_training,
+            learning_rate,
+            momentum,
+            batch_len,
+            runtime,
+        );
+        self.up.learn_from_state(
+            &mut self.up_training,
+            learning_rate,
+            momentum,
+            batch_len,
+            runtime,
+        );
+        self.down.learn_from_state(
+            &mut self.down_training,
+            learning_rate,
+            momentum,
+            batch_len,
+            runtime,
+        );
     }
 
     pub fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
@@ -179,6 +209,14 @@ fn identity_linear(weights: Matrix) -> Linear {
 }
 
 impl GraphNode for InferenceSwiglu {
+    fn create_train_state(&self) -> NodeTrainState {
+        NodeTrainState::with_children(vec![
+            self.gate.create_train_state(),
+            self.up.create_train_state(),
+            self.down.create_train_state(),
+        ])
+    }
+
     fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
         assert_eq!(inputs.len(), 1, "SwiGLU forward expects one matrix");
         let input = inputs.pop().unwrap();

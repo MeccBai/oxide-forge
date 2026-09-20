@@ -1,24 +1,43 @@
-use crate::graph::draft::BranchDraft;
+use crate::graph::GraphNode;
+use crate::graph::draft::{BranchDraft, DraftStep};
+use crate::net::linear::LinearConfig;
 
-/// Consuming builder for a reusable single-input branch draft.
 pub struct BranchBuilder {
-    _private: (),
+    draft: BranchDraft,
 }
 
 impl BranchBuilder {
     pub fn start() -> Self {
-        todo!("BranchBuilder topology recording")
+        Self {
+            draft: BranchDraft {
+                input_config: None,
+                output_config: None,
+                steps: Vec::new(),
+            },
+        }
     }
 
-    pub fn continue_from(_draft: BranchDraft) -> Self {
-        todo!("continuing a BranchDraft")
+    pub fn continue_from(draft: BranchDraft) -> Self {
+        Self { draft }
     }
 
-    pub fn then<N>(self, _node: N) -> Self {
-        todo!("appending a node to BranchBuilder")
+    pub fn then(mut self, config: LinearConfig) -> Self {
+        self.draft.steps.push(DraftStep::Linear(config));
+        if let Some(input) = self.draft.input_config {
+            self.draft.attach(input);
+        }
+        self
+    }
+
+    pub fn then_node<N: GraphNode + 'static>(mut self, node: N) -> Self {
+        self.draft.steps.push(DraftStep::Node(Box::new(node)));
+        if let Some(input) = self.draft.input_config {
+            self.draft.attach(input);
+        }
+        self
     }
 
     pub fn end(self) -> BranchDraft {
-        todo!("finalizing BranchBuilder")
+        self.draft
     }
 }

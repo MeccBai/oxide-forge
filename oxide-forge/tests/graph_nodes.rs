@@ -1,11 +1,14 @@
 use oxide_forge::cuda::{CudaRuntime, InitType};
-use oxide_forge::graph::{Branch, Graph, GraphNode, LearnConfig};
-use oxide_forge::net::linear::{Activation, Linear, TrainingLinear};
+use oxide_forge::graph::{
+    Branch, Graph, GraphBuilder, GraphNode, InitConfig, LearningRateScheduler, MatrixConfig,
+};
+use oxide_forge::net::linear::{Activation, Linear, LinearConfig};
+use oxide_forge::net::mlp::Loss;
 use oxide_forge::net::mlp::{InferenceMLP, TrainingMlp};
 use oxide_forge::net::node::{
-    BinaryNode, ConcatNode, FanOutNode, RowReduceNode, SingleNode, SplitNode, TrainingBinaryNode,
-    TrainingConcatNode, TrainingFanOutNode, TrainingRowReduceNode, TrainingSingleNode,
-    TrainingSplitNode,
+    BinaryNode, ConcatNode, CopyNode, ReduceNode, ReduceOp, RowReduceNode, SingleNode, SplitNode,
+    TrainingBinaryNode, TrainingConcatNode, TrainingCopyNode, TrainingReduceNode,
+    TrainingRowReduceNode, TrainingSingleNode, TrainingSplitNode,
 };
 use oxide_forge::net::swiglu::{InferenceSwiglu, TrainingSwiglu};
 use oxide_forge::net::transformer::{
@@ -21,7 +24,6 @@ fn linear_and_transformers_are_graph_nodes() {
     assert_graph_node::<Branch<false>>();
     assert_graph_node::<Branch<true>>();
     assert_graph_node::<Linear>();
-    assert_graph_node::<TrainingLinear>();
     assert_graph_node::<InferenceEncoder<1>>();
     assert_graph_node::<TrainingEncoder<1>>();
     assert_graph_node::<InferenceDecoder<1>>();
@@ -38,44 +40,49 @@ fn linear_and_transformers_are_graph_nodes() {
     assert_graph_node::<TrainingConcatNode>();
     assert_graph_node::<SplitNode>();
     assert_graph_node::<TrainingSplitNode>();
-    assert_graph_node::<FanOutNode>();
-    assert_graph_node::<TrainingFanOutNode>();
+    assert_graph_node::<CopyNode>();
+    assert_graph_node::<TrainingCopyNode>();
+    assert_graph_node::<ReduceNode>();
+    assert_graph_node::<TrainingReduceNode>();
     assert_graph_node::<RowReduceNode>();
     assert_graph_node::<TrainingRowReduceNode>();
 }
 
-/// Persistent device smoke test. Run it through the CUDA-Oxide test workflow
-/// on a CUDA-capable machine.
 #[test]
 #[ignore = "requires a CUDA device and a CUDA-Oxide device artifact"]
-fn training_linear_graph_node_forward_backward_and_learn() {
+fn graph_runs_two_complete_training_steps() {
     let mut runtime = CudaRuntime::new().unwrap();
-    let weights = runtime
-        .matrix_from_host(&[1.0, 0.0, 0.0, 1.0], 2, 2, None)
+    let draft = GraphBuilder::start(MatrixConfig::new(16, 16))
+        .then(LinearConfig::new(
+            MatrixConfig::new(16, 16),
+            true,
+            Activation::Identity,
+        ))
+        .then(LinearConfig::new(
+            MatrixConfig::new(16, 16),
+            true,
+            Activation::Identity,
+        ))
+        .end();
+    let mut graph: Graph<true> = draft
+        .init(
+            &mut runtime,
+            InitConfig::Random {
+                loss: Loss::MeanSquaredError,
+                learning_rate: LearningRateScheduler::new(0.01),
+            },
+        )
         .unwrap();
-    let bias = runtime.vector_from_host(&[0.0, 0.0], None).unwrap();
-    let mut linear = TrainingLinear::new(Linear::new(weights, Some(bias), Activation::Identity));
+    let target = runtime.new_matrix(InitType::Zero, 16, 16, None);
 
-    let input = runtime
-        .matrix_from_host(&[1.0, 2.0, 3.0, 4.0], 2, 2, None)
-        .unwrap();
-    let output = GraphNode::forward(&mut linear, vec![input], &mut runtime)
-        .pop()
-        .unwrap();
-    assert_eq!(output.to_host(&runtime, None), vec![1.0, 2.0, 3.0, 4.0]);
+    for _ in 0..2 {
+        let input = runtime.new_matrix(InitType::Random, 16, 16, None);
+        let loss = graph.train_step(input, &target, 1.0, 0.0, 0.0, &mut runtime);
+        runtime.recycle_vector(loss);
+    }
 
-    let gradient = runtime
-        .matrix_from_host(&[1.0, 1.0, 1.0, 1.0], 2, 2, None)
-        .unwrap();
-    let input_gradient = GraphNode::backward(&mut linear, vec![gradient], &mut runtime)
-        .pop()
-        .unwrap();
-    assert_eq!(input_gradient.to_host(&runtime, None), vec![1.0; 4]);
-
-    GraphNode::learn(&mut linear, LearnConfig::single(0.01), &mut runtime);
-    GraphNode::clear_cache(&mut linear, &mut runtime);
-    runtime.recycle_matrix(output);
-    runtime.recycle_matrix(input_gradient);
+    assert_eq!(graph.learning_rate().current_step(), 2);
+    runtime.recycle_matrix(target);
     runtime.sync();
 }
 
@@ -106,4 +113,32 @@ fn span_set_initializers_preserve_values() {
             .into_iter()
             .all(|value| (0.0..=1.0).contains(&value))
     );
+}
+
+#[test]
+#[ignore = "requires a CUDA device and a CUDA-Oxide device artifact"]
+fn copy_and_reduce_are_backward_pairs() {
+    let mut runtime = CudaRuntime::new().unwrap();
+
+    let input = runtime.matrix_from_host(&[1.0, 2.0], 1, 2, None).unwrap();
+    let mut copy = TrainingCopyNode::new(2);
+    let outputs = copy.forward(input, &mut runtime);
+    assert_eq!(outputs[0].to_host(&runtime, None), vec![1.0, 2.0]);
+    assert_eq!(outputs[1].to_host(&runtime, None), vec![1.0, 2.0]);
+
+    let lhs = runtime.matrix_from_host(&[1.0, 1.0], 1, 2, None).unwrap();
+    let rhs = runtime.matrix_from_host(&[2.0, 2.0], 1, 2, None).unwrap();
+    let gradient = copy.backward(vec![lhs, rhs], &mut runtime);
+    assert_eq!(gradient.to_host(&runtime, None), vec![3.0, 3.0]);
+
+    let lhs = runtime.matrix_from_host(&[2.0, 4.0], 1, 2, None).unwrap();
+    let rhs = runtime.matrix_from_host(&[4.0, 8.0], 1, 2, None).unwrap();
+    let mut mean = TrainingReduceNode::new(ReduceOp::Mean, 2);
+    let output = mean.forward(vec![lhs, rhs], &mut runtime);
+    assert_eq!(output.to_host(&runtime, None), vec![3.0, 6.0]);
+
+    let upstream = runtime.matrix_from_host(&[2.0, 4.0], 1, 2, None).unwrap();
+    let gradients = mean.backward(upstream, &mut runtime);
+    assert_eq!(gradients[0].to_host(&runtime, None), vec![1.0, 2.0]);
+    assert_eq!(gradients[1].to_host(&runtime, None), vec![1.0, 2.0]);
 }

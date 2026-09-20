@@ -1,5 +1,5 @@
 use crate::cuda::{CudaRuntime, container::Matrix};
-use crate::graph::{GraphNode, LearnConfig};
+use crate::graph::{GraphNode, LearnConfig, MatrixConfig};
 
 use super::{SingleCache, SingleNode, SingleType, TrainingSingleNode};
 
@@ -163,6 +163,9 @@ fn apply_in_place(op: SingleType, matrix: &mut Matrix, runtime: &CudaRuntime) {
 }
 
 impl GraphNode for SingleNode {
+    fn output_configs(&self, inputs: &[MatrixConfig]) -> Vec<MatrixConfig> {
+        single_output_config(self.op(), inputs)
+    }
     fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
         assert_eq!(inputs.len(), 1, "SingleNode forward expects one matrix");
         vec![SingleNode::forward(self, inputs.pop().unwrap(), runtime)]
@@ -178,6 +181,9 @@ impl GraphNode for SingleNode {
 }
 
 impl GraphNode for TrainingSingleNode {
+    fn output_configs(&self, inputs: &[MatrixConfig]) -> Vec<MatrixConfig> {
+        single_output_config(self.op(), inputs)
+    }
     fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
         assert_eq!(inputs.len(), 1, "SingleNode forward expects one matrix");
         vec![TrainingSingleNode::forward(
@@ -204,5 +210,14 @@ impl GraphNode for TrainingSingleNode {
 
     fn clear_cache(&mut self, runtime: &mut CudaRuntime) {
         TrainingSingleNode::clear_cache(self, runtime);
+    }
+}
+
+fn single_output_config(op: SingleType, inputs: &[MatrixConfig]) -> Vec<MatrixConfig> {
+    assert_eq!(inputs.len(), 1, "single node expects one input");
+    if matches!(op, SingleType::Transpose) {
+        vec![MatrixConfig::new(inputs[0].cols, inputs[0].rows)]
+    } else {
+        vec![inputs[0]]
     }
 }

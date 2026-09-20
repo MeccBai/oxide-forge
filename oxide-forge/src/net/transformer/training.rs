@@ -48,7 +48,7 @@ impl<const HEADS: usize, const MASKED: bool> TrainingTransformer<HEADS, MASKED> 
             position_encoding,
             fcs,
             output_matrix,
-            output_training: LinearTrainingState::default(),
+            output_training: LinearTrainingState::with_parameter_count(2),
             feed_forward_residual: TrainingBinaryNode::new(BinaryOp::Add),
             feed_forward_normalization: TrainingSingleNode::new(match norm_type {
                 NormType::Layer => SingleType::LayerNorm,
@@ -152,7 +152,8 @@ impl<const HEADS: usize, const MASKED: bool> TrainingTransformer<HEADS, MASKED> 
         let encoded_gradient = self
             .output_matrix
             .input_gradient(&output_gradient, runtime, None);
-        self.output_training.accumulate(
+        self.output_matrix.accumulate_training(
+            &mut self.output_training,
             &cache.encoded,
             &output_gradient,
             output_bias_gradient.as_ref(),
@@ -194,8 +195,8 @@ impl<const HEADS: usize, const MASKED: bool> TrainingTransformer<HEADS, MASKED> 
         batch_len: usize,
         runtime: &mut CudaRuntime,
     ) {
-        self.output_training.learn(
-            &mut self.output_matrix,
+        self.output_matrix.learn_from_state(
+            &mut self.output_training,
             learning_rate,
             momentum,
             batch_len,

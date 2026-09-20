@@ -1,6 +1,6 @@
 [workspace]
-members = ["oxide-forge", "bench"]
-default-members = ["bench"]
+members = ["oxide-forge", "example"]
+default-members = ["example"]
 resolver = "3"
 
 [workspace.package]

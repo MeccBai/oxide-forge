@@ -2,18 +2,18 @@
 
 English | [简体中文](README.cn.md)
 
-This workspace contains the reusable runtime and its focused benchmark:
+This workspace contains the reusable runtime and its executable examples:
 
 - [`oxide-forge`](oxide-forge/README.md): the reusable Rust/CUDA runtime,
   containers, kernels, and neural-network execution layers;
-- `bench`: the fixed-shape GPU benchmark executable.
+- `example`: runnable Graph and CUDA API examples.
 
 ```text
 oxide-forge/       base runtime library
-bench/             runtime benchmark
+example/           executable examples
 ```
 
-The benchmark is the default workspace member and can be launched through the
+The example package is the default workspace member and can be launched through the
 CUDA-Oxide workflow:
 
 ```bash

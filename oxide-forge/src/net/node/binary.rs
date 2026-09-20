@@ -1,5 +1,5 @@
 use crate::cuda::{CudaRuntime, container::Matrix};
-use crate::graph::{GraphNode, LearnConfig};
+use crate::graph::{GraphNode, LearnConfig, MatrixConfig};
 
 use super::{BinaryCache, BinaryNode, BinaryOp, TrainingBinaryNode};
 
@@ -242,6 +242,9 @@ fn validate_owned_inputs(op: BinaryOp, inputs: &[Matrix]) {
 }
 
 impl GraphNode for BinaryNode {
+    fn output_configs(&self, inputs: &[MatrixConfig]) -> Vec<MatrixConfig> {
+        binary_output_config(self.op(), inputs)
+    }
     fn forward(&mut self, inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
         vec![self.forward_owned(inputs, runtime)]
     }
@@ -256,6 +259,9 @@ impl GraphNode for BinaryNode {
 }
 
 impl GraphNode for TrainingBinaryNode {
+    fn output_configs(&self, inputs: &[MatrixConfig]) -> Vec<MatrixConfig> {
+        binary_output_config(self.op(), inputs)
+    }
     fn forward(&mut self, inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
         vec![TrainingBinaryNode::forward(self, inputs, runtime)]
     }
@@ -273,6 +279,35 @@ impl GraphNode for TrainingBinaryNode {
 
     fn clear_cache(&mut self, runtime: &mut CudaRuntime) {
         TrainingBinaryNode::clear_cache(self, runtime);
+    }
+}
+
+fn binary_output_config(op: BinaryOp, inputs: &[MatrixConfig]) -> Vec<MatrixConfig> {
+    assert!(
+        inputs.len() >= 2,
+        "binary node requires at least two inputs"
+    );
+    match op {
+        BinaryOp::MatMul => {
+            assert_eq!(inputs.len(), 2, "MatMul requires two inputs");
+            assert_eq!(
+                inputs[0].cols, inputs[1].rows,
+                "MatMul inner dimension mismatch"
+            );
+            vec![MatrixConfig::new(inputs[0].rows, inputs[1].cols)]
+        }
+        BinaryOp::Add => {
+            assert!(
+                inputs.iter().all(|config| *config == inputs[0]),
+                "element-wise shapes must match"
+            );
+            vec![inputs[0]]
+        }
+        BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+            assert_eq!(inputs.len(), 2, "binary operation requires two inputs");
+            assert_eq!(inputs[0], inputs[1], "element-wise shapes must match");
+            vec![inputs[0]]
+        }
     }
 }
 

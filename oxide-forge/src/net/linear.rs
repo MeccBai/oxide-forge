@@ -3,7 +3,8 @@ use cuda::container::{Matrix, Vector};
 use cuda_core::CudaStream;
 use serde::{Deserialize, Serialize};
 
-use crate::graph::{GraphNode, LearnConfig};
+use crate::graph::state::ParameterBuffer;
+use crate::graph::{GraphNode, LearnConfig, MatrixConfig, NodeTrainState};
 use crate::net::metadata::{
     HostData, HostDataCursor, MatrixMetadata, MetadataCursor, VectorMetadata,
 };
@@ -16,6 +17,25 @@ pub enum Activation {
     Relu,
     Silu,
     Sigmoid,
+}
+
+/// Device-independent description of a Linear block. Parameter storage is
+/// created only when its containing graph is initialized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinearConfig {
+    pub weights: MatrixConfig,
+    pub bias: bool,
+    pub activation: Activation,
+}
+
+impl LinearConfig {
+    pub const fn new(weights: MatrixConfig, bias: bool, activation: Activation) -> Self {
+        Self {
+            weights,
+            bias,
+            activation,
+        }
+    }
 }
 
 impl Activation {
@@ -85,38 +105,20 @@ pub struct Linear {
 /// The owned input is retained without a device copy until backward. For
 /// non-identity activations the pre-activation is recomputed during backward,
 /// avoiding a second output-sized persistent cache.
-pub struct TrainingLinear {
+pub(crate) struct LinearTrainingNode {
     linear: Linear,
     input_cache: Option<Matrix>,
-    training: LinearTrainingState,
+    training: NodeTrainState,
 }
 
-/// Gradients produced by backward. They remain node-owned until Graph invokes
-/// `learn` after the complete backward traversal.
-#[derive(Default)]
-struct LinearGradients {
-    weight_gradient: Option<Matrix>,
-    bias_gradient: Option<Vector>,
-}
+/// Transitional name used by compound blocks while their state ownership is
+/// moved to `Graph<true>`. The storage itself is already graph-generic.
+pub(crate) type LinearTrainingState = NodeTrainState;
 
-/// Optimizer-only state. It never computes or owns raw parameter gradients.
-#[derive(Default)]
-struct MomentumOptimizer {
-    weight_velocity: Option<Matrix>,
-    bias_velocity: Option<Vector>,
-}
-
-/// Per-node training state used by compound trainable modules as well as
-/// `TrainingLinear`.
-#[derive(Default)]
-pub(crate) struct LinearTrainingState {
-    gradients: LinearGradients,
-    optimizer: MomentumOptimizer,
-}
-
-impl LinearGradients {
-    fn accumulate(
-        &mut self,
+impl Linear {
+    pub(crate) fn accumulate_training(
+        &self,
+        state: &mut NodeTrainState,
         input: &Matrix,
         gradient: &Matrix,
         bias_gradient: Option<&Vector>,
@@ -126,34 +128,39 @@ impl LinearGradients {
         let weight_gradient = runtime.matrix_multiply(&input_transpose, gradient, None);
         runtime.recycle_matrix(input_transpose);
 
-        if let Some(total) = &mut self.weight_gradient {
-            total.binary_assign(&weight_gradient, move |lhs, rhs| lhs + rhs, runtime, None);
-            runtime.recycle_matrix(weight_gradient);
-        } else {
-            self.weight_gradient = Some(weight_gradient);
+        match &mut state.parameters[0].gradient {
+            Some(ParameterBuffer::Matrix(total)) => {
+                total.binary_assign(&weight_gradient, move |lhs, rhs| lhs + rhs, runtime, None);
+                runtime.recycle_matrix(weight_gradient);
+            }
+            None => state.parameters[0].gradient = Some(ParameterBuffer::Matrix(weight_gradient)),
+            Some(ParameterBuffer::Vector(_)) => panic!("Linear weight gradient type mismatch"),
         }
 
         match bias_gradient {
-            Some(bias_gradient) => {
-                if let Some(total) = &mut self.bias_gradient {
-                    total.binary_assign(bias_gradient, runtime, move |lhs, rhs| lhs + rhs, None);
-                } else {
-                    self.bias_gradient = Some(runtime.clone_vector(bias_gradient, None));
+            Some(bias_gradient) => match &mut state.parameters[1].gradient {
+                Some(ParameterBuffer::Vector(total)) => {
+                    total.binary_assign(bias_gradient, runtime, move |lhs, rhs| lhs + rhs, None)
                 }
-            }
+                None => {
+                    state.parameters[1].gradient = Some(ParameterBuffer::Vector(
+                        runtime.clone_vector(bias_gradient, None),
+                    ));
+                }
+                Some(ParameterBuffer::Matrix(_)) => {
+                    panic!("Linear bias gradient type mismatch")
+                }
+            },
             None => assert!(
-                self.bias_gradient.is_none(),
+                state.parameters[1].gradient.is_none(),
                 "missing bias gradient while a batch is being accumulated"
             ),
         }
     }
-}
 
-impl MomentumOptimizer {
-    fn learn(
+    pub(crate) fn learn_from_state(
         &mut self,
-        linear: &mut Linear,
-        gradients: &mut LinearGradients,
+        state: &mut NodeTrainState,
         learning_rate: f32,
         momentum: f32,
         batch_len: usize,
@@ -170,82 +177,72 @@ impl MomentumOptimizer {
         );
 
         let inverse_batch = 1.0 / batch_len as f32;
-        let mut weight_gradient = gradients
-            .weight_gradient
+        let mut weight_gradient = state.parameters[0]
+            .gradient
             .take()
-            .expect("optimizer step requires accumulated gradients");
+            .and_then(|buffer| match buffer {
+                ParameterBuffer::Matrix(matrix) => Some(matrix),
+                ParameterBuffer::Vector(_) => None,
+            })
+            .expect("optimizer step requires an accumulated weight gradient");
         weight_gradient.scale(inverse_batch, runtime, None);
-        if let Some(velocity) = &mut self.weight_velocity {
-            velocity.scale(momentum, runtime, None);
-            velocity.binary_assign(&weight_gradient, move |lhs, rhs| lhs + rhs, runtime, None);
-            runtime.recycle_matrix(weight_gradient);
-        } else {
-            self.weight_velocity = Some(weight_gradient);
+        match &mut state.parameters[0].velocity {
+            Some(ParameterBuffer::Matrix(velocity)) => {
+                velocity.scale(momentum, runtime, None);
+                velocity.binary_assign(&weight_gradient, move |lhs, rhs| lhs + rhs, runtime, None);
+                runtime.recycle_matrix(weight_gradient);
+            }
+            None => state.parameters[0].velocity = Some(ParameterBuffer::Matrix(weight_gradient)),
+            Some(ParameterBuffer::Vector(_)) => panic!("Linear weight velocity type mismatch"),
         }
 
-        let mut weight_update = runtime.clone_matrix(self.weight_velocity.as_ref().unwrap(), None);
+        let ParameterBuffer::Matrix(weight_velocity) =
+            state.parameters[0].velocity.as_ref().unwrap()
+        else {
+            unreachable!()
+        };
+        let mut weight_update = runtime.clone_matrix(weight_velocity, None);
         weight_update.scale(learning_rate, runtime, None);
-        linear
-            .weights
+        self.weights
             .binary_assign(&weight_update, move |lhs, rhs| lhs - rhs, runtime, None);
         runtime.recycle_matrix(weight_update);
 
-        match (&mut linear.bias, gradients.bias_gradient.take()) {
-            (Some(bias), Some(mut bias_gradient)) => {
+        match (&mut self.bias, state.parameters[1].gradient.take()) {
+            (Some(bias), Some(ParameterBuffer::Vector(mut bias_gradient))) => {
                 bias_gradient.scale(inverse_batch, runtime, None);
-                if let Some(velocity) = &mut self.bias_velocity {
-                    velocity.scale(momentum, runtime, None);
-                    velocity.binary_assign(
-                        &bias_gradient,
-                        runtime,
-                        move |lhs, rhs| lhs + rhs,
-                        None,
-                    );
-                    runtime.recycle_vector(bias_gradient);
-                } else {
-                    self.bias_velocity = Some(bias_gradient);
+                match &mut state.parameters[1].velocity {
+                    Some(ParameterBuffer::Vector(velocity)) => {
+                        velocity.scale(momentum, runtime, None);
+                        velocity.binary_assign(
+                            &bias_gradient,
+                            runtime,
+                            move |lhs, rhs| lhs + rhs,
+                            None,
+                        );
+                        runtime.recycle_vector(bias_gradient);
+                    }
+                    None => {
+                        state.parameters[1].velocity = Some(ParameterBuffer::Vector(bias_gradient));
+                    }
+                    Some(ParameterBuffer::Matrix(_)) => {
+                        panic!("Linear bias velocity type mismatch")
+                    }
                 }
 
-                let mut bias_update =
-                    runtime.clone_vector(self.bias_velocity.as_ref().unwrap(), None);
+                let ParameterBuffer::Vector(bias_velocity) =
+                    state.parameters[1].velocity.as_ref().unwrap()
+                else {
+                    unreachable!()
+                };
+                let mut bias_update = runtime.clone_vector(bias_velocity, None);
                 bias_update.scale(learning_rate, runtime, None);
                 bias.binary_assign(&bias_update, runtime, move |lhs, rhs| lhs - rhs, None);
                 runtime.recycle_vector(bias_update);
             }
             (None, None) => {}
+            (_, Some(ParameterBuffer::Matrix(_))) => panic!("Linear bias gradient type mismatch"),
             _ => panic!("bias and accumulated bias gradient do not match"),
         }
-    }
-}
-
-impl LinearTrainingState {
-    pub(crate) fn accumulate(
-        &mut self,
-        input: &Matrix,
-        gradient: &Matrix,
-        bias_gradient: Option<&Vector>,
-        runtime: &mut CudaRuntime,
-    ) {
-        self.gradients
-            .accumulate(input, gradient, bias_gradient, runtime);
-    }
-
-    pub(crate) fn learn(
-        &mut self,
-        linear: &mut Linear,
-        learning_rate: f32,
-        momentum: f32,
-        batch_len: usize,
-        runtime: &mut CudaRuntime,
-    ) {
-        self.optimizer.learn(
-            linear,
-            &mut self.gradients,
-            learning_rate,
-            momentum,
-            batch_len,
-            runtime,
-        );
     }
 }
 
@@ -507,25 +504,13 @@ impl Linear {
     }
 }
 
-impl TrainingLinear {
+impl LinearTrainingNode {
     pub fn new(linear: Linear) -> Self {
         Self {
             linear,
             input_cache: None,
-            training: LinearTrainingState::default(),
+            training: LinearTrainingState::with_parameter_count(2),
         }
-    }
-
-    pub fn linear(&self) -> &Linear {
-        &self.linear
-    }
-
-    pub fn linear_mut(&mut self) -> &mut Linear {
-        &mut self.linear
-    }
-
-    pub fn into_linear(self) -> Linear {
-        self.linear
     }
 
     pub fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
@@ -537,7 +522,7 @@ impl TrainingLinear {
     }
 }
 
-impl From<Linear> for TrainingLinear {
+impl From<Linear> for LinearTrainingNode {
     fn from(linear: Linear) -> Self {
         Self::new(linear)
     }
@@ -549,6 +534,20 @@ fn take_single(mut matrices: Vec<Matrix>, operation: &str) -> Matrix {
 }
 
 impl GraphNode for Linear {
+    fn create_train_state(&self) -> NodeTrainState {
+        NodeTrainState::with_parameter_count(2)
+    }
+
+    fn output_configs(&self, inputs: &[MatrixConfig]) -> Vec<MatrixConfig> {
+        assert_eq!(inputs.len(), 1, "Linear expects one input");
+        assert_eq!(
+            inputs[0].cols,
+            self.input_neurons(),
+            "Linear input width mismatch"
+        );
+        vec![MatrixConfig::new(inputs[0].rows, self.output_neurons())]
+    }
+
     fn forward(&mut self, inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
         let input = take_single(inputs, "Linear forward");
         let output = Linear::forward(self, &input, None, runtime, None);
@@ -557,11 +556,11 @@ impl GraphNode for Linear {
     }
 
     fn backward(&mut self, _gradients: Vec<Matrix>, _runtime: &mut CudaRuntime) -> Vec<Matrix> {
-        panic!("inference Linear does not support backward; use TrainingLinear")
+        panic!("inference Linear does not support backward; initialize Graph<true>")
     }
 
     fn learn(&mut self, _config: LearnConfig, _runtime: &mut CudaRuntime) {
-        panic!("inference Linear does not support optimizer steps; use TrainingLinear")
+        panic!("inference Linear does not support optimizer steps; initialize Graph<true>")
     }
 
     fn clear_cache(&mut self, _runtime: &mut CudaRuntime) {}
@@ -575,10 +574,14 @@ impl GraphNode for Linear {
     }
 }
 
-impl GraphNode for TrainingLinear {
+impl GraphNode for LinearTrainingNode {
+    fn output_configs(&self, inputs: &[MatrixConfig]) -> Vec<MatrixConfig> {
+        self.linear.output_configs(inputs)
+    }
+
     fn forward(&mut self, inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
         self.clear_cache(runtime);
-        let input = take_single(inputs, "TrainingLinear forward");
+        let input = take_single(inputs, "Linear training forward");
         let mut output = self.linear.affine(&input, None, runtime, None);
         self.linear.activate(&mut output, runtime, None);
         self.input_cache = Some(input);
@@ -586,11 +589,11 @@ impl GraphNode for TrainingLinear {
     }
 
     fn backward(&mut self, gradients: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
-        let output_gradient = take_single(gradients, "TrainingLinear backward");
+        let output_gradient = take_single(gradients, "Linear training backward");
         let input = self
             .input_cache
             .take()
-            .expect("TrainingLinear forward must run before backward");
+            .expect("Linear training forward must run before backward");
         let pre_activation = self
             .linear
             .needs_pre_activation()
@@ -599,8 +602,13 @@ impl GraphNode for TrainingLinear {
             self.linear
                 .backward(pre_activation.as_ref(), &output_gradient, runtime, None);
         let input_gradient = self.linear.input_gradient(&gradient, runtime, None);
-        self.training
-            .accumulate(&input, &gradient, bias_gradient.as_ref(), runtime);
+        self.linear.accumulate_training(
+            &mut self.training,
+            &input,
+            &gradient,
+            bias_gradient.as_ref(),
+            runtime,
+        );
 
         if let Some(pre_activation) = pre_activation {
             runtime.recycle_matrix(pre_activation);
@@ -615,8 +623,8 @@ impl GraphNode for TrainingLinear {
     }
 
     fn learn(&mut self, config: LearnConfig, runtime: &mut CudaRuntime) {
-        self.training.learn(
-            &mut self.linear,
+        self.linear.learn_from_state(
+            &mut self.training,
             config.learning_rate,
             config.momentum,
             config.batch_len,
@@ -631,11 +639,11 @@ impl GraphNode for TrainingLinear {
     }
 
     fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
-        TrainingLinear::get_data(self, runtime)
+        LinearTrainingNode::get_data(self, runtime)
     }
 
     fn set_data(&mut self, data: &mut HostDataCursor, runtime: &CudaRuntime) {
-        TrainingLinear::set_data(self, data, runtime);
+        LinearTrainingNode::set_data(self, data, runtime);
     }
 }
 

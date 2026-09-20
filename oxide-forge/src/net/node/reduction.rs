@@ -1,5 +1,5 @@
 use crate::cuda::{CudaRuntime, container::Matrix};
-use crate::graph::{GraphNode, LearnConfig};
+use crate::graph::{GraphNode, LearnConfig, MatrixConfig};
 
 use super::{RowReduceNode, RowReduction, TrainingRowReduceNode};
 
@@ -68,6 +68,9 @@ impl TrainingRowReduceNode {
 }
 
 impl GraphNode for RowReduceNode {
+    fn output_configs(&self, inputs: &[MatrixConfig]) -> Vec<MatrixConfig> {
+        row_reduce_config(inputs)
+    }
     fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
         assert_eq!(inputs.len(), 1, "RowReduce forward expects one matrix");
         vec![RowReduceNode::forward(self, inputs.pop().unwrap(), runtime)]
@@ -83,6 +86,9 @@ impl GraphNode for RowReduceNode {
 }
 
 impl GraphNode for TrainingRowReduceNode {
+    fn output_configs(&self, inputs: &[MatrixConfig]) -> Vec<MatrixConfig> {
+        row_reduce_config(inputs)
+    }
     fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
         assert_eq!(inputs.len(), 1, "RowReduce forward expects one matrix");
         vec![TrainingRowReduceNode::forward(
@@ -110,4 +116,9 @@ impl GraphNode for TrainingRowReduceNode {
     fn clear_cache(&mut self, _runtime: &mut CudaRuntime) {
         TrainingRowReduceNode::clear_cache(self);
     }
+}
+
+fn row_reduce_config(inputs: &[MatrixConfig]) -> Vec<MatrixConfig> {
+    assert_eq!(inputs.len(), 1, "row reduction expects one input");
+    vec![MatrixConfig::new(inputs[0].rows, 1)]
 }

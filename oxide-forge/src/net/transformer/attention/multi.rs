@@ -22,9 +22,9 @@ impl QkvProjector {
         Self {
             layers: Qkv { query, key, value },
             training: Qkv {
-                query: LinearTrainingState::default(),
-                key: LinearTrainingState::default(),
-                value: LinearTrainingState::default(),
+                query: LinearTrainingState::with_parameter_count(2),
+                key: LinearTrainingState::with_parameter_count(2),
+                value: LinearTrainingState::with_parameter_count(2),
             },
             streams,
         }
@@ -127,7 +127,13 @@ impl QkvProjector {
 
             input_gradients.push(current_input_gradient);
 
-            optimizer.accumulate(input, &gradient, bias_gradient.as_ref(), runtime);
+            linear.accumulate_training(
+                optimizer,
+                input,
+                &gradient,
+                bias_gradient.as_ref(),
+                runtime,
+            );
         }
 
         BinaryNode::new(BinaryOp::Add).forward_owned(input_gradients, runtime)
@@ -151,7 +157,7 @@ impl QkvProjector {
             (key, key_training),
             (value, value_training),
         ] {
-            training.learn(linear, learning_rate, momentum, batch_len, runtime);
+            linear.learn_from_state(training, learning_rate, momentum, batch_len, runtime);
         }
     }
 }

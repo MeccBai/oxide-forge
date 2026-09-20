@@ -1,8 +1,8 @@
 [package]
-name = "bench"
+name = "example"
 version.workspace = true
 edition.workspace = true
-description = "A benchmark suite for Oxide-Forge, a Rust/CUDA neural network runtime powered by CUDA-Oxide"
+description = "Executable examples for the OxideForge Rust/CUDA neural network runtime"
 
 [dependencies]
 cuda-device.workspace = true

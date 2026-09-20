@@ -33,7 +33,10 @@ Implemented capabilities include:
   residual connections, and their backward paths;
 - explicit differentiable compute nodes for element-wise arithmetic, MatMul,
   activations, normalization, transpose, row reduction, and contiguous
-  concat/split/fan-out;
+  concat/split/copy/reduce;
+- an explicit `GraphBuilder`/`BranchBuilder` DSL with static shape validation,
+  forward scheduling, reverse-order backward scheduling, graph-level loss,
+  optimizer steps, and learning-rate schedules;
 - inference and training SwiGLU blocks assembled from reusable Linear,
   activation, product, and optimizer components;
 - const-generic multi-head Post-Norm Transformer executors with selectable
@@ -79,14 +82,17 @@ The runtime currently uses `f32` and targets known model shapes. Generality is
 added only when it does not impose significant complexity or performance cost.
 Optimization follows profiler evidence instead of speculative abstraction.
 
-### Explicit networks instead of autograd
+### Explicit static graphs instead of tracing
 
-OxideForge does not record a dynamic computation graph. Networks are ordinary
-Rust modules assembled from layers and nodes: forward calls them in execution
-order, and backward calls the corresponding training components in reverse
-order. Branching, residual addition, concatenation, and gradient routing are
-explicit. This keeps cache ownership and device allocation visible without
-duplicating the model as a runtime graph.
+OxideForge does not trace arbitrary Rust execution or construct a hidden dynamic
+autograd graph. `GraphBuilder` records the topology explicitly: forward follows
+the declared order and backward walks the same steps in reverse. Branching,
+copying, concatenation, gradient routing, loss, and optimizer scheduling remain
+visible in model code.
+
+Drafts contain only configuration. Device parameters are allocated when
+`GraphDraft::init` receives a `CudaRuntime`; `Graph<true>` enables training and
+`Graph<false>` builds the inference path from the same draft.
 
 ## Execution Model
 
@@ -132,28 +138,65 @@ cargo check -p oxide-forge
 ```
 
 Executable consumers must use the CUDA-Oxide build workflow so the device
-artifact is compiled and linked. The workspace `bench` package is the current
-executable consumer and performance harness.
+artifact is compiled and linked. The workspace `example` package contains the
+runnable consumers.
 
-## Minimal Example
+## Graph Example
 
-The following example maps a `[batch, input_features]` matrix through a Linear
-layer:
+This is the primary model API. The draft describes two Linear blocks without
+allocating device memory. Initialization creates random weights and zero biases;
+the graph owns forward, backward, optimizer, and learning-rate scheduling.
 
 ```rust
+use oxide_forge::cuda::{CudaRuntime, InitType};
+use oxide_forge::graph::{
+    Graph, GraphBuilder, InitConfig, LearningRateScheduler, MatrixConfig,
+};
+use oxide_forge::net::linear::{Activation, LinearConfig};
+use oxide_forge::net::mlp::Loss;
+
+const ROWS: usize = 16;
+const WIDTH: usize = 16;
+
 let mut runtime = CudaRuntime::new()?;
+let draft = GraphBuilder::start(MatrixConfig::new(ROWS, WIDTH))
+    .then(LinearConfig::new(
+        MatrixConfig::new(WIDTH, WIDTH),
+        true,
+        Activation::Gelu,
+    ))
+    .then(LinearConfig::new(
+        MatrixConfig::new(WIDTH, WIDTH),
+        true,
+        Activation::Identity,
+    ))
+    .end();
 
-let input = runtime.new_matrix(InitType::Random, 256, 128, None);
-let projection = Linear::new(
-    runtime.new_matrix(InitType::Random, 128, 64, None),
-    None,
-    Activation::Identity,
-);
+let mut graph: Graph<true> = draft.init(
+    &mut runtime,
+    InitConfig::Random {
+        loss: Loss::MeanSquaredError,
+        learning_rate: LearningRateScheduler::new(1.0e-3)
+            .linear(100, 1.0e-4),
+    },
+)?;
 
-let output = projection.forward(&input, None, &mut runtime, None);
+let target = runtime.new_matrix(InitType::Zero, ROWS, WIDTH, None);
+for _ in 0..2 {
+    let input = runtime.new_matrix(InitType::Random, ROWS, WIDTH, None);
+    let loss = graph.train_step(input, &target, 1.0, 0.0, 0.9, &mut runtime);
+    println!("loss = {}", loss.sum(&mut runtime, None) / ROWS as f32);
+    runtime.recycle_vector(loss);
+}
 runtime.sync();
+```
 
-assert_eq!((output.rows(), output.cols()), (256, 64));
+The same topology can be initialized for inference:
+
+```rust
+let inference_draft = build_model_draft();
+let mut graph: Graph<false> = inference_draft.init(&mut runtime, init_config)?;
+let output = graph.forward(input, &mut runtime);
 ```
 
 ## Repository Layout
@@ -161,6 +204,8 @@ assert_eq!((output.rows(), output.cols()), (256, 64));
 ```text
 src/
 ├── lib.rs                 base library entry point
+├── graph.rs               executable Graph, Branch, and node contract
+├── graph/                 builders, drafts, training state, LR schedules
 ├── cuda.rs                CUDA types and module routing entry point
 ├── cuda/
 │   ├── device.rs          device-side module routing
@@ -187,7 +232,7 @@ synchronization, and network-layer reference.
 
 - `f32` only;
 - contiguous row-major matrices only; no stride support;
-- explicit forward/backward composition only; no automatic computation graph;
+- explicit static graph construction only; no runtime tracing or dynamic autograd;
 - matrix multiplication uses Tensor Core TF32 products with `f32` accumulation
   and output, requires SM80+, and currently requires M/K/N dimensions to be
   multiples of 16;
