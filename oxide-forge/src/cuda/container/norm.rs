@@ -5,7 +5,7 @@ use crate::cuda::{DEFAULT_BLOCK_SIZE, DeviceSpan, DeviceSpanMut, runtime::CudaRu
 use super::Matrix;
 
 impl Matrix {
-    pub fn softmax_rows(&mut self, runtime: &CudaRuntime) {
+    pub fn softmax_rows(&mut self, runtime: &CudaRuntime, stream: Option<&CudaStream>) {
         if self.rows == 0 {
             return;
         }
@@ -17,13 +17,14 @@ impl Matrix {
             .unwrap();
         let len = self.buffer.len();
         let matrix = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
+        let stream = runtime.execution_stream(stream);
         runtime
             .module()
-            .matrix_softmax_rows(runtime.stream(), &prepared, matrix.descriptor(), self.cols)
+            .matrix_softmax_rows(stream, &prepared, matrix.descriptor(), self.cols)
             .unwrap();
     }
 
-    pub fn layer_norm(&mut self, runtime: &CudaRuntime) {
+    pub fn layer_norm(&mut self, runtime: &CudaRuntime, stream: Option<&CudaStream>) {
         if self.rows == 0 {
             return;
         }
@@ -35,19 +36,14 @@ impl Matrix {
             .unwrap();
         let len = self.buffer.len();
         let matrix = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
+        let stream = runtime.execution_stream(stream);
         runtime
             .module()
-            .matrix_layer_norm_rows(
-                runtime.stream(),
-                &prepared,
-                matrix.descriptor(),
-                self.cols,
-                1e-5,
-            )
+            .matrix_layer_norm_rows(stream, &prepared, matrix.descriptor(), self.cols, 1e-5)
             .unwrap();
     }
 
-    pub fn rms_norm(&mut self, runtime: &CudaRuntime) {
+    pub fn rms_norm(&mut self, runtime: &CudaRuntime, stream: Option<&CudaStream>) {
         if self.rows == 0 {
             return;
         }
@@ -56,15 +52,10 @@ impl Matrix {
         let prepared = runtime.module().prepare_rms_norm_assign(config).unwrap();
         let len = self.buffer.len();
         let matrix = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
+        let stream = runtime.execution_stream(stream);
         runtime
             .module()
-            .rms_norm_assign(
-                runtime.stream(),
-                &prepared,
-                matrix.descriptor(),
-                self.cols,
-                1e-5,
-            )
+            .rms_norm_assign(stream, &prepared, matrix.descriptor(), self.cols, 1e-5)
             .unwrap();
     }
 }

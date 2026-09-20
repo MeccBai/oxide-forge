@@ -12,36 +12,14 @@ pub(in crate::cuda) mod kernels {
     #[kernel]
     #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
     #[launch_contract(domain = 1)]
-    pub fn slice_set(
+    pub fn span_set<F>(
         target: span::DeviceSliceMutDescriptor<f32>,
         elements_per_thread: usize,
-        value: f32,
-    ) {
-        elementwise::slice_set_device(target, elements_per_thread, value);
-    }
-
-    #[kernel]
-    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
-    #[launch_contract(domain = 1)]
-    pub fn slice_set_seq(
-        target: span::DeviceSliceMutDescriptor<f32>,
-        elements_per_thread: usize,
-        dir: bool,
-        start: f32,
-        step: f32,
-    ) {
-        elementwise::slice_set_seq_device(target, elements_per_thread, dir, start, step);
-    }
-
-    #[kernel]
-    #[launch_bounds(DEFAULT_BLOCK_SIZE_U32)]
-    #[launch_contract(domain = 1)]
-    pub fn slice_set_random(
-        target: span::DeviceSliceMutDescriptor<f32>,
-        elements_per_thread: usize,
-        seed: u32,
-    ) {
-        elementwise::slice_set_random_device(target, elements_per_thread, seed);
+        f: F,
+    ) where
+        F: Fn(usize) -> f32 + Copy,
+    {
+        elementwise::span_set_device(target, elements_per_thread, f);
     }
 
     #[kernel]
@@ -182,41 +160,11 @@ pub(in crate::cuda) mod kernels {
     #[launch_bounds(128)]
     #[launch_contract(domain = 1, block = (128, 1, 1))]
     pub fn matrix_multiply_batched_strided(
-        matrix1: span::DeviceSliceDescriptor<f32>,
-        matrix2: span::DeviceSliceDescriptor<f32>,
-        result: span::DeviceSliceMutDescriptor<f32>,
-        inner: usize,
-        rows: usize,
-        cols: usize,
-        batch_count: usize,
-        a_offset: usize,
-        a_row_stride: usize,
-        a_batch_stride: usize,
-        b_offset: usize,
-        b_row_stride: usize,
-        b_batch_stride: usize,
-        result_offset: usize,
-        result_row_stride: usize,
-        result_batch_stride: usize,
+        matrix1: span::MatrixBatchDescriptor<f32>,
+        matrix2: span::MatrixBatchDescriptor<f32>,
+        result: span::MatrixBatchMutDescriptor<f32>,
     ) {
-        gemm::matrix_multiply_batched_strided_device(
-            matrix1,
-            matrix2,
-            result,
-            inner,
-            rows,
-            cols,
-            batch_count,
-            a_offset,
-            a_row_stride,
-            a_batch_stride,
-            b_offset,
-            b_row_stride,
-            b_batch_stride,
-            result_offset,
-            result_row_stride,
-            result_batch_stride,
-        );
+        gemm::matrix_multiply_batched_strided_device(matrix1, matrix2, result);
     }
 
     #[kernel]

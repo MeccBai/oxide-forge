@@ -10,16 +10,7 @@ impl Matrix {
         vec: &Vector,
         f: impl Fn(f32, f32) -> f32 + Copy,
         runtime: &CudaRuntime,
-    ) {
-        self.binary_assign_by_rows_on(vec, f, runtime, runtime.stream());
-    }
-
-    pub(crate) fn binary_assign_by_rows_on(
-        &mut self,
-        vec: &Vector,
-        f: impl Fn(f32, f32) -> f32 + Copy,
-        runtime: &CudaRuntime,
-        stream: &CudaStream,
+        stream: Option<&CudaStream>,
     ) {
         assert_eq!(self.cols, vec.len());
         if self.buffer.is_empty() {
@@ -33,6 +24,7 @@ impl Matrix {
         let len = self.buffer.len();
         let matrix = DeviceSpanMut::from_buffer(&mut self.buffer, 0, len);
         let rhs = DeviceSpan::from_buffer(&vec.buffer, 0, vec.buffer.len());
+        let stream = runtime.execution_stream(stream);
         runtime
             .module()
             .matrix_binary_assign_by_rows(
@@ -54,24 +46,14 @@ impl CudaRuntime {
             return self.create_vector(buffer);
         }
         let mut buffer = self.get_uninit_buffer(matrix.rows);
-        let stream = self.execution_stream(stream);
-        self.matrix_sum_rows_into_on(matrix, &mut buffer, stream);
-        self.create_vector(buffer)
-    }
-
-    fn matrix_sum_rows_into_on(
-        &self,
-        matrix: &Matrix,
-        buffer: &mut cuda_core::DeviceBuffer<f32>,
-        stream: &CudaStream,
-    ) {
         assert!(matrix.cols > 0);
         let elements_per_thread = matrix.cols.div_ceil(DEFAULT_BLOCK_SIZE);
         let config = LaunchConfig1D::new(matrix.rows as u32, DEFAULT_BLOCK_SIZE as u32, 128);
         let prepared = self.module().prepare_matrix_sum_rows(config).unwrap();
         let input = DeviceSpan::from_buffer(&matrix.buffer, 0, matrix.buffer.len());
         let result_len = buffer.len();
-        let result = DeviceSpanMut::from_buffer(buffer, 0, result_len);
+        let result = DeviceSpanMut::from_buffer(&mut buffer, 0, result_len);
+        let stream = self.execution_stream(stream);
         self.module()
             .matrix_sum_rows(
                 stream,
@@ -82,5 +64,6 @@ impl CudaRuntime {
                 elements_per_thread,
             )
             .unwrap();
+        self.create_vector(buffer)
     }
 }

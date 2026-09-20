@@ -79,4 +79,61 @@ impl HostData {
     pub fn values(&self) -> &[f32] {
         &self.values
     }
+
+    pub fn into_values(self) -> Vec<f32> {
+        self.values
+    }
+}
+
+/// Sequential parameter source used while restoring a node or a whole graph.
+pub struct HostDataCursor {
+    data: std::vec::IntoIter<HostData>,
+    consumed: usize,
+}
+
+impl HostDataCursor {
+    pub fn new(data: Vec<HostData>) -> Self {
+        Self {
+            data: data.into_iter(),
+            consumed: 0,
+        }
+    }
+
+    pub fn take(&mut self) -> HostData {
+        let value = self
+            .data
+            .next()
+            .unwrap_or_else(|| panic!("missing host parameter at index {}", self.consumed));
+        self.consumed += 1;
+        value
+    }
+
+    pub fn consumed(&self) -> usize {
+        self.consumed
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn finish(self) {
+        assert_eq!(self.data.len(), 0, "unused host parameters remain");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HostData, HostDataCursor};
+
+    #[test]
+    fn host_data_cursor_preserves_parameter_order() {
+        let mut cursor = HostDataCursor::new(vec![
+            HostData::new(vec![1.0, 2.0]),
+            HostData::new(vec![3.0]),
+        ]);
+        assert_eq!(cursor.take().values(), &[1.0, 2.0]);
+        assert_eq!(cursor.consumed(), 1);
+        assert_eq!(cursor.take().values(), &[3.0]);
+        cursor.finish();
+    }
 }

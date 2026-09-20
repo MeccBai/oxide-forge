@@ -6,4 +6,5 @@ mod module;
 mod reduction;
 mod row;
 
+pub(in crate::cuda) use common::random;
 pub(in crate::cuda) use module::kernels;

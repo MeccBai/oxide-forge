@@ -559,7 +559,7 @@ clears the accumulators. `Linear` remains optimizer- and tape-free. The older
 `backward(..., learning_rate, ...)` entry is the one-sample, zero-momentum
 convenience path.
 
-`TrainingTransformer` exposes the same `backward_accumulate`/`step` split and
+`TrainingEncoder` exposes the same `backward_accumulate`/`step` split and
 applies a single batch boundary to its output projection, feed-forward MLP, and
 Q/K/V projections. Optimizer velocity is runtime state and is not serialized in
 the parameter checkpoint.
@@ -620,18 +620,16 @@ MLP + residual + norm [sequence, hidden]
 output projection     [sequence, output]
 ```
 
-`InferenceTransformer` selects `NormType::Layer` or `NormType::Rms` at
+`InferenceEncoder` and `InferenceDecoder` select `NormType::Layer` or `NormType::Rms` at
 construction. It also accepts an optional set of three reusable Q/K/V streams;
 the supplied vector must contain exactly three streams. Passing `None` creates
-them lazily on the first forward call. Positional encoding is supplied as an
-owned closure that maps an input Matrix to a newly allocated Matrix:
+them lazily on the first forward call. Positional encoding is an owned,
+serializable enum:
 
 ```rust
-let position_encoding = move |input: &Matrix, runtime: &mut CudaRuntime| {
-    runtime.matrix_add(input, &position, None)
-};
+let position_encoding = PositionEncoding::additive(position);
 
-let transformer = InferenceTransformer::<8>::new(
+let transformer = InferenceEncoder::<8>::new(
     query,
     key,
     value,
@@ -650,8 +648,10 @@ inputs, so decoder cross-attention can reuse it. `Attention` owns scaled score
 calculation, row Softmax, the value GEMM, residual normalization, and its training
 cache. Encoder inference and training therefore share the same scheduling code.
 
-The head count is `InferenceTransformer<const HEADS: usize>` (and likewise for
-training). Construction asserts that the projection width is divisible by
+The head count is carried by `InferenceEncoder<const HEADS: usize>`,
+`InferenceDecoder<const HEADS: usize>`, `TrainingEncoder<const HEADS: usize>`, and
+`TrainingDecoder<const HEADS: usize>`.
+Construction asserts that the projection width is divisible by
 `HEADS`. Q/K/V remain single contiguous `[sequence, hidden]` matrices: no head
 buffers are materialized. A batched-strided GEMM kernel derives the head index
 from its global block index, so all head tiles are submitted by one launch while
@@ -671,10 +671,9 @@ output projection
 → position encoding
 ```
 
-`TrainingTransformer::backward` returns the input gradient and updates Linear
-parameters with the supplied learning rate. The positional closure is external
-to the trainable Transformer parameters; training assumes its derivative with
-respect to the input is the identity, as with additive positional encoding.
+`TrainingEncoder::backward` returns the input gradient and updates Linear
+parameters with the supplied learning rate. Identity and additive positional
+encoding both have an identity derivative with respect to the input.
 
 ## Model Checkpoints
 
@@ -699,19 +698,15 @@ checkpoint::dump_mlp(&mlp, "mlp.toml", &runtime)?;
 let mlp = checkpoint::load_mlp("mlp.toml", &runtime)?;
 
 checkpoint::dump_transformer(&model, "model.toml", &runtime)?;
-let model = checkpoint::load_transformer(
-    "model.toml",
-    position_encoding,
-    &runtime,
-)?;
+let model = checkpoint::load_transformer("model.toml", &runtime)?;
 ```
 
 All file operations live in `net::checkpoint`; `Linear`, MLP, and Transformer do
 not expose file methods. The module also provides explicit inference/training MLP
 and training Transformer variants. Inference and training forms share the same
 persistent parameter representation. Forward caches and Q/K/V streams are runtime
-state and are not saved. Positional closures are code and are likewise not
-serialized, so callers provide one when loading a Transformer. A loaded inference
+state and are not saved. Positional encoding metadata and additive values are
+stored with the Transformer. A loaded inference
 Transformer recreates streams lazily, while a loaded training wrapper starts with
 an empty cache. Training checkpoints retain their selected LayerNorm or RMSNorm
 type when loaded.

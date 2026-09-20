@@ -1,4 +1,5 @@
 use crate::cuda::{CudaRuntime, container::Matrix};
+use crate::graph::{GraphNode, LearnConfig};
 
 use super::{
     BinaryNode, BinaryOp, ConcatNode, FanOutMode, FanOutNode, MatrixAxis, SplitNode,
@@ -179,7 +180,7 @@ impl FanOutNode {
     /// outputs. Average distributes `input / output_count` to every branch.
     pub fn forward(&self, mut input: Matrix, runtime: &mut CudaRuntime) -> Vec<Matrix> {
         if let FanOutMode::Average = self.mode {
-            input.scale(1.0 / self.output_count as f32, runtime);
+            input.scale(1.0 / self.output_count as f32, runtime, None);
         }
 
         let mut outputs = Vec::with_capacity(self.output_count);
@@ -199,7 +200,7 @@ impl FanOutNode {
         );
         let mut gradient = BinaryNode::new(BinaryOp::Add).forward_owned(output_gradients, runtime);
         if let FanOutMode::Average = self.mode {
-            gradient.scale(1.0 / self.output_count as f32, runtime);
+            gradient.scale(1.0 / self.output_count as f32, runtime, None);
         }
         gradient
     }
@@ -283,5 +284,100 @@ fn split(
     match axis {
         MatrixAxis::Rows => runtime.matrix_split_rows(input, sizes, None),
         MatrixAxis::Columns => runtime.matrix_split_cols(input, sizes, None),
+    }
+}
+
+impl GraphNode for ConcatNode {
+    fn forward(&mut self, inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        vec![self.forward_owned(inputs, runtime)]
+    }
+
+    fn backward(&mut self, _gradients: Vec<Matrix>, _runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        panic!("inference ConcatNode does not support backward; use TrainingConcatNode")
+    }
+
+    fn learn(&mut self, _config: LearnConfig, _runtime: &mut CudaRuntime) {}
+
+    fn clear_cache(&mut self, _runtime: &mut CudaRuntime) {}
+}
+
+impl GraphNode for TrainingConcatNode {
+    fn forward(&mut self, inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        vec![TrainingConcatNode::forward(self, inputs, runtime)]
+    }
+
+    fn backward(&mut self, mut gradients: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert_eq!(gradients.len(), 1, "Concat backward expects one gradient");
+        TrainingConcatNode::backward(self, gradients.pop().unwrap(), runtime)
+    }
+
+    fn learn(&mut self, _config: LearnConfig, _runtime: &mut CudaRuntime) {}
+
+    fn clear_cache(&mut self, _runtime: &mut CudaRuntime) {
+        TrainingConcatNode::clear_cache(self);
+    }
+}
+
+impl GraphNode for SplitNode {
+    fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert_eq!(inputs.len(), 1, "Split forward expects one matrix");
+        SplitNode::forward(self, inputs.pop().unwrap(), runtime)
+    }
+
+    fn backward(&mut self, _gradients: Vec<Matrix>, _runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        panic!("inference SplitNode does not support backward; use TrainingSplitNode")
+    }
+
+    fn learn(&mut self, _config: LearnConfig, _runtime: &mut CudaRuntime) {}
+
+    fn clear_cache(&mut self, _runtime: &mut CudaRuntime) {}
+}
+
+impl GraphNode for TrainingSplitNode {
+    fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert_eq!(inputs.len(), 1, "Split forward expects one matrix");
+        TrainingSplitNode::forward(self, inputs.pop().unwrap(), runtime)
+    }
+
+    fn backward(&mut self, gradients: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        vec![TrainingSplitNode::backward(self, gradients, runtime)]
+    }
+
+    fn learn(&mut self, _config: LearnConfig, _runtime: &mut CudaRuntime) {}
+
+    fn clear_cache(&mut self, _runtime: &mut CudaRuntime) {
+        TrainingSplitNode::clear_cache(self);
+    }
+}
+
+impl GraphNode for FanOutNode {
+    fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert_eq!(inputs.len(), 1, "FanOut forward expects one matrix");
+        FanOutNode::forward(self, inputs.pop().unwrap(), runtime)
+    }
+
+    fn backward(&mut self, _gradients: Vec<Matrix>, _runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        panic!("inference FanOutNode does not support backward; use TrainingFanOutNode")
+    }
+
+    fn learn(&mut self, _config: LearnConfig, _runtime: &mut CudaRuntime) {}
+
+    fn clear_cache(&mut self, _runtime: &mut CudaRuntime) {}
+}
+
+impl GraphNode for TrainingFanOutNode {
+    fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert_eq!(inputs.len(), 1, "FanOut forward expects one matrix");
+        TrainingFanOutNode::forward(self, inputs.pop().unwrap(), runtime)
+    }
+
+    fn backward(&mut self, gradients: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        vec![TrainingFanOutNode::backward(self, gradients, runtime)]
+    }
+
+    fn learn(&mut self, _config: LearnConfig, _runtime: &mut CudaRuntime) {}
+
+    fn clear_cache(&mut self, _runtime: &mut CudaRuntime) {
+        TrainingFanOutNode::clear_cache(self);
     }
 }

@@ -1,23 +1,42 @@
-use crate::cuda::{DeviceSpan, kernels};
+use crate::cuda::{DeviceSpanMut, device::random, kernels};
 use cuda_core::simt::memory;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InitType {
     Sequence,
-    Reserve,
+    Reverse,
     Random,
     Zero,
 }
 
 impl InitType {
-    pub fn is_zero(&self) -> bool {
+    pub(crate) fn initialize(
+        self,
+        span: &mut DeviceSpanMut<'_, f32>,
+        runtime: &CudaRuntime,
+        stream: Option<&CudaStream>,
+    ) {
         match self {
-            Self::Sequence => false,
-            Self::Reserve => false,
-            Self::Random => false,
-            Self::Zero => true,
+            Self::Sequence => span.set(runtime, move |index| index as f32, stream),
+            Self::Reverse => {
+                let len = span.len();
+                span.set(runtime, move |index| (len - index) as f32, stream);
+            }
+            Self::Random => {
+                let seed = rand::random::<u32>();
+                span.set(
+                    runtime,
+                    move |index| {
+                        let value = random(seed.wrapping_add(index as u32));
+                        value as f32 / u32::MAX as f32
+                    },
+                    stream,
+                );
+            }
+            Self::Zero => span.set(runtime, move |_| 0.0, stream),
         }
     }
 }
@@ -158,11 +177,7 @@ impl CudaRuntime {
         )
     }
 
-    pub fn concat_buffers(&mut self, buffers: &[&DeviceBuffer<f32>]) -> DeviceBuffer<f32> {
-        self.concat_buffers_on(buffers, None)
-    }
-
-    pub(crate) fn concat_buffers_on(
+    pub fn concat_buffers(
         &mut self,
         buffers: &[&DeviceBuffer<f32>],
         stream: Option<&CudaStream>,
@@ -217,10 +232,6 @@ impl CudaRuntime {
             .copy_from_device_async(buffer, &self.stream())
             .unwrap();
         new_buffer
-    }
-
-    fn span_to_buffer_async(&mut self, span: &DeviceSpan<'_, f32>) -> DeviceBuffer<f32> {
-        span.to_buffer_async(self)
     }
 
     pub fn create_extra_streams(&self, count: usize) -> Vec<Arc<CudaStream>> {

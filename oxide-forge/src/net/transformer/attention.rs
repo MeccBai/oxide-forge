@@ -1,4 +1,4 @@
-use crate::net::linear::{Linear, LinearMomentum};
+use crate::net::linear::{Linear, LinearTrainingState};
 use cuda_core::CudaStream;
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ pub(super) struct Qkv<T> {
 
 pub(super) struct QkvProjector {
     layers: Qkv<Linear>,
-    optimizers: Qkv<LinearMomentum>,
+    training: Qkv<LinearTrainingState>,
     streams: Option<[Arc<CudaStream>; 3]>,
 }
 

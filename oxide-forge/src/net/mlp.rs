@@ -1,8 +1,9 @@
 use crate::cuda::container::Matrix;
 use crate::cuda::container::Vector;
 use crate::cuda::runtime::CudaRuntime;
-use crate::net::linear::{Linear, LinearMetadata, LinearMomentum};
-use crate::net::metadata::{HostData, MetadataCursor};
+use crate::graph::{GraphNode, LearnConfig};
+use crate::net::linear::{Linear, LinearMetadata, LinearTrainingState};
+use crate::net::metadata::{HostData, HostDataCursor, MetadataCursor};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,7 +18,7 @@ pub enum Loss {
 impl Loss {
     pub fn activate_output(self, output: &mut Matrix, runtime: &CudaRuntime) {
         if matches!(self, Self::BinaryCrossEntropyWithLogits) {
-            output.sigmoid(runtime);
+            output.sigmoid(runtime, None);
         }
     }
 
@@ -32,27 +33,33 @@ impl Loss {
         let mut loss = runtime.clone_matrix(output, None);
         match self {
             Self::MeanSquaredError => {
-                loss.binary_assign(target, move |lhs, rhs| lhs - rhs, runtime);
-                loss.for_each(runtime, |value| 0.5 * value * value);
+                loss.binary_assign(target, move |lhs, rhs| lhs - rhs, runtime, None);
+                loss.for_each(runtime, |value| 0.5 * value * value, None);
             }
             Self::BinaryCrossEntropyWithLogits => {
                 // softplus(x) - x * target is stable BCE with logits.
-                loss.for_each(runtime, |value| {
-                    value.max(0.0) + (1.0 + (-value.abs()).exp()).ln()
-                });
+                loss.for_each(
+                    runtime,
+                    |value| value.max(0.0) + (1.0 + (-value.abs()).exp()).ln(),
+                    None,
+                );
                 let product = runtime.matrix_mul(output, target, None);
-                loss.binary_assign(&product, move |lhs, rhs| lhs - rhs, runtime);
+                loss.binary_assign(&product, move |lhs, rhs| lhs - rhs, runtime, None);
                 runtime.recycle_matrix(product);
 
                 if positive_weight != 1.0 {
                     // move |lhs,rhs| lhs+rhs (positive_weight - 1) * target * softplus(-logit).
                     let mut positive = runtime.clone_matrix(output, None);
-                    positive.for_each(runtime, move |value| {
-                        (positive_weight - 1.0)
-                            * ((-value).max(0.0) + (1.0 + (-value.abs()).exp()).ln())
-                    });
-                    positive.binary_assign(target, move |lhs, rhs| lhs * rhs, runtime);
-                    loss.binary_assign(&positive, move |lhs, rhs| lhs + rhs, runtime);
+                    positive.for_each(
+                        runtime,
+                        move |value| {
+                            (positive_weight - 1.0)
+                                * ((-value).max(0.0) + (1.0 + (-value.abs()).exp()).ln())
+                        },
+                        None,
+                    );
+                    positive.binary_assign(target, move |lhs, rhs| lhs * rhs, runtime, None);
+                    loss.binary_assign(&positive, move |lhs, rhs| lhs + rhs, runtime, None);
                     runtime.recycle_matrix(positive);
                 }
             }
@@ -60,7 +67,7 @@ impl Loss {
 
         let cols = loss.cols() as f32;
         let mut rows = runtime.matrix_sum_rows(&loss, None);
-        rows.scale(1.0 / cols, runtime);
+        rows.scale(1.0 / cols, runtime, None);
         runtime.recycle_matrix(loss);
         rows
     }
@@ -76,31 +83,36 @@ impl Loss {
         let mut gradient = runtime.clone_matrix(output, None);
         match self {
             Self::MeanSquaredError => {
-                gradient.binary_assign(target, move |lhs, rhs| lhs - rhs, runtime)
+                gradient.binary_assign(target, move |lhs, rhs| lhs - rhs, runtime, None)
             }
             Self::BinaryCrossEntropyWithLogits => {
-                gradient.sigmoid(runtime);
+                gradient.sigmoid(runtime, None);
                 if positive_weight == 1.0 {
-                    gradient.binary_assign(target, move |lhs, rhs| lhs - rhs, runtime);
+                    gradient.binary_assign(target, move |lhs, rhs| lhs - rhs, runtime, None);
                 } else {
                     // sigmoid(logit) * (1 - target + weight * target)
                     //     - weight * target
                     // remains correct for both hard and soft target values.
                     let mut weights = runtime.clone_matrix(target, None);
-                    weights.scale(positive_weight - 1.0, runtime);
-                    weights.add_scalar(1.0, runtime);
-                    gradient.binary_assign(&weights, move |lhs, rhs| lhs * rhs, runtime);
+                    weights.scale(positive_weight - 1.0, runtime, None);
+                    weights.add_scalar(1.0, runtime, None);
+                    gradient.binary_assign(&weights, move |lhs, rhs| lhs * rhs, runtime, None);
                     runtime.recycle_matrix(weights);
 
                     let mut weighted_target = runtime.clone_matrix(target, None);
-                    weighted_target.scale(positive_weight, runtime);
-                    gradient.binary_assign(&weighted_target, move |lhs, rhs| lhs - rhs, runtime);
+                    weighted_target.scale(positive_weight, runtime, None);
+                    gradient.binary_assign(
+                        &weighted_target,
+                        move |lhs, rhs| lhs - rhs,
+                        runtime,
+                        None,
+                    );
                     runtime.recycle_matrix(weighted_target);
                 }
             }
         }
 
-        gradient.scale(1.0 / (output.rows() * output.cols()) as f32, runtime);
+        gradient.scale(1.0 / (output.rows() * output.cols()) as f32, runtime, None);
         gradient
     }
 
@@ -127,33 +139,39 @@ impl Loss {
         );
 
         let mut probabilities = runtime.clone_matrix(output, None);
-        probabilities.sigmoid(runtime);
+        probabilities.sigmoid(runtime, None);
         let intersection = probabilities.zip_map_reduce(
             target,
             runtime,
             0.0,
             move |probability, target| probability * target,
             move |lhs, rhs| lhs + rhs,
+            None,
         );
         let numerator = 2.0 * intersection + 1.0;
         let denominator = matrix_sum(&probabilities, runtime) + matrix_sum(target, runtime) + 1.0;
 
         let dice_loss = 1.0 - numerator / denominator;
-        loss_rows.add_scalar(dice_weight * dice_loss, runtime);
+        loss_rows.add_scalar(dice_weight * dice_loss, runtime, None);
 
         // d(1 - Dice)/dp = (numerator - 2 * target * denominator) / denominator²
         let mut dice_gradient = runtime.clone_matrix(target, None);
-        dice_gradient.scale(-2.0 * denominator, runtime);
-        dice_gradient.add_scalar(numerator, runtime);
-        dice_gradient.scale(dice_weight / (denominator * denominator), runtime);
+        dice_gradient.scale(-2.0 * denominator, runtime, None);
+        dice_gradient.add_scalar(numerator, runtime, None);
+        dice_gradient.scale(dice_weight / (denominator * denominator), runtime, None);
 
         // Convert dL/dp to dL/dlogit with sigmoid'(logit) = p * (1 - p).
         let mut sigmoid_derivative = runtime.clone_matrix(&probabilities, None);
-        sigmoid_derivative.scale(-1.0, runtime);
-        sigmoid_derivative.add_scalar(1.0, runtime);
-        sigmoid_derivative.binary_assign(&probabilities, move |lhs, rhs| lhs * rhs, runtime);
-        dice_gradient.binary_assign(&sigmoid_derivative, move |lhs, rhs| lhs * rhs, runtime);
-        gradient.binary_assign(&dice_gradient, move |lhs, rhs| lhs + rhs, runtime);
+        sigmoid_derivative.scale(-1.0, runtime, None);
+        sigmoid_derivative.add_scalar(1.0, runtime, None);
+        sigmoid_derivative.binary_assign(&probabilities, move |lhs, rhs| lhs * rhs, runtime, None);
+        dice_gradient.binary_assign(
+            &sigmoid_derivative,
+            move |lhs, rhs| lhs * rhs,
+            runtime,
+            None,
+        );
+        gradient.binary_assign(&dice_gradient, move |lhs, rhs| lhs + rhs, runtime, None);
 
         runtime.recycle_matrix(probabilities);
         runtime.recycle_matrix(sigmoid_derivative);
@@ -163,7 +181,7 @@ impl Loss {
 }
 
 fn matrix_sum(matrix: &Matrix, runtime: &mut CudaRuntime) -> f32 {
-    matrix.sum(runtime)
+    matrix.sum(runtime, None)
 }
 
 fn validate_binary_loss_inputs(output: &Matrix, target: &Matrix, positive_weight: f32) {
@@ -320,15 +338,21 @@ impl MlpExecutor {
             .collect()
     }
 
+    pub fn set_data(&mut self, data: &mut HostDataCursor, runtime: &CudaRuntime) {
+        for layer in &mut self.layers {
+            layer.set_data(data, runtime);
+        }
+    }
+
     fn backward_accumulate(
         &mut self,
         layer_inputs: &[Matrix],
         output_gradient: &Matrix,
-        optimizers: &mut [LinearMomentum],
+        training: &mut [LinearTrainingState],
         runtime: &mut CudaRuntime,
     ) -> Matrix {
         assert_eq!(layer_inputs.len(), self.layers.len());
-        assert_eq!(optimizers.len(), self.layers.len());
+        assert_eq!(training.len(), self.layers.len());
 
         let mut gradient = runtime.clone_matrix(output_gradient, None);
         let mut residual_gradient: Option<(usize, Matrix)> = None;
@@ -353,10 +377,15 @@ impl MlpExecutor {
                 .is_some_and(|(source, _)| *source == index)
             {
                 let (_, skip_gradient) = residual_gradient.take().unwrap();
-                input_gradient.binary_assign(&skip_gradient, move |lhs, rhs| lhs + rhs, runtime);
+                input_gradient.binary_assign(
+                    &skip_gradient,
+                    move |lhs, rhs| lhs + rhs,
+                    runtime,
+                    None,
+                );
             }
 
-            optimizers[index].accumulate(
+            training[index].accumulate(
                 &layer_inputs[index],
                 &layer_gradient,
                 bias_gradient.as_ref(),
@@ -392,6 +421,10 @@ impl InferenceMLP {
         self.executor.get_data(runtime)
     }
 
+    pub fn set_data(&mut self, data: &mut HostDataCursor, runtime: &CudaRuntime) {
+        self.executor.set_data(data, runtime);
+    }
+
     pub fn loss(&self) -> Loss {
         self.executor.loss()
     }
@@ -411,7 +444,7 @@ pub struct TrainingMlp {
     /// `layer_inputs[i]` owns the input consumed by layer `i`.
     layer_inputs: Vec<Matrix>,
     executor: MlpExecutor,
-    optimizers: Vec<LinearMomentum>,
+    training: Vec<LinearTrainingState>,
 }
 
 impl TrainingMlp {
@@ -424,8 +457,8 @@ impl TrainingMlp {
         Self {
             layer_inputs: Vec::new(),
             executor: MlpExecutor::with_loss(layers, res_range, loss),
-            optimizers: (0..layer_count)
-                .map(|_| LinearMomentum::default())
+            training: (0..layer_count)
+                .map(|_| LinearTrainingState::default())
                 .collect(),
         }
     }
@@ -436,6 +469,10 @@ impl TrainingMlp {
 
     pub fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
         self.executor.get_data(runtime)
+    }
+
+    pub fn set_data(&mut self, data: &mut HostDataCursor, runtime: &CudaRuntime) {
+        self.executor.set_data(data, runtime);
     }
 
     pub fn loss(&self) -> Loss {
@@ -486,7 +523,7 @@ impl TrainingMlp {
     }
 
     pub fn forward(&mut self, input: Matrix, runtime: &mut CudaRuntime) -> Matrix {
-        self.layer_inputs.clear();
+        self.clear_cache(runtime);
         self.layer_inputs.reserve(self.executor.layers.len());
         self.layer_inputs.push(input);
 
@@ -508,19 +545,12 @@ impl TrainingMlp {
         unreachable!("MLP always contains at least one layer")
     }
 
-    pub fn backward(
-        &mut self,
-        output_gradient: &Matrix,
-        learning_rate: f32,
-        runtime: &mut CudaRuntime,
-    ) -> Matrix {
-        let input_gradient = self.backward_accumulate(output_gradient, runtime);
-        self.step(learning_rate, 0.0, 1, runtime);
-        input_gradient
+    pub fn backward(&mut self, output_gradient: &Matrix, runtime: &mut CudaRuntime) -> Matrix {
+        self.backward_accumulate(output_gradient, runtime)
     }
 
-    /// Backpropagates one sample and move |lhs,rhs| lhs+rhss its parameter gradients to the current
-    /// mini-batch without changing any parameters.
+    /// Backpropagates one sample and accumulates its parameter gradients into
+    /// the current mini-batch without changing any parameters.
     pub fn backward_accumulate(
         &mut self,
         output_gradient: &Matrix,
@@ -529,26 +559,98 @@ impl TrainingMlp {
         self.executor.backward_accumulate(
             &self.layer_inputs,
             output_gradient,
-            &mut self.optimizers,
+            &mut self.training,
             runtime,
         )
     }
 
     /// Applies the mean gradient of the accumulated mini-batch using classical
     /// momentum SGD, then clears only the gradient accumulators.
-    pub fn step(
+    pub fn learn(
         &mut self,
         learning_rate: f32,
         momentum: f32,
         batch_len: usize,
         runtime: &mut CudaRuntime,
     ) {
-        for (layer, optimizer) in self.executor.layers.iter_mut().zip(&mut self.optimizers) {
-            optimizer.step(layer, learning_rate, momentum, batch_len, runtime);
+        for (layer, training) in self.executor.layers.iter_mut().zip(&mut self.training) {
+            training.learn(layer, learning_rate, momentum, batch_len, runtime);
         }
     }
 
     pub fn input(&self) -> Option<&Matrix> {
         self.layer_inputs.first()
+    }
+
+    pub fn clear_cache(&mut self, runtime: &mut CudaRuntime) {
+        for input in self.layer_inputs.drain(..) {
+            runtime.recycle_matrix(input);
+        }
+    }
+}
+
+impl GraphNode for InferenceMLP {
+    fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert_eq!(inputs.len(), 1, "MLP forward expects one matrix");
+        let input = inputs.pop().unwrap();
+        let output = InferenceMLP::forward(self, &input, runtime);
+        runtime.recycle_matrix(input);
+        vec![output]
+    }
+
+    fn backward(&mut self, _gradients: Vec<Matrix>, _runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        panic!("inference MLP does not support backward; use TrainingMlp")
+    }
+
+    fn learn(&mut self, _config: LearnConfig, _runtime: &mut CudaRuntime) {
+        panic!("inference MLP does not support learning; use TrainingMlp")
+    }
+
+    fn clear_cache(&mut self, _runtime: &mut CudaRuntime) {}
+
+    fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
+        InferenceMLP::get_data(self, runtime)
+    }
+
+    fn set_data(&mut self, data: &mut HostDataCursor, runtime: &CudaRuntime) {
+        InferenceMLP::set_data(self, data, runtime);
+    }
+}
+
+impl GraphNode for TrainingMlp {
+    fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert_eq!(inputs.len(), 1, "MLP forward expects one matrix");
+        vec![TrainingMlp::forward(self, inputs.pop().unwrap(), runtime)]
+    }
+
+    fn backward(&mut self, mut gradients: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert_eq!(gradients.len(), 1, "MLP backward expects one gradient");
+        let output_gradient = gradients.pop().unwrap();
+        let input_gradient = self.backward_accumulate(&output_gradient, runtime);
+        runtime.recycle_matrix(output_gradient);
+        self.clear_cache(runtime);
+        vec![input_gradient]
+    }
+
+    fn learn(&mut self, config: LearnConfig, runtime: &mut CudaRuntime) {
+        TrainingMlp::learn(
+            self,
+            config.learning_rate,
+            config.momentum,
+            config.batch_len,
+            runtime,
+        );
+    }
+
+    fn clear_cache(&mut self, runtime: &mut CudaRuntime) {
+        TrainingMlp::clear_cache(self, runtime);
+    }
+
+    fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
+        TrainingMlp::get_data(self, runtime)
+    }
+
+    fn set_data(&mut self, data: &mut HostDataCursor, runtime: &CudaRuntime) {
+        TrainingMlp::set_data(self, data, runtime);
     }
 }

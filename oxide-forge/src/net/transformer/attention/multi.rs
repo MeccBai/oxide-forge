@@ -1,10 +1,7 @@
 use crate::cuda::{container::Matrix, runtime::CudaRuntime};
-use crate::net::linear::{Linear, LinearMetadata, LinearMomentum};
-use crate::net::metadata::{HostData, MetadataCursor};
-use crate::net::node::{
-    BinaryNode, BinaryOp, SingleNode, SingleType, TrainingBinaryNode, TrainingSingleNode,
-};
-use crate::net::transformer::NormType;
+use crate::net::linear::{Linear, LinearMetadata, LinearTrainingState};
+use crate::net::metadata::{HostData, HostDataCursor, MetadataCursor};
+use crate::net::node::{BinaryNode, BinaryOp, SingleNode, SingleType};
 use cuda_core::CudaStream;
 use std::sync::Arc;
 
@@ -24,10 +21,10 @@ impl QkvProjector {
         });
         Self {
             layers: Qkv { query, key, value },
-            optimizers: Qkv {
-                query: LinearMomentum::default(),
-                key: LinearMomentum::default(),
-                value: LinearMomentum::default(),
+            training: Qkv {
+                query: LinearTrainingState::default(),
+                key: LinearTrainingState::default(),
+                value: LinearTrainingState::default(),
             },
             streams,
         }
@@ -46,6 +43,12 @@ impl QkvProjector {
         data.extend(self.layers.key.get_data(runtime));
         data.extend(self.layers.value.get_data(runtime));
         data
+    }
+
+    pub(crate) fn set_data(&mut self, data: &mut HostDataCursor, runtime: &CudaRuntime) {
+        self.layers.query.set_data(data, runtime);
+        self.layers.key.set_data(data, runtime);
+        self.layers.value.set_data(data, runtime);
     }
 
     /// Projects query and key/value inputs independently. Passing the same Matrix
@@ -105,15 +108,15 @@ impl QkvProjector {
         let mut input_gradients = Vec::with_capacity(3);
         let Qkv { query, key, value } = &mut self.layers;
         let Qkv {
-            query: query_optimizer,
-            key: key_optimizer,
-            value: value_optimizer,
-        } = &mut self.optimizers;
+            query: query_training,
+            key: key_training,
+            value: value_training,
+        } = &mut self.training;
 
         for (linear, optimizer, projected_gradient) in [
-            (query, query_optimizer, query_gradient),
-            (key, key_optimizer, key_gradient),
-            (value, value_optimizer, value_gradient),
+            (query, query_training, query_gradient),
+            (key, key_training, key_gradient),
+            (value, value_training, value_gradient),
         ] {
             let pre_activation = linear
                 .needs_pre_activation()
@@ -130,7 +133,7 @@ impl QkvProjector {
         BinaryNode::new(BinaryOp::Add).forward_owned(input_gradients, runtime)
     }
 
-    pub(crate) fn step(
+    pub(crate) fn learn(
         &mut self,
         learning_rate: f32,
         momentum: f32,
@@ -139,35 +142,32 @@ impl QkvProjector {
     ) {
         let Qkv { query, key, value } = &mut self.layers;
         let Qkv {
-            query: query_optimizer,
-            key: key_optimizer,
-            value: value_optimizer,
-        } = &mut self.optimizers;
-        for (linear, optimizer) in [
-            (query, query_optimizer),
-            (key, key_optimizer),
-            (value, value_optimizer),
+            query: query_training,
+            key: key_training,
+            value: value_training,
+        } = &mut self.training;
+        for (linear, training) in [
+            (query, query_training),
+            (key, key_training),
+            (value, value_training),
         ] {
-            optimizer.step(linear, learning_rate, momentum, batch_len, runtime);
+            training.learn(linear, learning_rate, momentum, batch_len, runtime);
         }
     }
 }
 
 pub(crate) struct Attention<const HEADS: usize> {
     qkv: QkvProjector,
-    norm_type: NormType,
-    residual: BinaryNode,
-    normalization: SingleNode,
-    training_residual: TrainingBinaryNode,
-    training_normalization: TrainingSingleNode,
     training_cache: Option<AttentionCache>,
 }
 
-struct AttentionCache {
-    input: Matrix,
+pub(crate) struct AttentionTrainingState {
+    pub(crate) input: Matrix,
     projected: Qkv<Matrix>,
     probabilities: Matrix,
 }
+
+type AttentionCache = AttentionTrainingState;
 
 impl<const HEADS: usize> Attention<HEADS> {
     pub(crate) fn new(
@@ -175,7 +175,6 @@ impl<const HEADS: usize> Attention<HEADS> {
         key: Linear,
         value: Linear,
         streams: Option<Vec<Arc<CudaStream>>>,
-        norm_type: NormType,
     ) -> Self {
         assert!(HEADS > 0, "attention requires at least one head");
         let width = query.output_neurons();
@@ -190,23 +189,10 @@ impl<const HEADS: usize> Attention<HEADS> {
             width,
             "query/value widths must match"
         );
-        let normalization = match norm_type {
-            NormType::Layer => SingleType::LayerNorm,
-            NormType::Rms => SingleType::RmsNorm,
-        };
         Self {
             qkv: QkvProjector::new(query, key, value, streams),
-            norm_type,
-            residual: BinaryNode::new(BinaryOp::Add),
-            normalization: SingleNode::new(normalization),
-            training_residual: TrainingBinaryNode::new(BinaryOp::Add),
-            training_normalization: TrainingSingleNode::new(normalization),
             training_cache: None,
         }
-    }
-
-    pub(crate) fn norm_type(&self) -> NormType {
-        self.norm_type
     }
 
     pub(crate) fn get_meta_data(&self, cursor: &mut MetadataCursor) -> Qkv<LinearMetadata> {
@@ -215,6 +201,10 @@ impl<const HEADS: usize> Attention<HEADS> {
 
     pub(crate) fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
         self.qkv.get_data(runtime)
+    }
+
+    pub(crate) fn set_data(&mut self, data: &mut HostDataCursor, runtime: &CudaRuntime) {
+        self.qkv.set_data(data, runtime);
     }
 
     /// Runs attention without retaining backward state. `query_input` is also
@@ -226,8 +216,7 @@ impl<const HEADS: usize> Attention<HEADS> {
         runtime: &mut CudaRuntime,
     ) -> Matrix {
         let projected = self.qkv.project(query_input, key_value_input, runtime);
-        let attention = self.attention_value_inference(projected, runtime);
-        self.finish_forward(query_input, attention, runtime)
+        self.attention_value_inference(projected, runtime)
     }
 
     pub(crate) fn forward_mask(
@@ -237,44 +226,36 @@ impl<const HEADS: usize> Attention<HEADS> {
         runtime: &mut CudaRuntime,
     ) -> Matrix {
         let projected = self.qkv.project(query_input, key_value_input, runtime);
-        let attention = self.attention_value_mask_inference(projected, runtime);
-        self.finish_forward(query_input, attention, runtime)
-    }
-
-    fn finish_forward(
-        &self,
-        query_input: &Matrix,
-        attention: Matrix,
-        runtime: &mut CudaRuntime,
-    ) -> Matrix {
-        let output = self.residual.forward(&[query_input, &attention], runtime);
-        runtime.recycle_matrix(attention);
-        self.normalization.forward(output, runtime)
+        self.attention_value_mask_inference(projected, runtime)
     }
 
     /// Self-attention variant that owns the input and retains exactly the state
     /// required by backward. A future cross-attention trainer can use the same
     /// QkvProjector while keeping separate query and key/value input caches.
-    pub(crate) fn forward_self_training(
+    pub(crate) fn forward_self_training<const MASKED: bool>(
         &mut self,
         input: Matrix,
         runtime: &mut CudaRuntime,
-    ) -> Matrix {
+    ) -> (Matrix, AttentionTrainingState) {
         let projected = self.qkv.project(&input, &input, runtime);
-        let probabilities = self.attention_probabilities(&projected, false, runtime);
+        let probabilities = self.attention_probabilities(&projected, MASKED, runtime);
         let attention = self.attention_value(&probabilities, &projected.value, runtime);
-        let pre_norm = self
-            .training_residual
-            .forward_borrowed(&[&input, &attention], runtime);
-        runtime.recycle_matrix(attention);
-        let output = self.training_normalization.forward(pre_norm, runtime);
+        (
+            attention,
+            AttentionTrainingState {
+                input,
+                projected,
+                probabilities,
+            },
+        )
+    }
 
-        self.training_cache = Some(AttentionCache {
-            input,
-            projected,
-            probabilities,
-        });
-        output
+    pub(crate) fn retain_training_state(&mut self, state: AttentionTrainingState) {
+        assert!(
+            self.training_cache.is_none(),
+            "attention backward cache is still occupied"
+        );
+        self.training_cache = Some(state);
     }
 
     pub(crate) fn backward_self_accumulate(
@@ -286,14 +267,7 @@ impl<const HEADS: usize> Attention<HEADS> {
             .training_cache
             .take()
             .expect("attention forward must run before backward");
-        let residual_gradient = self
-            .training_normalization
-            .backward(output_gradient, runtime);
-        let [direct_gradient, attention_gradient]: [Matrix; 2] = self
-            .training_residual
-            .backward(residual_gradient, runtime)
-            .try_into()
-            .unwrap_or_else(|_| unreachable!("residual Add has two inputs"));
+        let attention_gradient = output_gradient;
 
         let width = cache.projected.query.cols();
         let head_width = width / HEADS;
@@ -303,22 +277,24 @@ impl<const HEADS: usize> Attention<HEADS> {
         let value_t = runtime.matrix_transpose(&cache.projected.value, None);
         let mut probabilities_gradient = runtime.new_uninit_matrix(HEADS * query_rows, key_rows);
         runtime.matrix_multiply_batched_strided_into(
-            &attention_gradient,
-            &value_t,
-            &mut probabilities_gradient,
-            head_width,
-            query_rows,
-            key_rows,
-            HEADS,
-            0,
-            width,
-            head_width,
-            0,
-            key_rows,
-            head_width * key_rows,
-            0,
-            key_rows,
-            query_rows * key_rows,
+            attention_gradient.batch_span(0, query_rows, head_width, width, head_width, HEADS),
+            value_t.batch_span(
+                0,
+                head_width,
+                key_rows,
+                key_rows,
+                head_width * key_rows,
+                HEADS,
+            ),
+            probabilities_gradient.batch_span_mut(
+                0,
+                query_rows,
+                key_rows,
+                key_rows,
+                query_rows * key_rows,
+                HEADS,
+            ),
+            None,
         );
 
         let probabilities_t = runtime.matrix_transpose_batches(
@@ -330,22 +306,17 @@ impl<const HEADS: usize> Attention<HEADS> {
         );
         let mut value_gradient = runtime.new_uninit_matrix(key_rows, width);
         runtime.matrix_multiply_batched_strided_into(
-            &probabilities_t,
-            &attention_gradient,
-            &mut value_gradient,
-            query_rows,
-            key_rows,
-            head_width,
-            HEADS,
-            0,
-            query_rows,
-            key_rows * query_rows,
-            0,
-            width,
-            head_width,
-            0,
-            width,
-            head_width,
+            probabilities_t.batch_span(
+                0,
+                key_rows,
+                query_rows,
+                query_rows,
+                key_rows * query_rows,
+                HEADS,
+            ),
+            attention_gradient.batch_span(0, query_rows, head_width, width, head_width, HEADS),
+            value_gradient.batch_span_mut(0, key_rows, head_width, width, head_width, HEADS),
+            None,
         );
 
         let score_gradient =
@@ -355,44 +326,40 @@ impl<const HEADS: usize> Attention<HEADS> {
 
         let mut query_gradient = runtime.new_uninit_matrix(query_rows, width);
         runtime.matrix_multiply_batched_strided_into(
-            &score_gradient,
-            &cache.projected.key,
-            &mut query_gradient,
-            key_rows,
-            query_rows,
-            head_width,
-            HEADS,
-            0,
-            key_rows,
-            query_rows * key_rows,
-            0,
-            width,
-            head_width,
-            0,
-            width,
-            head_width,
+            score_gradient.batch_span(
+                0,
+                query_rows,
+                key_rows,
+                key_rows,
+                query_rows * key_rows,
+                HEADS,
+            ),
+            cache
+                .projected
+                .key
+                .batch_span(0, key_rows, head_width, width, head_width, HEADS),
+            query_gradient.batch_span_mut(0, query_rows, head_width, width, head_width, HEADS),
+            None,
         );
 
         let score_gradient_t =
             runtime.matrix_transpose_batches(&score_gradient, HEADS, query_rows, key_rows, None);
         let mut key_gradient = runtime.new_uninit_matrix(key_rows, width);
         runtime.matrix_multiply_batched_strided_into(
-            &score_gradient_t,
-            &cache.projected.query,
-            &mut key_gradient,
-            query_rows,
-            key_rows,
-            head_width,
-            HEADS,
-            0,
-            query_rows,
-            key_rows * query_rows,
-            0,
-            width,
-            head_width,
-            0,
-            width,
-            head_width,
+            score_gradient_t.batch_span(
+                0,
+                key_rows,
+                query_rows,
+                query_rows,
+                key_rows * query_rows,
+                HEADS,
+            ),
+            cache
+                .projected
+                .query
+                .batch_span(0, query_rows, head_width, width, head_width, HEADS),
+            key_gradient.batch_span_mut(0, key_rows, head_width, width, head_width, HEADS),
+            None,
         );
 
         let projection_gradient = self.qkv.backward_self_accumulate(
@@ -402,19 +369,41 @@ impl<const HEADS: usize> Attention<HEADS> {
             &value_gradient,
             runtime,
         );
+        runtime.recycle_matrix(value_t);
+        runtime.recycle_matrix(probabilities_gradient);
+        runtime.recycle_matrix(probabilities_t);
+        runtime.recycle_matrix(value_gradient);
+        runtime.recycle_matrix(score_gradient);
+        runtime.recycle_matrix(query_gradient);
+        runtime.recycle_matrix(score_gradient_t);
+        runtime.recycle_matrix(key_gradient);
+        runtime.recycle_matrix(cache.input);
+        runtime.recycle_matrix(cache.projected.query);
+        runtime.recycle_matrix(cache.projected.key);
+        runtime.recycle_matrix(cache.projected.value);
+        runtime.recycle_matrix(cache.probabilities);
         runtime.recycle_matrix(attention_gradient);
-        BinaryNode::new(BinaryOp::Add)
-            .forward_owned(vec![direct_gradient, projection_gradient], runtime)
+        projection_gradient
     }
 
-    pub(crate) fn step(
+    pub(crate) fn clear_training_cache(&mut self, runtime: &mut CudaRuntime) {
+        if let Some(cache) = self.training_cache.take() {
+            runtime.recycle_matrix(cache.input);
+            runtime.recycle_matrix(cache.projected.query);
+            runtime.recycle_matrix(cache.projected.key);
+            runtime.recycle_matrix(cache.projected.value);
+            runtime.recycle_matrix(cache.probabilities);
+        }
+    }
+
+    pub(crate) fn learn(
         &mut self,
         learning_rate: f32,
         momentum: f32,
         batch_len: usize,
         runtime: &mut CudaRuntime,
     ) {
-        self.qkv.step(learning_rate, momentum, batch_len, runtime);
+        self.qkv.learn(learning_rate, momentum, batch_len, runtime);
     }
 
     fn attention_value_inference(
@@ -452,22 +441,24 @@ impl<const HEADS: usize> Attention<HEADS> {
         let key_t = runtime.matrix_transpose(&key, None);
         let mut scores = runtime.new_uninit_matrix(HEADS * query_rows, key_rows);
         runtime.matrix_multiply_batched_strided_into(
-            &query,
-            &key_t,
-            &mut scores,
-            head_width,
-            query_rows,
-            key_rows,
-            HEADS,
-            0,
-            query_width,
-            head_width,
-            0,
-            key_rows,
-            head_width * key_rows,
-            0,
-            key_rows,
-            query_rows * key_rows,
+            query.batch_span(0, query_rows, head_width, query_width, head_width, HEADS),
+            key_t.batch_span(
+                0,
+                head_width,
+                key_rows,
+                key_rows,
+                head_width * key_rows,
+                HEADS,
+            ),
+            scores.batch_span_mut(
+                0,
+                query_rows,
+                key_rows,
+                key_rows,
+                query_rows * key_rows,
+                HEADS,
+            ),
+            None,
         );
         runtime.recycle_matrix(query);
         runtime.recycle_matrix(key);
@@ -475,7 +466,7 @@ impl<const HEADS: usize> Attention<HEADS> {
         let mut scores = SingleNode::new(SingleType::Scale(1.0 / (head_width as f32).sqrt()))
             .forward(scores, runtime);
         if masked {
-            scores.causal_mask_heads(query_rows, runtime);
+            scores.causal_mask_heads(query_rows, runtime, None);
         }
         SingleNode::new(SingleType::Softmax).forward(scores, runtime)
     }
@@ -506,28 +497,32 @@ impl<const HEADS: usize> Attention<HEADS> {
         let key_t = runtime.matrix_transpose(&projected.key, None);
         let mut scores = runtime.new_uninit_matrix(HEADS * query_rows, key_rows);
         runtime.matrix_multiply_batched_strided_into(
-            &projected.query,
-            &key_t,
-            &mut scores,
-            head_width,
-            query_rows,
-            key_rows,
-            HEADS,
-            0,
-            width,
-            head_width,
-            0,
-            key_rows,
-            head_width * key_rows,
-            0,
-            key_rows,
-            query_rows * key_rows,
+            projected
+                .query
+                .batch_span(0, query_rows, head_width, width, head_width, HEADS),
+            key_t.batch_span(
+                0,
+                head_width,
+                key_rows,
+                key_rows,
+                head_width * key_rows,
+                HEADS,
+            ),
+            scores.batch_span_mut(
+                0,
+                query_rows,
+                key_rows,
+                key_rows,
+                query_rows * key_rows,
+                HEADS,
+            ),
+            None,
         );
         runtime.recycle_matrix(key_t);
         let mut scores = SingleNode::new(SingleType::Scale(1.0 / (head_width as f32).sqrt()))
             .forward(scores, runtime);
         if masked {
-            scores.causal_mask_heads(query_rows, runtime);
+            scores.causal_mask_heads(query_rows, runtime, None);
         }
         SingleNode::new(SingleType::Softmax).forward(scores, runtime)
     }
@@ -545,22 +540,17 @@ impl<const HEADS: usize> Attention<HEADS> {
         let head_width = width / HEADS;
         let mut attention = runtime.new_uninit_matrix(query_rows, width);
         runtime.matrix_multiply_batched_strided_into(
-            probabilities,
-            value,
-            &mut attention,
-            key_rows,
-            query_rows,
-            head_width,
-            HEADS,
-            0,
-            key_rows,
-            query_rows * key_rows,
-            0,
-            width,
-            head_width,
-            0,
-            width,
-            head_width,
+            probabilities.batch_span(
+                0,
+                query_rows,
+                key_rows,
+                key_rows,
+                query_rows * key_rows,
+                HEADS,
+            ),
+            value.batch_span(0, key_rows, head_width, width, head_width, HEADS),
+            attention.batch_span_mut(0, query_rows, head_width, width, head_width, HEADS),
+            None,
         );
         attention
     }

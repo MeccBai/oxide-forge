@@ -406,7 +406,7 @@ mini-batch 训练使用 `backward_accumulate`：它立即计算 `dX`，但参数
 Momentum velocity、修改参数并清空累积量。`Linear` 仍然不持有 optimizer 或 tape。
 原有 `backward(..., learning_rate, ...)` 是单样本、零 momentum 的便捷路径。
 
-`TrainingTransformer` 提供相同的 `backward_accumulate`/`step` 分离接口，用同一个 batch
+`TrainingEncoder` 提供相同的 `backward_accumulate`/`step` 分离接口，用同一个 batch
 边界更新 output projection、FFN 和 Q/K/V。optimizer velocity 属于运行期状态，不写入
 参数 checkpoint。
 
@@ -437,17 +437,14 @@ MLP + residual + norm [sequence,hidden]
 output projection     [sequence,output]
 ```
 
-`InferenceTransformer` 在构造时选择 `NormType::Layer` 或 `NormType::Rms`，同时可以传入
+`InferenceEncoder` 和 `InferenceDecoder` 在构造时选择 `NormType::Layer` 或 `NormType::Rms`，同时可以传入
 三条可复用的 Q/K/V stream；传入的 Vec 必须正好包含三条 stream。传入 `None` 时会在
-第一次 forward 中延迟创建。位置编码作为一个由 Transformer 持有的闭包传入，负责把
-输入 Matrix 转换成新 Matrix：
+第一次 forward 中延迟创建。位置编码是由 Transformer 持有并可序列化的枚举：
 
 ```rust
-let position_encoding = move |input: &Matrix, runtime: &mut CudaRuntime| {
-    runtime.matrix_add(input, &position)
-};
+let position_encoding = PositionEncoding::additive(position);
 
-let transformer = InferenceTransformer::<8>::new(
+let transformer = InferenceEncoder::<8>::new(
     query,
     key,
     value,
@@ -465,7 +462,8 @@ key/value 使用不同输入，因此后续 decoder cross-attention 可直接复
 负责 scaled score、row Softmax、value GEMM、residual norm 和训练 cache，encoder
 的 inference/training 不再各自实现调度逻辑。
 
-头数由 `InferenceTransformer<const HEADS: usize>`（训练版本同理）在编译期指定；构造时
+头数由 `InferenceEncoder<const HEADS: usize>`、`InferenceDecoder<const HEADS: usize>`、
+`TrainingEncoder<const HEADS: usize>` 和 `TrainingDecoder<const HEADS: usize>` 在编译期指定；构造时
 断言投影宽度可以被 `HEADS` 整除。Q/K/V 始终保持为单个连续的
 `[sequence, hidden]` 矩阵，不做物理拆分。batched-strided GEMM kernel 从全局 block
 索引推导 head，各 head 的所有 tile 由一次 launch 提交，而每个 block 通过 stride
@@ -484,9 +482,8 @@ output projection
 → position encoding
 ```
 
-`TrainingTransformer::backward` 返回输入梯度，并使用传入 learning rate 更新 Linear
-参数。位置编码闭包不属于 Transformer 的可训练参数；训练路径假定它对输入的导数为
-恒等映射，对应加法式位置编码。
+`TrainingEncoder::backward` 返回输入梯度，并使用传入 learning rate 更新 Linear
+参数。Identity 与加法式位置编码对输入的导数均为恒等映射。
 
 ## 模型存档
 
@@ -510,18 +507,14 @@ checkpoint::dump_mlp(&mlp, "mlp.toml", &runtime)?;
 let mlp = checkpoint::load_mlp("mlp.toml", &runtime)?;
 
 checkpoint::dump_transformer(&model, "model.toml", &runtime)?;
-let model = checkpoint::load_transformer(
-    "model.toml",
-    position_encoding,
-    &runtime,
-)?;
+let model = checkpoint::load_transformer("model.toml", &runtime)?;
 ```
 
 所有文件操作都只存在于 `net::checkpoint`；`Linear`、MLP 和 Transformer 不提供
 文件方法。该模块另外提供明确的 inference/training MLP 以及 training Transformer
 变体。推理版和训练版使用相同的持久参数表示。forward cache 与 Q/K/V stream
-属于运行时状态，不会保存。位置编码闭包属于代码，同样不会被序列化，因此加载
-Transformer 时由调用方重新提供。推理模型加载后延迟重建 stream，训练模型的 cache
+属于运行时状态，不会保存。位置编码的类型和加法参数会随 Transformer 一起保存。
+推理模型加载后延迟重建 stream，训练模型的 cache
 从空状态开始；加载训练 checkpoint 时会保留其选择的 LayerNorm 或 RMSNorm 类型。
 
 模型关联层的完整入口为 `dump_linear/load_linear`、`dump_mlp/load_mlp`、

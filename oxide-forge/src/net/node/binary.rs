@@ -1,4 +1,5 @@
 use crate::cuda::{CudaRuntime, container::Matrix};
+use crate::graph::{GraphNode, LearnConfig};
 
 use super::{BinaryCache, BinaryNode, BinaryOp, TrainingBinaryNode};
 
@@ -26,7 +27,7 @@ impl BinaryNode {
 
         if let BinaryOp::Add = self.op {
             for input in &inputs[2..] {
-                output.binary_assign(input, move |lhs, rhs| lhs + rhs, runtime);
+                output.binary_assign(input, move |lhs, rhs| lhs + rhs, runtime, None);
             }
         }
         output
@@ -41,7 +42,7 @@ impl BinaryNode {
             BinaryOp::Add => {
                 let mut output = inputs.remove(0);
                 for input in inputs {
-                    output.binary_assign(&input, move |lhs, rhs| lhs + rhs, runtime);
+                    output.binary_assign(&input, move |lhs, rhs| lhs + rhs, runtime, None);
                     runtime.recycle_matrix(input);
                 }
                 output
@@ -50,9 +51,15 @@ impl BinaryNode {
                 let rhs = inputs.pop().unwrap();
                 let mut output = inputs.pop().unwrap();
                 match self.op {
-                    BinaryOp::Sub => output.binary_assign(&rhs, move |lhs, rhs| lhs - rhs, runtime),
-                    BinaryOp::Mul => output.binary_assign(&rhs, move |lhs, rhs| lhs * rhs, runtime),
-                    BinaryOp::Div => output.binary_assign(&rhs, move |lhs, rhs| lhs / rhs, runtime),
+                    BinaryOp::Sub => {
+                        output.binary_assign(&rhs, move |lhs, rhs| lhs - rhs, runtime, None)
+                    }
+                    BinaryOp::Mul => {
+                        output.binary_assign(&rhs, move |lhs, rhs| lhs * rhs, runtime, None)
+                    }
+                    BinaryOp::Div => {
+                        output.binary_assign(&rhs, move |lhs, rhs| lhs / rhs, runtime, None)
+                    }
                     _ => unreachable!(),
                 }
                 runtime.recycle_matrix(rhs);
@@ -144,7 +151,7 @@ impl TrainingBinaryNode {
             }
             BinaryOp::Sub => {
                 let lhs_gradient = runtime.clone_matrix(&output_gradient, None);
-                output_gradient.scale(-1.0, runtime);
+                output_gradient.scale(-1.0, runtime, None);
                 vec![lhs_gradient, output_gradient]
             }
             BinaryOp::Mul => {
@@ -160,7 +167,7 @@ impl TrainingBinaryNode {
                 let denominator = runtime.matrix_mul(&inputs[1], &inputs[1], None);
                 let numerator = runtime.matrix_mul(&output_gradient, &inputs[0], None);
                 let mut rhs_gradient = runtime.matrix_div(&numerator, &denominator, None);
-                rhs_gradient.scale(-1.0, runtime);
+                rhs_gradient.scale(-1.0, runtime, None);
 
                 runtime.recycle_matrix(denominator);
                 runtime.recycle_matrix(numerator);
@@ -232,6 +239,41 @@ fn validate_owned_inputs(op: BinaryOp, inputs: &[Matrix]) {
         assert_eq!(inputs.len(), 2, "binary operation requires two inputs");
     }
     validate_shapes(op, inputs.iter());
+}
+
+impl GraphNode for BinaryNode {
+    fn forward(&mut self, inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        vec![self.forward_owned(inputs, runtime)]
+    }
+
+    fn backward(&mut self, _gradients: Vec<Matrix>, _runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        panic!("inference BinaryNode does not support backward; use TrainingBinaryNode")
+    }
+
+    fn learn(&mut self, _config: LearnConfig, _runtime: &mut CudaRuntime) {}
+
+    fn clear_cache(&mut self, _runtime: &mut CudaRuntime) {}
+}
+
+impl GraphNode for TrainingBinaryNode {
+    fn forward(&mut self, inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        vec![TrainingBinaryNode::forward(self, inputs, runtime)]
+    }
+
+    fn backward(&mut self, mut gradients: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert_eq!(
+            gradients.len(),
+            1,
+            "BinaryNode backward expects one gradient"
+        );
+        TrainingBinaryNode::backward(self, gradients.pop().unwrap(), runtime)
+    }
+
+    fn learn(&mut self, _config: LearnConfig, _runtime: &mut CudaRuntime) {}
+
+    fn clear_cache(&mut self, runtime: &mut CudaRuntime) {
+        TrainingBinaryNode::clear_cache(self, runtime);
+    }
 }
 
 fn validate_shapes<'a>(op: BinaryOp, mut inputs: impl Iterator<Item = &'a Matrix>) {

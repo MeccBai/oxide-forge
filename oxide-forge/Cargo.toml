@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 description = "A purpose-built Rust/CUDA neural network runtime powered by CUDA-Oxide"
 
+[features]
+cuda-tests = []
+
+[[test]]
+name = "graph_nodes"
+path = "tests/graph_nodes.rs"
+required-features = ["cuda-tests"]
+
 [dependencies]
 cuda-device.workspace = true
 cuda-host.workspace = true

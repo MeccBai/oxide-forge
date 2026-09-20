@@ -1,4 +1,5 @@
 use crate::cuda::{CudaRuntime, container::Matrix};
+use crate::graph::{GraphNode, LearnConfig};
 
 use super::{SingleCache, SingleNode, SingleType, TrainingSingleNode};
 
@@ -70,7 +71,7 @@ impl TrainingSingleNode {
 
         match self.node.op {
             SingleType::Scale(scale) => {
-                output_gradient.scale(scale, runtime);
+                output_gradient.scale(scale, runtime, None);
                 output_gradient
             }
             SingleType::Transpose => self.node.forward(output_gradient, runtime),
@@ -84,11 +85,12 @@ impl TrainingSingleNode {
                     unreachable!()
                 };
                 let mut derivative = input;
-                derivative.for_each(runtime, move |value| activation.derivative(value));
+                derivative.for_each(runtime, move |value| activation.derivative(value), None);
                 output_gradient.binary_assign(
                     &derivative,
                     move |gradient, derivative| gradient * derivative,
                     runtime,
+                    None,
                 );
                 runtime.recycle_matrix(derivative);
                 output_gradient
@@ -150,12 +152,57 @@ impl TrainingSingleNode {
 fn apply_in_place(op: SingleType, matrix: &mut Matrix, runtime: &CudaRuntime) {
     match op {
         SingleType::Activation(activation) => {
-            matrix.for_each(runtime, move |value| activation.forward(value))
+            matrix.for_each(runtime, move |value| activation.forward(value), None)
         }
-        SingleType::Softmax => matrix.softmax_rows(runtime),
-        SingleType::RmsNorm => matrix.rms_norm(runtime),
-        SingleType::LayerNorm => matrix.layer_norm(runtime),
-        SingleType::Scale(scale) => matrix.scale(scale, runtime),
+        SingleType::Softmax => matrix.softmax_rows(runtime, None),
+        SingleType::RmsNorm => matrix.rms_norm(runtime, None),
+        SingleType::LayerNorm => matrix.layer_norm(runtime, None),
+        SingleType::Scale(scale) => matrix.scale(scale, runtime, None),
         SingleType::Transpose => unreachable!("transpose is not an in-place operation"),
+    }
+}
+
+impl GraphNode for SingleNode {
+    fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert_eq!(inputs.len(), 1, "SingleNode forward expects one matrix");
+        vec![SingleNode::forward(self, inputs.pop().unwrap(), runtime)]
+    }
+
+    fn backward(&mut self, _gradients: Vec<Matrix>, _runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        panic!("inference SingleNode does not support backward; use TrainingSingleNode")
+    }
+
+    fn learn(&mut self, _config: LearnConfig, _runtime: &mut CudaRuntime) {}
+
+    fn clear_cache(&mut self, _runtime: &mut CudaRuntime) {}
+}
+
+impl GraphNode for TrainingSingleNode {
+    fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert_eq!(inputs.len(), 1, "SingleNode forward expects one matrix");
+        vec![TrainingSingleNode::forward(
+            self,
+            inputs.pop().unwrap(),
+            runtime,
+        )]
+    }
+
+    fn backward(&mut self, mut gradients: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert_eq!(
+            gradients.len(),
+            1,
+            "SingleNode backward expects one gradient"
+        );
+        vec![TrainingSingleNode::backward(
+            self,
+            gradients.pop().unwrap(),
+            runtime,
+        )]
+    }
+
+    fn learn(&mut self, _config: LearnConfig, _runtime: &mut CudaRuntime) {}
+
+    fn clear_cache(&mut self, runtime: &mut CudaRuntime) {
+        TrainingSingleNode::clear_cache(self, runtime);
     }
 }

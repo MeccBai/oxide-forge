@@ -59,6 +59,158 @@ pub(super) struct DeviceSliceMutDescriptor<T> {
     len: usize,
 }
 
+#[repr(C)]
+pub(super) struct MatrixBatchDescriptor<T> {
+    pub(super) ptr: *const T,
+    pub(super) len: usize,
+    pub(super) rows: usize,
+    pub(super) cols: usize,
+    pub(super) row_stride: usize,
+    pub(super) batch_stride: usize,
+    pub(super) batches: usize,
+}
+
+impl<T> Copy for MatrixBatchDescriptor<T> {}
+impl<T> Clone for MatrixBatchDescriptor<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+#[repr(C)]
+pub(super) struct MatrixBatchMutDescriptor<T> {
+    pub(super) ptr: *mut T,
+    pub(super) len: usize,
+    pub(super) rows: usize,
+    pub(super) cols: usize,
+    pub(super) row_stride: usize,
+    pub(super) batch_stride: usize,
+    pub(super) batches: usize,
+}
+
+impl<T> Copy for MatrixBatchMutDescriptor<T> {}
+impl<T> Clone for MatrixBatchMutDescriptor<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> MatrixBatchMutDescriptor<T> {
+    #[inline(always)]
+    pub(super) fn write(&self, index: usize, value: T) {
+        debug_assert!(index < self.len);
+        unsafe { self.ptr.add(index).write(value) };
+    }
+}
+
+pub(crate) struct MatrixBatchSpan<'a, T> {
+    descriptor: MatrixBatchDescriptor<T>,
+    _borrow: PhantomData<&'a [T]>,
+}
+
+impl<'a, T> MatrixBatchSpan<'a, T> {
+    pub(super) fn from_buffer(
+        buffer: &'a DeviceBuffer<T>,
+        offset: usize,
+        rows: usize,
+        cols: usize,
+        row_stride: usize,
+        batch_stride: usize,
+        batches: usize,
+    ) -> Self {
+        check_matrix_batch_range(
+            buffer.len(),
+            offset,
+            rows,
+            cols,
+            row_stride,
+            batch_stride,
+            batches,
+        );
+        Self {
+            descriptor: MatrixBatchDescriptor {
+                ptr: offset_ptr::<T>(buffer.cu_deviceptr(), offset) as usize as *const T,
+                len: buffer.len() - offset,
+                rows,
+                cols,
+                row_stride,
+                batch_stride,
+                batches,
+            },
+            _borrow: PhantomData,
+        }
+    }
+
+    pub(super) fn descriptor(&self) -> MatrixBatchDescriptor<T> {
+        self.descriptor
+    }
+}
+
+pub(crate) struct MatrixBatchSpanMut<'a, T> {
+    descriptor: MatrixBatchMutDescriptor<T>,
+    _borrow: PhantomData<&'a mut [T]>,
+}
+
+impl<'a, T> MatrixBatchSpanMut<'a, T> {
+    pub(super) fn from_buffer(
+        buffer: &'a mut DeviceBuffer<T>,
+        offset: usize,
+        rows: usize,
+        cols: usize,
+        row_stride: usize,
+        batch_stride: usize,
+        batches: usize,
+    ) -> Self {
+        check_matrix_batch_range(
+            buffer.len(),
+            offset,
+            rows,
+            cols,
+            row_stride,
+            batch_stride,
+            batches,
+        );
+        Self {
+            descriptor: MatrixBatchMutDescriptor {
+                ptr: offset_ptr::<T>(buffer.cu_deviceptr(), offset) as usize as *mut T,
+                len: buffer.len() - offset,
+                rows,
+                cols,
+                row_stride,
+                batch_stride,
+                batches,
+            },
+            _borrow: PhantomData,
+        }
+    }
+
+    pub(super) fn descriptor(&self) -> MatrixBatchMutDescriptor<T> {
+        self.descriptor
+    }
+}
+
+fn check_matrix_batch_range(
+    buffer_len: usize,
+    offset: usize,
+    rows: usize,
+    cols: usize,
+    row_stride: usize,
+    batch_stride: usize,
+    batches: usize,
+) {
+    assert!(rows > 0 && cols > 0 && batches > 0);
+    let end = offset
+        .checked_add(
+            (batches - 1)
+                .checked_mul(batch_stride)
+                .expect("batch stride overflow"),
+        )
+        .and_then(|value| value.checked_add((rows - 1).checked_mul(row_stride)?))
+        .and_then(|value| value.checked_add(cols))
+        .expect("matrix span range overflow");
+    assert!(end <= buffer_len, "matrix span exceeds its device buffer");
+}
+
 impl<T> Copy for DeviceSliceMutDescriptor<T> {}
 
 impl<T> Clone for DeviceSliceMutDescriptor<T> {
@@ -80,6 +232,11 @@ impl<T> DeviceSliceMutDescriptor<T> {
     #[inline(always)]
     pub(super) fn len(&self) -> usize {
         self.len
+    }
+
+    #[inline(always)]
+    pub(super) fn as_mut_ptr(&self) -> *mut T {
+        self.ptr
     }
 
     /// Writes an element after device code has established `index < len()`.
@@ -133,43 +290,42 @@ impl<'a, T> DeviceSpan<'a, T> {
     pub(super) fn chunks(buffer: &'a DeviceBuffer<T>, chunk_size: usize) -> Vec<Self> {
         Self::from_buffer(buffer, 0, buffer.len()).split(chunk_size)
     }
-
-    pub fn to_buffer_async(&self, runtime: &mut CudaRuntime) -> DeviceBuffer<f32> {
-        copy_to_buffer_async(self.ptr as usize as u64, self.len, runtime)
-    }
 }
 
 impl DeviceSpan<'_, f32> {
-    pub fn to_buffer(&self, runtime: &mut CudaRuntime) -> DeviceBuffer<f32> {
-        copy_to_buffer(self.ptr as usize as u64, self.len, runtime)
-    }
-
-    pub(crate) fn to_buffer_on(
+    pub(crate) fn to_buffer(
         &self,
         runtime: &mut CudaRuntime,
-        stream: &cuda_core::CudaStream,
+        stream: Option<&cuda_core::CudaStream>,
     ) -> DeviceBuffer<f32> {
-        copy_to_buffer_on(self.ptr as usize as u64, self.len, runtime, stream)
+        copy_to_buffer(self.ptr as usize as u64, self.len, runtime, stream)
     }
 
-    pub fn sum(&self, runtime: &mut CudaRuntime) -> f32 {
-        self.map_reduce(runtime, 0.0, move |value| value, move |lhs, rhs| lhs + rhs)
+    pub fn sum(&self, runtime: &mut CudaRuntime, stream: Option<&CudaStream>) -> f32 {
+        self.map_reduce(
+            runtime,
+            0.0,
+            move |value| value,
+            move |lhs, rhs| lhs + rhs,
+            stream,
+        )
     }
 
-    pub fn max(&self, runtime: &mut CudaRuntime) -> f32 {
+    pub fn max(&self, runtime: &mut CudaRuntime, stream: Option<&CudaStream>) -> f32 {
         self.map_reduce(
             runtime,
             f32::NEG_INFINITY,
             move |value| value,
             move |lhs, rhs| lhs.max(rhs),
+            stream,
         )
     }
 
-    pub fn map_sum<F>(&self, runtime: &mut CudaRuntime, f: F) -> f32
+    pub fn map_sum<F>(&self, runtime: &mut CudaRuntime, f: F, stream: Option<&CudaStream>) -> f32
     where
         F: Fn(f32) -> f32 + Copy,
     {
-        self.map_reduce(runtime, 0.0, f, move |lhs, rhs| lhs + rhs)
+        self.map_reduce(runtime, 0.0, f, move |lhs, rhs| lhs + rhs, stream)
     }
 
     pub fn map_reduce<FM, FR>(
@@ -178,12 +334,13 @@ impl DeviceSpan<'_, f32> {
         identity: f32,
         map: FM,
         reduce: FR,
+        stream: Option<&CudaStream>,
     ) -> f32
     where
         FM: Fn(f32) -> f32 + Copy,
         FR: Fn(f32, f32) -> f32 + Copy,
     {
-        map_reduce_descriptor(self.descriptor(), runtime, identity, map, reduce)
+        map_reduce_descriptor(self.descriptor(), runtime, identity, map, reduce, stream)
     }
 
     pub fn zip_map_reduce<FM, FR>(
@@ -193,6 +350,7 @@ impl DeviceSpan<'_, f32> {
         identity: f32,
         map: FM,
         reduce: FR,
+        stream: Option<&CudaStream>,
     ) -> f32
     where
         FM: Fn(f32, f32) -> f32 + Copy,
@@ -205,6 +363,7 @@ impl DeviceSpan<'_, f32> {
             identity,
             map,
             reduce,
+            stream,
         )
     }
 }
@@ -295,30 +454,20 @@ impl<'a, T> DeviceSpanMut<'a, T> {
 
 impl DeviceSpanMut<'_, f32> {
     /// Copies this span into a new independently-owned device buffer.
-    pub fn to_buffer(&self, runtime: &mut CudaRuntime) -> DeviceBuffer<f32> {
+    pub(crate) fn to_buffer(
+        &self,
+        runtime: &mut CudaRuntime,
+        stream: Option<&CudaStream>,
+    ) -> DeviceBuffer<f32> {
         copy_to_buffer(
             self.descriptor.ptr as usize as u64,
             self.descriptor.len,
             runtime,
+            stream,
         )
     }
 
-    pub fn to_buffer_async(&self, runtime: &mut CudaRuntime) -> DeviceBuffer<f32> {
-        copy_to_buffer_async(
-            self.descriptor.ptr as usize as u64,
-            self.descriptor.len,
-            runtime,
-        )
-    }
-
-    pub fn for_each<F>(&mut self, runtime: &CudaRuntime, f: F)
-    where
-        F: Fn(f32) -> f32 + Copy,
-    {
-        self.for_each_on(runtime, runtime.stream(), f);
-    }
-
-    pub(crate) fn for_each_on<F>(&mut self, runtime: &CudaRuntime, stream: &CudaStream, f: F)
+    pub fn for_each<F>(&mut self, runtime: &CudaRuntime, f: F, stream: Option<&CudaStream>)
     where
         F: Fn(f32) -> f32 + Copy,
     {
@@ -333,34 +482,60 @@ impl DeviceSpanMut<'_, f32> {
             .prepare_slice_for_each::<F>(config)
             .unwrap();
 
+        let stream = runtime.execution_stream(stream);
         runtime
             .module()
             .slice_for_each::<F>(stream, &prepared, self.descriptor(), elements_per_thread, f)
             .unwrap();
     }
 
-    pub fn scale(&mut self, value: f32, runtime: &CudaRuntime) {
-        self.for_each(runtime, move |x| x * value);
+    pub(crate) fn set<F>(&mut self, runtime: &CudaRuntime, f: F, stream: Option<&CudaStream>)
+    where
+        F: Fn(usize) -> f32 + Copy,
+    {
+        if self.is_empty() {
+            return;
+        }
+
+        let (config, elements_per_thread) =
+            runtime.get_elementwise_launch_config(self.len(), DEFAULT_BLOCK_SIZE);
+        let prepared = runtime.module().prepare_span_set::<F>(config).unwrap();
+        let stream = runtime.execution_stream(stream);
+        runtime
+            .module()
+            .span_set::<F>(stream, &prepared, self.descriptor(), elements_per_thread, f)
+            .unwrap();
     }
 
-    pub fn sum(&self, runtime: &mut CudaRuntime) -> f32 {
-        self.map_reduce(runtime, 0.0, move |value| value, move |lhs, rhs| lhs + rhs)
+    pub fn scale(&mut self, value: f32, runtime: &CudaRuntime, stream: Option<&CudaStream>) {
+        self.for_each(runtime, move |x| x * value, stream);
     }
 
-    pub fn max(&self, runtime: &mut CudaRuntime) -> f32 {
+    pub fn sum(&self, runtime: &mut CudaRuntime, stream: Option<&CudaStream>) -> f32 {
+        self.map_reduce(
+            runtime,
+            0.0,
+            move |value| value,
+            move |lhs, rhs| lhs + rhs,
+            stream,
+        )
+    }
+
+    pub fn max(&self, runtime: &mut CudaRuntime, stream: Option<&CudaStream>) -> f32 {
         self.map_reduce(
             runtime,
             f32::NEG_INFINITY,
             move |value| value,
             move |lhs, rhs| lhs.max(rhs),
+            stream,
         )
     }
 
-    pub fn map_sum<F>(&self, runtime: &mut CudaRuntime, f: F) -> f32
+    pub fn map_sum<F>(&self, runtime: &mut CudaRuntime, f: F, stream: Option<&CudaStream>) -> f32
     where
         F: Fn(f32) -> f32 + Copy,
     {
-        self.map_reduce(runtime, 0.0, f, move |lhs, rhs| lhs + rhs)
+        self.map_reduce(runtime, 0.0, f, move |lhs, rhs| lhs + rhs, stream)
     }
 
     pub fn map_reduce<FM, FR>(
@@ -369,12 +544,20 @@ impl DeviceSpanMut<'_, f32> {
         identity: f32,
         map: FM,
         reduce: FR,
+        stream: Option<&CudaStream>,
     ) -> f32
     where
         FM: Fn(f32) -> f32 + Copy,
         FR: Fn(f32, f32) -> f32 + Copy,
     {
-        map_reduce_descriptor(self.read_descriptor(), runtime, identity, map, reduce)
+        map_reduce_descriptor(
+            self.read_descriptor(),
+            runtime,
+            identity,
+            map,
+            reduce,
+            stream,
+        )
     }
 
     pub fn zip_map_reduce<FM, FR>(
@@ -384,6 +567,7 @@ impl DeviceSpanMut<'_, f32> {
         identity: f32,
         map: FM,
         reduce: FR,
+        stream: Option<&CudaStream>,
     ) -> f32
     where
         FM: Fn(f32, f32) -> f32 + Copy,
@@ -396,6 +580,7 @@ impl DeviceSpanMut<'_, f32> {
             identity,
             map,
             reduce,
+            stream,
         )
     }
 }
@@ -407,6 +592,7 @@ fn zip_map_reduce_descriptors<FM, FR>(
     identity: f32,
     map: FM,
     reduce: FR,
+    stream: Option<&CudaStream>,
 ) -> f32
 where
     FM: Fn(f32, f32) -> f32 + Copy,
@@ -417,8 +603,8 @@ where
         return identity;
     }
 
-    let input = launch_zip_map_reduce(lhs, rhs, runtime, identity, map, reduce);
-    let result = input.to_host_vec(runtime.stream()).unwrap()[0];
+    let input = launch_zip_map_reduce(lhs, rhs, runtime, identity, map, reduce, stream);
+    let result = input.to_host_vec(runtime.execution_stream(stream)).unwrap()[0];
     runtime.recycle_buffer(input);
     result
 }
@@ -429,6 +615,7 @@ fn map_reduce_descriptor<FM, FR>(
     identity: f32,
     map: FM,
     reduce: FR,
+    stream: Option<&CudaStream>,
 ) -> f32
 where
     FM: Fn(f32) -> f32 + Copy,
@@ -438,8 +625,8 @@ where
         return identity;
     }
 
-    let input = launch_map_reduce(source, source.len(), runtime, identity, map, reduce);
-    let result = input.to_host_vec(runtime.stream()).unwrap()[0];
+    let input = launch_map_reduce(source, source.len(), runtime, identity, map, reduce, stream);
+    let result = input.to_host_vec(runtime.execution_stream(stream)).unwrap()[0];
     runtime.recycle_buffer(input);
     result
 }
@@ -451,6 +638,7 @@ fn launch_map_reduce<FM, FR>(
     identity: f32,
     map: FM,
     reduce: FR,
+    stream: Option<&CudaStream>,
 ) -> DeviceBuffer<f32>
 where
     FM: Fn(f32) -> f32 + Copy,
@@ -465,10 +653,11 @@ where
         .module()
         .prepare_map_reduce::<FM, FR>(config)
         .unwrap();
+    let stream = runtime.execution_stream(stream);
     runtime
         .module()
         .map_reduce::<FM, FR>(
-            runtime.stream(),
+            stream,
             &prepared,
             source,
             output_span.descriptor(),
@@ -488,6 +677,7 @@ fn launch_zip_map_reduce<FM, FR>(
     identity: f32,
     map: FM,
     reduce: FR,
+    stream: Option<&CudaStream>,
 ) -> DeviceBuffer<f32>
 where
     FM: Fn(f32, f32) -> f32 + Copy,
@@ -502,10 +692,11 @@ where
         .module()
         .prepare_zip_map_reduce::<FM, FR>(config)
         .unwrap();
+    let stream = runtime.execution_stream(stream);
     runtime
         .module()
         .zip_map_reduce::<FM, FR>(
-            runtime.stream(),
+            stream,
             &prepared,
             lhs,
             rhs,
@@ -547,59 +738,18 @@ fn split_spans<T>(base: u64, len: usize, chunk_size: usize) -> Vec<(u64, usize)>
     spans
 }
 
-fn copy_to_buffer(src: u64, len: usize, runtime: &mut CudaRuntime) -> DeviceBuffer<f32> {
-    let result = runtime.get_uninit_buffer(len);
-    if len == 0 {
-        return result;
-    }
-
-    let byte_len = len
-        .checked_mul(core::mem::size_of::<f32>())
-        .expect("device span copy size overflow");
-    unsafe {
-        memory::memcpy_dtod_async(
-            result.cu_deviceptr(),
-            src,
-            byte_len,
-            runtime.stream().cu_stream(),
-        )
-        .unwrap();
-    }
-    result
-}
-
-fn copy_to_buffer_async(src: u64, len: usize, runtime: &mut CudaRuntime) -> DeviceBuffer<f32> {
-    let result = runtime.get_uninit_buffer(len);
-    if len == 0 {
-        return result;
-    }
-
-    let byte_len = len
-        .checked_mul(core::mem::size_of::<f32>())
-        .expect("device span copy size overflow");
-    unsafe {
-        memory::memcpy_dtod_async(
-            result.cu_deviceptr(),
-            src,
-            byte_len,
-            runtime.stream().cu_stream(),
-        )
-        .unwrap();
-    }
-    result
-}
-
-fn copy_to_buffer_on(
+fn copy_to_buffer(
     src: u64,
     len: usize,
     runtime: &mut CudaRuntime,
-    stream: &cuda_core::CudaStream,
+    stream: Option<&CudaStream>,
 ) -> DeviceBuffer<f32> {
     let result = runtime.get_uninit_buffer(len);
-    stream.join(runtime.stream()).unwrap();
+    let stream = runtime.execution_stream(stream);
     if len == 0 {
         return result;
     }
+
     let byte_len = len
         .checked_mul(core::mem::size_of::<f32>())
         .expect("device span copy size overflow");
@@ -611,7 +761,7 @@ fn copy_to_buffer_on(
 }
 
 impl CudaRuntime {
-    pub(crate) fn concat_buffers_from_span_on(
+    pub(crate) fn concat_buffers_from_span(
         &mut self,
         spans: &[DeviceSpan<'_, f32>],
         stream: Option<&cuda_core::CudaStream>,

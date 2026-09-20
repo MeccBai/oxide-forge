@@ -1,8 +1,9 @@
 use crate::cuda::{CudaRuntime, container::Matrix};
+use crate::graph::{GraphNode, LearnConfig};
 
 use super::{
-    linear::{Activation, Linear, LinearMomentum},
-    metadata::HostData,
+    linear::{Activation, Linear, LinearTrainingState},
+    metadata::{HostData, HostDataCursor},
     node::{BinaryNode, BinaryOp, SingleNode, SingleType, TrainingBinaryNode, TrainingSingleNode},
 };
 
@@ -39,15 +40,21 @@ impl InferenceSwiglu {
         data.extend(self.down.get_data(runtime));
         data
     }
+
+    pub fn set_data(&mut self, data: &mut HostDataCursor, runtime: &CudaRuntime) {
+        self.gate.set_data(data, runtime);
+        self.up.set_data(data, runtime);
+        self.down.set_data(data, runtime);
+    }
 }
 
 pub struct TrainingSwiglu {
     gate: Linear,
     up: Linear,
     down: Linear,
-    gate_optimizer: LinearMomentum,
-    up_optimizer: LinearMomentum,
-    down_optimizer: LinearMomentum,
+    gate_training: LinearTrainingState,
+    up_training: LinearTrainingState,
+    down_training: LinearTrainingState,
     activation: TrainingSingleNode,
     product: TrainingBinaryNode,
     cache: Option<SwigluCache>,
@@ -64,9 +71,9 @@ impl TrainingSwiglu {
             gate: identity_linear(gate),
             up: identity_linear(up),
             down: identity_linear(down),
-            gate_optimizer: LinearMomentum::default(),
-            up_optimizer: LinearMomentum::default(),
-            down_optimizer: LinearMomentum::default(),
+            gate_training: LinearTrainingState::default(),
+            up_training: LinearTrainingState::default(),
+            down_training: LinearTrainingState::default(),
             activation: TrainingSingleNode::new(SingleType::Activation(Activation::Silu)),
             product: TrainingBinaryNode::new(BinaryOp::Mul),
             cache: None,
@@ -88,15 +95,8 @@ impl TrainingSwiglu {
         output
     }
 
-    pub fn backward(
-        &mut self,
-        output_gradient: &Matrix,
-        learning_rate: f32,
-        runtime: &mut CudaRuntime,
-    ) -> Matrix {
-        let input_gradient = self.backward_accumulate(output_gradient, runtime);
-        self.step(learning_rate, 0.0, 1, runtime);
-        input_gradient
+    pub fn backward(&mut self, output_gradient: &Matrix, runtime: &mut CudaRuntime) -> Matrix {
+        self.backward_accumulate(output_gradient, runtime)
     }
 
     pub fn backward_accumulate(
@@ -110,7 +110,7 @@ impl TrainingSwiglu {
             .expect("SwiGLU forward must run before backward");
 
         let hidden_gradient = self.down.input_gradient(output_gradient, runtime, None);
-        self.down_optimizer
+        self.down_training
             .accumulate(&cache.hidden, output_gradient, None, runtime);
 
         let [gate_activation_gradient, up_gradient]: [Matrix; 2] = self
@@ -122,9 +122,9 @@ impl TrainingSwiglu {
 
         let gate_input_gradient = self.gate.input_gradient(&gate_gradient, runtime, None);
         let up_input_gradient = self.up.input_gradient(&up_gradient, runtime, None);
-        self.gate_optimizer
+        self.gate_training
             .accumulate(&cache.input, &gate_gradient, None, runtime);
-        self.up_optimizer
+        self.up_training
             .accumulate(&cache.input, &up_gradient, None, runtime);
 
         runtime.recycle_matrix(gate_gradient);
@@ -136,19 +136,19 @@ impl TrainingSwiglu {
             .forward_owned(vec![gate_input_gradient, up_input_gradient], runtime)
     }
 
-    pub fn step(
+    pub fn learn(
         &mut self,
         learning_rate: f32,
         momentum: f32,
         batch_len: usize,
         runtime: &mut CudaRuntime,
     ) {
-        self.gate_optimizer
-            .step(&mut self.gate, learning_rate, momentum, batch_len, runtime);
-        self.up_optimizer
-            .step(&mut self.up, learning_rate, momentum, batch_len, runtime);
-        self.down_optimizer
-            .step(&mut self.down, learning_rate, momentum, batch_len, runtime);
+        self.gate_training
+            .learn(&mut self.gate, learning_rate, momentum, batch_len, runtime);
+        self.up_training
+            .learn(&mut self.up, learning_rate, momentum, batch_len, runtime);
+        self.down_training
+            .learn(&mut self.down, learning_rate, momentum, batch_len, runtime);
     }
 
     pub fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
@@ -156,6 +156,12 @@ impl TrainingSwiglu {
         data.extend(self.up.get_data(runtime));
         data.extend(self.down.get_data(runtime));
         data
+    }
+
+    pub fn set_data(&mut self, data: &mut HostDataCursor, runtime: &CudaRuntime) {
+        self.gate.set_data(data, runtime);
+        self.up.set_data(data, runtime);
+        self.down.set_data(data, runtime);
     }
 
     pub fn clear_cache(&mut self, runtime: &mut CudaRuntime) {
@@ -170,4 +176,73 @@ impl TrainingSwiglu {
 
 fn identity_linear(weights: Matrix) -> Linear {
     Linear::new(weights, None, Activation::Identity)
+}
+
+impl GraphNode for InferenceSwiglu {
+    fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert_eq!(inputs.len(), 1, "SwiGLU forward expects one matrix");
+        let input = inputs.pop().unwrap();
+        let output = InferenceSwiglu::forward(self, &input, runtime);
+        runtime.recycle_matrix(input);
+        vec![output]
+    }
+
+    fn backward(&mut self, _gradients: Vec<Matrix>, _runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        panic!("inference SwiGLU does not support backward; use TrainingSwiglu")
+    }
+
+    fn learn(&mut self, _config: LearnConfig, _runtime: &mut CudaRuntime) {
+        panic!("inference SwiGLU does not support learning; use TrainingSwiglu")
+    }
+
+    fn clear_cache(&mut self, _runtime: &mut CudaRuntime) {}
+
+    fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
+        InferenceSwiglu::get_data(self, runtime)
+    }
+
+    fn set_data(&mut self, data: &mut HostDataCursor, runtime: &CudaRuntime) {
+        InferenceSwiglu::set_data(self, data, runtime);
+    }
+}
+
+impl GraphNode for TrainingSwiglu {
+    fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert_eq!(inputs.len(), 1, "SwiGLU forward expects one matrix");
+        vec![TrainingSwiglu::forward(
+            self,
+            inputs.pop().unwrap(),
+            runtime,
+        )]
+    }
+
+    fn backward(&mut self, mut gradients: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert_eq!(gradients.len(), 1, "SwiGLU backward expects one gradient");
+        let output_gradient = gradients.pop().unwrap();
+        let input_gradient = self.backward_accumulate(&output_gradient, runtime);
+        runtime.recycle_matrix(output_gradient);
+        vec![input_gradient]
+    }
+
+    fn learn(&mut self, config: LearnConfig, runtime: &mut CudaRuntime) {
+        TrainingSwiglu::learn(
+            self,
+            config.learning_rate,
+            config.momentum,
+            config.batch_len,
+            runtime,
+        );
+    }
+
+    fn clear_cache(&mut self, runtime: &mut CudaRuntime) {
+        TrainingSwiglu::clear_cache(self, runtime);
+    }
+
+    fn get_data(&self, runtime: &CudaRuntime) -> Vec<HostData> {
+        TrainingSwiglu::get_data(self, runtime)
+    }
+
+    fn set_data(&mut self, data: &mut HostDataCursor, runtime: &CudaRuntime) {
+        TrainingSwiglu::set_data(self, data, runtime);
+    }
 }

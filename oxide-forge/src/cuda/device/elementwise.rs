@@ -1,13 +1,14 @@
-use super::common::random;
 use crate::cuda::span;
 use cuda_device::{device, thread};
 
 #[device]
-pub(super) fn slice_set_device(
+pub(super) fn span_set_device<F>(
     target: span::DeviceSliceMutDescriptor<f32>,
     elements_per_thread: usize,
-    value: f32,
-) {
+    f: F,
+) where
+    F: Fn(usize) -> f32 + Copy,
+{
     let thread_index = thread::index_1d().get();
     let stride = thread::gridDim_x() as usize * thread::blockDim_x() as usize;
 
@@ -15,49 +16,7 @@ pub(super) fn slice_set_device(
         let index = thread_index + stride * iteration;
 
         if index < target.len() {
-            target.write(index, value);
-        }
-    }
-}
-
-#[device]
-pub(super) fn slice_set_seq_device(
-    target: span::DeviceSliceMutDescriptor<f32>,
-    elements_per_thread: usize,
-    dir: bool,
-    start: f32,
-    step: f32,
-) {
-    let thread_index = thread::index_1d().get();
-    let stride = thread::gridDim_x() as usize * thread::blockDim_x() as usize;
-    for iteration in 0..elements_per_thread {
-        let index = thread_index + stride * iteration;
-        if index < target.len() {
-            let value = if dir {
-                index as f32 * step + start
-            } else {
-                (target.len() - index) as f32 * step - start
-            };
-
-            target.write(index, value);
-        }
-    }
-}
-
-#[device]
-pub(super) fn slice_set_random_device(
-    target: span::DeviceSliceMutDescriptor<f32>,
-    elements_per_thread: usize,
-    seed: u32,
-) {
-    let thread_index = thread::index_1d().get();
-    let stride = thread::gridDim_x() as usize * thread::blockDim_x() as usize;
-
-    for iteration in 0..elements_per_thread {
-        let index = thread_index + stride * iteration;
-        if index < target.len() {
-            let rand = random(seed + index as u32);
-            target.write(index, (rand as f32) / (u32::MAX as f32));
+            target.write(index, f(index));
         }
     }
 }

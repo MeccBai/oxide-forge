@@ -8,13 +8,14 @@ use crate::cuda::runtime::CudaRuntime;
 use crate::net::linear::{Linear, LinearMetadata};
 use crate::net::metadata::{HostData, MatrixMetadata, MetadataCursor, VectorMetadata};
 use crate::net::mlp::{InferenceMLP, MlpExecutor, MlpMetadata, TrainingMlp};
-use crate::net::transformer::encoder::{
-    InferenceTransformer, TrainingTransformer, TransformerMetadata,
+use crate::net::transformer::{
+    InferenceEncoder, PositionEncoding, PositionEncodingMetadata, TrainingEncoder,
+    TransformerMetadata,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const SCALAR_TYPE: &str = "f32_le";
 const LINEAR_MODEL_TYPE: &str = "linear";
 const MLP_MODEL_TYPE: &str = "mlp";
@@ -136,7 +137,7 @@ pub fn load_training_mlp<P: AsRef<Path>>(
 }
 
 pub fn dump_transformer<const HEADS: usize, P: AsRef<Path>>(
-    model: &InferenceTransformer<HEADS>,
+    model: &InferenceEncoder<HEADS>,
     path: P,
     runtime: &CudaRuntime,
 ) -> CheckpointResult<()> {
@@ -147,14 +148,12 @@ pub fn dump_transformer<const HEADS: usize, P: AsRef<Path>>(
     )
 }
 
-pub fn load_transformer<const HEADS: usize, P, F>(
+pub fn load_transformer<const HEADS: usize, P>(
     path: P,
-    position_encoding: F,
     runtime: &CudaRuntime,
-) -> CheckpointResult<InferenceTransformer<HEADS>>
+) -> CheckpointResult<InferenceEncoder<HEADS>>
 where
     P: AsRef<Path>,
-    F: Fn(&Matrix, &mut CudaRuntime) -> Matrix + 'static,
 {
     let (metadata, mut reader) = open_transformer(path.as_ref())?;
     let transformer = &metadata.transformer;
@@ -162,9 +161,11 @@ where
     let q_matrix = load_linear_parameter(&transformer.query, &mut reader, runtime)?;
     let k_matrix = load_linear_parameter(&transformer.key, &mut reader, runtime)?;
     let v_matrix = load_linear_parameter(&transformer.value, &mut reader, runtime)?;
+    let position_encoding =
+        load_position_encoding(&transformer.position_encoding, &mut reader, runtime)?;
     let (layers, residual) = load_mlp_parameters(&transformer.feed_forward, &mut reader, runtime)?;
     let output_matrix = load_linear_parameter(&transformer.output, &mut reader, runtime)?;
-    Ok(InferenceTransformer::new(
+    Ok(InferenceEncoder::new(
         q_matrix,
         k_matrix,
         v_matrix,
@@ -177,7 +178,7 @@ where
 }
 
 pub fn dump_training_transformer<const HEADS: usize, P: AsRef<Path>>(
-    model: &TrainingTransformer<HEADS>,
+    model: &TrainingEncoder<HEADS>,
     path: P,
     runtime: &CudaRuntime,
 ) -> CheckpointResult<()> {
@@ -188,14 +189,12 @@ pub fn dump_training_transformer<const HEADS: usize, P: AsRef<Path>>(
     )
 }
 
-pub fn load_training_transformer<const HEADS: usize, P, F>(
+pub fn load_training_transformer<const HEADS: usize, P>(
     path: P,
-    position_encoding: F,
     runtime: &CudaRuntime,
-) -> CheckpointResult<TrainingTransformer<HEADS>>
+) -> CheckpointResult<TrainingEncoder<HEADS>>
 where
     P: AsRef<Path>,
-    F: Fn(&Matrix, &mut CudaRuntime) -> Matrix + 'static,
 {
     let (metadata, mut reader) = open_transformer(path.as_ref())?;
     let transformer = &metadata.transformer;
@@ -203,9 +202,11 @@ where
     let q_matrix = load_linear_parameter(&transformer.query, &mut reader, runtime)?;
     let k_matrix = load_linear_parameter(&transformer.key, &mut reader, runtime)?;
     let v_matrix = load_linear_parameter(&transformer.value, &mut reader, runtime)?;
+    let position_encoding =
+        load_position_encoding(&transformer.position_encoding, &mut reader, runtime)?;
     let (layers, residual) = load_mlp_parameters(&transformer.feed_forward, &mut reader, runtime)?;
     let output_matrix = load_linear_parameter(&transformer.output, &mut reader, runtime)?;
-    Ok(TrainingTransformer::new(
+    Ok(TrainingEncoder::new(
         q_matrix,
         k_matrix,
         v_matrix,
@@ -357,6 +358,19 @@ fn load_vector(
     Ok(runtime.vector_from_host(&values, None)?)
 }
 
+fn load_position_encoding(
+    metadata: &PositionEncodingMetadata,
+    reader: &mut ParameterReader,
+    runtime: &CudaRuntime,
+) -> CheckpointResult<PositionEncoding> {
+    Ok(match metadata {
+        PositionEncodingMetadata::Identity => PositionEncoding::Identity,
+        PositionEncodingMetadata::Additive { values } => {
+            PositionEncoding::Additive(load_matrix(values, reader, runtime)?)
+        }
+    })
+}
+
 fn validate_header(
     model_type: &str,
     expected_model_type: &str,
@@ -472,6 +486,15 @@ fn validate_transformer(
     validate_linear(&metadata.query, ranges)?;
     validate_linear(&metadata.key, ranges)?;
     validate_linear(&metadata.value, ranges)?;
+    if let PositionEncodingMetadata::Additive { values } = &metadata.position_encoding {
+        if values.cols != metadata.query.input_neurons {
+            return Err(invalid_data(
+                "additive position encoding width must match the embedding size",
+            )
+            .into());
+        }
+        ranges.matrix(values)?;
+    }
     validate_mlp(&metadata.feed_forward, ranges)?;
     validate_linear(&metadata.output, ranges)?;
 

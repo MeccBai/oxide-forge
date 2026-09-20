@@ -1,4 +1,5 @@
 use crate::cuda::{CudaRuntime, container::Matrix};
+use crate::graph::{GraphNode, LearnConfig};
 
 use super::{RowReduceNode, RowReduction, TrainingRowReduceNode};
 
@@ -19,7 +20,7 @@ impl RowReduceNode {
         runtime.recycle_matrix(input);
         let mut output = runtime.vector_into_matrix(output);
         if let RowReduction::Mean = self.reduction {
-            output.scale(1.0 / cols as f32, runtime);
+            output.scale(1.0 / cols as f32, runtime, None);
         }
         output
     }
@@ -56,12 +57,57 @@ impl TrainingRowReduceNode {
         let mut expanded = runtime.matrix_transpose(&expanded_t, None);
         runtime.recycle_matrix(expanded_t);
         if let RowReduction::Mean = self.node.reduction {
-            expanded.scale(1.0 / cols as f32, runtime);
+            expanded.scale(1.0 / cols as f32, runtime, None);
         }
         expanded
     }
 
     pub fn clear_cache(&mut self) {
         self.input_shape = None;
+    }
+}
+
+impl GraphNode for RowReduceNode {
+    fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert_eq!(inputs.len(), 1, "RowReduce forward expects one matrix");
+        vec![RowReduceNode::forward(self, inputs.pop().unwrap(), runtime)]
+    }
+
+    fn backward(&mut self, _gradients: Vec<Matrix>, _runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        panic!("inference RowReduceNode does not support backward; use TrainingRowReduceNode")
+    }
+
+    fn learn(&mut self, _config: LearnConfig, _runtime: &mut CudaRuntime) {}
+
+    fn clear_cache(&mut self, _runtime: &mut CudaRuntime) {}
+}
+
+impl GraphNode for TrainingRowReduceNode {
+    fn forward(&mut self, mut inputs: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert_eq!(inputs.len(), 1, "RowReduce forward expects one matrix");
+        vec![TrainingRowReduceNode::forward(
+            self,
+            inputs.pop().unwrap(),
+            runtime,
+        )]
+    }
+
+    fn backward(&mut self, mut gradients: Vec<Matrix>, runtime: &mut CudaRuntime) -> Vec<Matrix> {
+        assert_eq!(
+            gradients.len(),
+            1,
+            "RowReduce backward expects one gradient"
+        );
+        vec![TrainingRowReduceNode::backward(
+            self,
+            gradients.pop().unwrap(),
+            runtime,
+        )]
+    }
+
+    fn learn(&mut self, _config: LearnConfig, _runtime: &mut CudaRuntime) {}
+
+    fn clear_cache(&mut self, _runtime: &mut CudaRuntime) {
+        TrainingRowReduceNode::clear_cache(self);
     }
 }

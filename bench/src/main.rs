@@ -1,6 +1,6 @@
 use oxide_forge::cuda::{
     CudaRuntime,
-    InitType::{Random, Reserve},
+    InitType::Random,
 };
 use std::time::Instant;
 
@@ -49,7 +49,7 @@ fn main() {
     let mut mat2_c_s1 = runtime.matrix_multiply(&mat2_s[0], &matc_s[0], None);
     let mut mat2_c_s2 = runtime.matrix_multiply(&mat2_s[1], &matc_s[1], None);
 
-    mat2_c_s1.binary_assign(&mat2_c_s2, add, &runtime);
+    mat2_c_s1.binary_assign(&mat2_c_s2, add, &runtime, None);
 
     println!("mat2_c_s[0] shape: {:?}", mat2_c_s1.shape());
 }

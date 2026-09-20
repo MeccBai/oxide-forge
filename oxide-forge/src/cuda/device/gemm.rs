@@ -167,44 +167,46 @@ pub(super) fn matrix_multiply_strided_device(
     result_row_stride: usize,
 ) {
     matrix_multiply_batched_strided_device(
-        matrix_a,
-        matrix_b,
-        result,
-        inner,
-        rows,
-        cols,
-        1,
-        a_offset,
-        a_row_stride,
-        0,
-        b_offset,
-        b_row_stride,
-        0,
-        result_offset,
-        result_row_stride,
-        0,
+        span::MatrixBatchDescriptor {
+            ptr: unsafe { matrix_a.as_ptr().add(a_offset) },
+            len: matrix_a.len() - a_offset,
+            rows,
+            cols: inner,
+            row_stride: a_row_stride,
+            batch_stride: 0,
+            batches: 1,
+        },
+        span::MatrixBatchDescriptor {
+            ptr: unsafe { matrix_b.as_ptr().add(b_offset) },
+            len: matrix_b.len() - b_offset,
+            rows: inner,
+            cols,
+            row_stride: b_row_stride,
+            batch_stride: 0,
+            batches: 1,
+        },
+        span::MatrixBatchMutDescriptor {
+            ptr: unsafe { result.as_mut_ptr().add(result_offset) },
+            len: result.len() - result_offset,
+            rows,
+            cols,
+            row_stride: result_row_stride,
+            batch_stride: 0,
+            batches: 1,
+        },
     );
 }
 
 #[device]
 pub(super) fn matrix_multiply_batched_strided_device(
-    matrix_a: span::DeviceSliceDescriptor<f32>,
-    matrix_b: span::DeviceSliceDescriptor<f32>,
-    result: span::DeviceSliceMutDescriptor<f32>,
-    inner: usize,
-    rows: usize,
-    cols: usize,
-    batch_count: usize,
-    a_offset: usize,
-    a_row_stride: usize,
-    a_batch_stride: usize,
-    b_offset: usize,
-    b_row_stride: usize,
-    b_batch_stride: usize,
-    result_offset: usize,
-    result_row_stride: usize,
-    result_batch_stride: usize,
+    matrix_a: span::MatrixBatchDescriptor<f32>,
+    matrix_b: span::MatrixBatchDescriptor<f32>,
+    result: span::MatrixBatchMutDescriptor<f32>,
 ) {
+    let rows = matrix_a.rows;
+    let inner = matrix_a.cols;
+    let cols = matrix_b.cols;
+    let batch_count = matrix_a.batches;
     static mut MATA0: shared::SharedArray<f32, STAGE_SIZE> = shared::SharedArray::UNINIT;
     static mut MATA1: shared::SharedArray<f32, STAGE_SIZE> = shared::SharedArray::UNINIT;
     static mut MATB0: shared::SharedArray<f32, STAGE_SIZE> = shared::SharedArray::UNINIT;
@@ -238,8 +240,8 @@ pub(super) fn matrix_multiply_batched_strided_device(
     let b_stage1 = (&raw mut MATB1).cast::<f32>();
     let source_base = unsafe {
         (
-            matrix_a.as_ptr().add(a_offset + batch * a_batch_stride),
-            matrix_b.as_ptr().add(b_offset + batch * b_batch_stride),
+            matrix_a.ptr.add(batch * matrix_a.batch_stride),
+            matrix_b.ptr.add(batch * matrix_b.batch_stride),
         )
     };
     let initial = tile_sources(
@@ -252,8 +254,8 @@ pub(super) fn matrix_multiply_batched_strided_device(
         inner,
         rows,
         cols,
-        a_row_stride,
-        b_row_stride,
+        matrix_a.row_stride,
+        matrix_b.row_stride,
     );
 
     let mut a_buffer = unsafe {
@@ -295,8 +297,8 @@ pub(super) fn matrix_multiply_batched_strided_device(
                 inner,
                 rows,
                 cols,
-                a_row_stride,
-                b_row_stride,
+                matrix_a.row_stride,
+                matrix_b.row_stride,
             );
             unsafe {
                 a_buffer.copy_async(next.destination, next.a, next.a_valid, 4);
@@ -337,20 +339,13 @@ pub(super) fn matrix_multiply_batched_strided_device(
         let output_col = tile_col * TILE_SIZE + thread * 2 + register % 2;
         if active && output_row < rows && output_col < cols {
             result.write(
-                result_offset
-                    + batch * result_batch_stride
-                    + output_row * result_row_stride
-                    + output_col,
+                batch * result.batch_stride + output_row * result.row_stride + output_col,
                 accumulator_left[register],
             );
         }
         if active && output_row < rows && output_col + 8 < cols {
             result.write(
-                result_offset
-                    + batch * result_batch_stride
-                    + output_row * result_row_stride
-                    + output_col
-                    + 8,
+                batch * result.batch_stride + output_row * result.row_stride + output_col + 8,
                 accumulator_right[register],
             );
         }

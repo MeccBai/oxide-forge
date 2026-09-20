@@ -31,64 +31,10 @@ impl CudaRuntime {
         size: usize,
         stream: Option<&CudaStream>,
     ) -> Vector {
-        if init_type.is_zero() {
-            let mut buffer = self.get_uninit_buffer(size);
-            let stream = self.execution_stream(stream);
-            buffer.zero_async(stream).unwrap();
-            return Vector { buffer };
-        }
         let mut buffer = self.get_uninit_buffer(size);
-        let (config, elements_per_thread) =
-            self.get_elementwise_launch_config(buffer.len(), DEFAULT_BLOCK_SIZE);
-        let span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
-        let stream = self.execution_stream(stream);
-        match init_type {
-            InitType::Sequence => {
-                let prepared = self.module().prepare_slice_set_seq(config).unwrap();
-                self.module()
-                    .slice_set_seq(
-                        stream,
-                        &prepared,
-                        span.descriptor(),
-                        elements_per_thread,
-                        true,
-                        0.0,
-                        1.0,
-                    )
-                    .unwrap();
-                Vector { buffer }
-            }
-            InitType::Reserve => {
-                let prepared = self.module().prepare_slice_set_seq(config).unwrap();
-                self.module()
-                    .slice_set_seq(
-                        stream,
-                        &prepared,
-                        span.descriptor(),
-                        elements_per_thread,
-                        false,
-                        0.0,
-                        1.0,
-                    )
-                    .unwrap();
-                Vector { buffer }
-            }
-            InitType::Random => {
-                let seed = rand::random();
-                let prepared = self.module().prepare_slice_set_random(config).unwrap();
-                self.module()
-                    .slice_set_random(
-                        stream,
-                        &prepared,
-                        span.descriptor(),
-                        elements_per_thread,
-                        seed,
-                    )
-                    .unwrap();
-                Vector { buffer }
-            }
-            InitType::Zero => Vector { buffer },
-        }
+        let mut span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
+        init_type.initialize(&mut span, self, stream);
+        Vector { buffer }
     }
 
     pub fn clone_vector(&mut self, vec: &Vector, stream: Option<&CudaStream>) -> Vector {

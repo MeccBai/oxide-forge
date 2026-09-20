@@ -37,7 +37,7 @@ impl CudaRuntime {
             .iter()
             .map(|matrix| &matrix.buffer)
             .collect::<Vec<_>>();
-        let buffer = self.concat_buffers_on(&buffers, stream);
+        let buffer = self.concat_buffers(&buffers, stream);
         self.create_matrix(buffer, rows, cols)
     }
 
@@ -72,7 +72,7 @@ impl CudaRuntime {
                 ));
             }
         }
-        let buffer = self.concat_buffers_from_span_on(&spans, stream);
+        let buffer = self.concat_buffers_from_span(&spans, stream);
         self.create_matrix(buffer, rows, cols)
     }
 
@@ -92,11 +92,7 @@ impl CudaRuntime {
                     .expect("row split size overflow");
                 let span = DeviceSpan::from_buffer(&matrix.buffer, offset, len);
                 offset += len;
-                let buffer = if let Some(stream) = stream {
-                    span.to_buffer_on(self, stream)
-                } else {
-                    span.to_buffer(self)
-                };
+                let buffer = span.to_buffer(self, stream);
                 self.create_matrix(buffer, rows, matrix.cols)
             })
             .collect()
@@ -125,7 +121,7 @@ impl CudaRuntime {
                     })
                     .collect::<Vec<_>>();
                 column_offset += cols;
-                let buffer = self.concat_buffers_from_span_on(&spans, stream);
+                let buffer = self.concat_buffers_from_span(&spans, stream);
                 self.create_matrix(buffer, matrix.rows, cols)
             })
             .collect()
@@ -135,8 +131,27 @@ impl CudaRuntime {
         let rows = mat.cols;
         let cols = mat.rows;
         let mut result_buffer = self.get_uninit_buffer(rows * cols);
-        let stream = self.execution_stream(stream);
-        self.matrix_transpose_into_on(stream, mat, &mut result_buffer);
+        if !mat.buffer.is_empty() {
+            const TILE_SIZE: usize = 32;
+            const BLOCK_ROWS: usize = 8;
+            let grid = (
+                mat.cols.div_ceil(TILE_SIZE) as u32,
+                mat.rows.div_ceil(TILE_SIZE) as u32,
+            );
+            let config = LaunchConfig2D::new(grid, (TILE_SIZE as u32, BLOCK_ROWS as u32), 0);
+            let prepared = self.module().prepare_matrix_transpose(config).unwrap();
+            let stream = self.execution_stream(stream);
+            self.module()
+                .matrix_transpose(
+                    stream,
+                    &prepared,
+                    &mat.buffer,
+                    cuda_host::RowWidth::new(&mut result_buffer, mat.rows as u32),
+                    mat.rows,
+                    mat.cols,
+                )
+                .unwrap();
+        }
         self.create_matrix(result_buffer, rows, cols)
     }
 
@@ -178,42 +193,11 @@ impl CudaRuntime {
         result
     }
 
-    fn matrix_transpose_into_on(
-        &self,
-        stream: &CudaStream,
-        mat: &Matrix,
-        result_buffer: &mut cuda_core::DeviceBuffer<f32>,
-    ) {
-        if mat.buffer.is_empty() {
-            return;
-        }
-
-        const TILE_SIZE: usize = 32;
-        const BLOCK_ROWS: usize = 8;
-        let grid = (
-            mat.cols.div_ceil(TILE_SIZE) as u32,
-            mat.rows.div_ceil(TILE_SIZE) as u32,
-        );
-        let config = LaunchConfig2D::new(grid, (TILE_SIZE as u32, BLOCK_ROWS as u32), 0);
-        let prepared = self.module().prepare_matrix_transpose(config).unwrap();
-
-        self.module()
-            .matrix_transpose(
-                stream,
-                &prepared,
-                &mat.buffer,
-                cuda_host::RowWidth::new(result_buffer, mat.rows as u32),
-                mat.rows,
-                mat.cols,
-            )
-            .unwrap();
-    }
-
     pub fn vector_zip(&mut self, vecs: &[Vector], stream: Option<&CudaStream>) -> Matrix {
         let spans = vecs.iter().map(|v| v.as_span()).collect::<Vec<_>>();
         let rows = spans.len();
         let cols = spans[0].len();
-        let buffer = self.concat_buffers_from_span_on(&spans, stream);
+        let buffer = self.concat_buffers_from_span(&spans, stream);
 
         self.create_matrix(buffer, rows, cols)
     }
@@ -222,11 +206,7 @@ impl CudaRuntime {
         let spans = DeviceSpan::chunks(&matrix.buffer, matrix.cols);
         let mut vectors = Vec::with_capacity(spans.len());
         for span in spans {
-            let buffer = if let Some(stream) = stream {
-                span.to_buffer_on(self, stream)
-            } else {
-                span.to_buffer(self)
-            };
+            let buffer = span.to_buffer(self, stream);
             vectors.push(self.create_vector(buffer));
         }
         vectors
@@ -239,7 +219,7 @@ impl CudaRuntime {
         stream: Option<&CudaStream>,
     ) -> Matrix {
         let spans = vec![vector.as_span(); copies];
-        let buffer = self.concat_buffers_from_span_on(&spans, stream);
+        let buffer = self.concat_buffers_from_span(&spans, stream);
         self.create_matrix(buffer, copies, vector.len())
     }
 
@@ -254,11 +234,7 @@ impl CudaRuntime {
         }
 
         let span = DeviceSpan::from_buffer(&matrix.buffer, 0, matrix.cols);
-        let buffer = if let Some(stream) = stream {
-            span.to_buffer_on(self, stream)
-        } else {
-            span.to_buffer(self)
-        };
+        let buffer = span.to_buffer(self, stream);
         self.create_vector(buffer)
     }
 
@@ -298,7 +274,7 @@ impl CudaRuntime {
                     tile_spans.push(spans[span_index].clone());
                 }
 
-                let buffer = self.concat_buffers_from_span_on(&tile_spans, stream);
+                let buffer = self.concat_buffers_from_span(&tile_spans, stream);
                 result.push(self.create_matrix(buffer, rows, cols));
             }
         }
