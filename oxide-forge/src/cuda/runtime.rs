@@ -4,39 +4,166 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InitType {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RandomInit {
+    XavierUniform,
+    XavierNormal,
+    KaimingUniform,
+    KaimingNormal,
+    Uniform { min: f32, max: f32 },
+    Normal { mean: f32, std_dev: f32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RegularInit {
+    Constant(f32),
     Sequence,
     Reverse,
-    Random,
-    Zero,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum InitType {
+    Random(RandomInit),
+    Regular(RegularInit),
 }
 
 impl InitType {
     pub(crate) fn initialize(
         self,
         span: &mut DeviceSpanMut<'_, f32>,
+        fan_in: usize,
+        fan_out: usize,
         runtime: &CudaRuntime,
         stream: Option<&CudaStream>,
     ) {
         match self {
-            Self::Sequence => span.set(runtime, move |index| index as f32, stream),
-            Self::Reverse => {
+            Self::Regular(RegularInit::Sequence) => {
+                span.set(runtime, move |index| index as f32, stream)
+            }
+            Self::Regular(RegularInit::Reverse) => {
                 let len = span.len();
                 span.set(runtime, move |index| (len - index) as f32, stream);
             }
-            Self::Random => {
+            Self::Regular(RegularInit::Constant(value)) => {
+                span.set(runtime, move |_| value, stream)
+            }
+            Self::Random(initializer) => {
+                assert!(
+                    fan_in > 0 && fan_out > 0,
+                    "random initialization requires non-zero fans"
+                );
+                let distribution = initializer.distribution(fan_in, fan_out);
                 let seed = rand::random::<u32>();
                 span.set(
                     runtime,
                     move |index| {
-                        let value = random(seed.wrapping_add(index as u32));
-                        value as f32 / u32::MAX as f32
+                        let first = random(seed.wrapping_add((index as u32).wrapping_mul(2)));
+                        let unit = first as f32 / u32::MAX as f32;
+                        match distribution {
+                            RandomDistribution::Uniform { min, max } => min + unit * (max - min),
+                            RandomDistribution::Normal { mean, std_dev } => {
+                                let second = random(
+                                    seed.wrapping_add((index as u32).wrapping_mul(2))
+                                        .wrapping_add(1),
+                                );
+                                let u1 = unit.max(f32::EPSILON);
+                                let u2 = second as f32 / u32::MAX as f32;
+                                let standard = (-2.0 * u1.ln()).sqrt()
+                                    * (2.0 * core::f32::consts::PI * u2).cos();
+                                mean + standard * std_dev
+                            }
+                        }
                     },
                     stream,
                 );
             }
-            Self::Zero => span.set(runtime, move |_| 0.0, stream),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RandomDistribution {
+    Uniform { min: f32, max: f32 },
+    Normal { mean: f32, std_dev: f32 },
+}
+
+impl RandomInit {
+    fn distribution(self, fan_in: usize, fan_out: usize) -> RandomDistribution {
+        let fan_in = fan_in as f32;
+        let fan_out = fan_out as f32;
+        match self {
+            Self::XavierUniform => {
+                let bound = (6.0 / (fan_in + fan_out)).sqrt();
+                RandomDistribution::Uniform {
+                    min: -bound,
+                    max: bound,
+                }
+            }
+            Self::XavierNormal => RandomDistribution::Normal {
+                mean: 0.0,
+                std_dev: (2.0 / (fan_in + fan_out)).sqrt(),
+            },
+            Self::KaimingUniform => {
+                let bound = (6.0 / fan_in).sqrt();
+                RandomDistribution::Uniform {
+                    min: -bound,
+                    max: bound,
+                }
+            }
+            Self::KaimingNormal => RandomDistribution::Normal {
+                mean: 0.0,
+                std_dev: (2.0 / fan_in).sqrt(),
+            },
+            Self::Uniform { min, max } => {
+                assert!(min.is_finite() && max.is_finite() && min <= max);
+                RandomDistribution::Uniform { min, max }
+            }
+            Self::Normal { mean, std_dev } => {
+                assert!(mean.is_finite() && std_dev.is_finite() && std_dev >= 0.0);
+                RandomDistribution::Normal { mean, std_dev }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RandomDistribution, RandomInit};
+
+    #[test]
+    fn fan_scaled_initializers_use_expected_parameters() {
+        let (fan_in, fan_out) = (64, 32);
+
+        match RandomInit::XavierUniform.distribution(fan_in, fan_out) {
+            RandomDistribution::Uniform { min, max } => {
+                let expected = (6.0_f32 / 96.0).sqrt();
+                assert_eq!((min, max), (-expected, expected));
+            }
+            _ => unreachable!(),
+        }
+
+        match RandomInit::XavierNormal.distribution(fan_in, fan_out) {
+            RandomDistribution::Normal { mean, std_dev } => {
+                assert_eq!(mean, 0.0);
+                assert_eq!(std_dev, (2.0_f32 / 96.0).sqrt());
+            }
+            _ => unreachable!(),
+        }
+
+        match RandomInit::KaimingUniform.distribution(fan_in, fan_out) {
+            RandomDistribution::Uniform { min, max } => {
+                let expected = (6.0_f32 / 64.0).sqrt();
+                assert_eq!((min, max), (-expected, expected));
+            }
+            _ => unreachable!(),
+        }
+
+        match RandomInit::KaimingNormal.distribution(fan_in, fan_out) {
+            RandomDistribution::Normal { mean, std_dev } => {
+                assert_eq!(mean, 0.0);
+                assert_eq!(std_dev, (2.0_f32 / 64.0).sqrt());
+            }
+            _ => unreachable!(),
         }
     }
 }

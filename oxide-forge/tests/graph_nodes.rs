@@ -1,4 +1,4 @@
-use oxide_forge::cuda::{CudaRuntime, InitType};
+use oxide_forge::cuda::{CudaRuntime, InitType, RandomInit, RegularInit};
 use oxide_forge::graph::{
     Branch, Graph, GraphBuilder, GraphNode, InitConfig, LearningRateScheduler, MatrixConfig,
 };
@@ -53,15 +53,21 @@ fn graph_runs_two_complete_training_steps() {
         .init(
             &mut runtime,
             InitConfig::Random {
+                initializer: RandomInit::XavierUniform,
                 loss: Loss::MeanSquaredError,
                 learning_rate: LearningRateScheduler::new(0.01),
             },
         )
         .unwrap();
-    let target = runtime.new_matrix(InitType::Zero, 16, 16, None);
+    let target = runtime.new_matrix(InitType::Regular(RegularInit::Constant(0.0)), 16, 16, None);
 
     for _ in 0..2 {
-        let input = runtime.new_matrix(InitType::Random, 16, 16, None);
+        let input = runtime.new_matrix(
+            InitType::Random(RandomInit::Uniform { min: 0.0, max: 1.0 }),
+            16,
+            16,
+            None,
+        );
         let loss = graph.train_step(input, &target, 1.0, 0.0, 0.0, &mut runtime);
         runtime.recycle_vector(loss);
     }
@@ -76,26 +82,49 @@ fn graph_runs_two_complete_training_steps() {
 fn span_set_initializers_preserve_values() {
     let mut runtime = CudaRuntime::new().unwrap();
 
-    let sequence = runtime.new_vector(InitType::Sequence, 5, None);
+    let sequence = runtime.new_vector(InitType::Regular(RegularInit::Sequence), 5, None);
     assert_eq!(
         sequence.to_host(&runtime, None),
         vec![0.0, 1.0, 2.0, 3.0, 4.0]
     );
 
-    let reverse = runtime.new_vector(InitType::Reverse, 5, None);
+    let reverse = runtime.new_vector(InitType::Regular(RegularInit::Reverse), 5, None);
     assert_eq!(
         reverse.to_host(&runtime, None),
         vec![5.0, 4.0, 3.0, 2.0, 1.0]
     );
 
-    let zero = runtime.new_vector(InitType::Zero, 5, None);
+    let zero = runtime.new_vector(InitType::Regular(RegularInit::Constant(0.0)), 5, None);
     assert_eq!(zero.to_host(&runtime, None), vec![0.0; 5]);
 
-    let random = runtime.new_vector(InitType::Random, 64, None);
+    let constant = runtime.new_vector(InitType::Regular(RegularInit::Constant(3.5)), 5, None);
+    assert_eq!(constant.to_host(&runtime, None), vec![3.5; 5]);
+
+    let random = runtime.new_vector(
+        InitType::Random(RandomInit::Uniform { min: 0.0, max: 1.0 }),
+        64,
+        None,
+    );
     assert!(
         random
             .to_host(&runtime, None)
             .into_iter()
             .all(|value| (0.0..=1.0).contains(&value))
     );
+
+    for initializer in [
+        RandomInit::XavierUniform,
+        RandomInit::XavierNormal,
+        RandomInit::KaimingUniform,
+        RandomInit::KaimingNormal,
+        RandomInit::Normal {
+            mean: 0.0,
+            std_dev: 1.0,
+        },
+    ] {
+        let values = runtime
+            .new_matrix(InitType::Random(initializer), 16, 16, None)
+            .to_host(&runtime, None);
+        assert!(values.into_iter().all(f32::is_finite));
+    }
 }

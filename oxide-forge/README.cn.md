@@ -112,9 +112,19 @@ cargo check -p oxide-forge
 ```rust
 let mut runtime = CudaRuntime::new()?;
 
-let input = runtime.new_matrix(InitType::Random, 256, 128);
+let input = runtime.new_matrix(
+    InitType::Random(RandomInit::Uniform { min: 0.0, max: 1.0 }),
+    256,
+    128,
+    None,
+);
 let projection = Linear::new(
-    runtime.new_matrix(InitType::Random, 128, 64),
+    runtime.new_matrix(
+        InitType::Random(RandomInit::KaimingNormal),
+        128,
+        64,
+        None,
+    ),
     None,
     Activation::Identity,
 );

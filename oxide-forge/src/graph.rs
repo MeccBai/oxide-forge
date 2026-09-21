@@ -1,5 +1,5 @@
 use crate::cuda::{
-    CudaRuntime,
+    CudaRuntime, RandomInit, RegularInit,
     container::{Matrix, Vector},
 };
 use crate::net::metadata::{HostData, HostDataCursor};
@@ -31,6 +31,12 @@ impl MatrixConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub enum InitConfig {
     Random {
+        initializer: RandomInit,
+        loss: Loss,
+        learning_rate: LearningRateScheduler,
+    },
+    Regular {
+        initializer: RegularInit,
         loss: Loss,
         learning_rate: LearningRateScheduler,
     },

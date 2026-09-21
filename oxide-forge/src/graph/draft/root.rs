@@ -1,5 +1,5 @@
 use super::DraftStep;
-use crate::cuda::CudaRuntime;
+use crate::cuda::{CudaRuntime, InitType, RegularInit};
 use crate::graph::{Graph, InitConfig, MatrixConfig, Step, TrainState};
 use crate::net::checkpoint::CheckpointResult;
 
@@ -32,11 +32,27 @@ impl GraphDraft {
         runtime: &mut CudaRuntime,
         config: InitConfig,
     ) -> CheckpointResult<Graph<TRAINING>> {
-        let (loss, learning_rate) = match config {
+        let (parameter_init, bias_init, loss, learning_rate) = match config {
             InitConfig::Random {
+                initializer,
                 loss,
                 learning_rate,
-            } => (loss, learning_rate),
+            } => (
+                InitType::Random(initializer),
+                InitType::Regular(RegularInit::Constant(0.0)),
+                loss,
+                learning_rate,
+            ),
+            InitConfig::Regular {
+                initializer,
+                loss,
+                learning_rate,
+            } => (
+                InitType::Regular(initializer),
+                InitType::Regular(initializer),
+                loss,
+                learning_rate,
+            ),
             InitConfig::Load(path) => {
                 return Err(format!(
                     "Graph checkpoint loading is not implemented for dynamic topology: {}",
@@ -45,7 +61,14 @@ impl GraphDraft {
                 .into());
             }
         };
-        let (steps, states) = compile_steps::<TRAINING>(self.steps, runtime, loss, &learning_rate);
+        let (steps, states) = compile_steps::<TRAINING>(
+            self.steps,
+            runtime,
+            parameter_init,
+            bias_init,
+            loss,
+            &learning_rate,
+        );
         Ok(Graph {
             input_config: self.input_config,
             output_config: self.output_config,
@@ -60,6 +83,8 @@ impl GraphDraft {
 pub(crate) fn compile_steps<const TRAINING: bool>(
     drafts: Vec<DraftStep>,
     runtime: &mut CudaRuntime,
+    parameter_init: InitType,
+    bias_init: InitType,
     loss: crate::graph::Loss,
     learning_rate: &crate::graph::LearningRateScheduler,
 ) -> (Vec<Step<TRAINING>>, Vec<crate::graph::NodeTrainState>) {
@@ -76,7 +101,15 @@ pub(crate) fn compile_steps<const TRAINING: bool>(
             DraftStep::Map(branches) => {
                 let branches = branches
                     .into_iter()
-                    .map(|branch| branch.compile::<TRAINING>(runtime, loss, learning_rate.clone()))
+                    .map(|branch| {
+                        branch.compile::<TRAINING>(
+                            runtime,
+                            parameter_init,
+                            bias_init,
+                            loss,
+                            learning_rate.clone(),
+                        )
+                    })
                     .collect();
                 if TRAINING {
                     states.push(crate::graph::NodeTrainState::default());
@@ -107,14 +140,14 @@ pub(crate) fn compile_steps<const TRAINING: bool>(
             }
             DraftStep::Linear(config) => {
                 let weights = runtime.new_matrix(
-                    crate::cuda::InitType::Random,
+                    parameter_init,
                     config.weights.rows,
                     config.weights.cols,
                     None,
                 );
-                let bias = config.bias.then(|| {
-                    runtime.new_vector(crate::cuda::InitType::Zero, config.weights.cols, None)
-                });
+                let bias = config
+                    .bias
+                    .then(|| runtime.new_vector(bias_init, config.weights.cols, None));
                 let linear = crate::net::linear::Linear::new(weights, bias, config.activation);
                 let node: Box<dyn crate::graph::GraphNode> = if TRAINING {
                     Box::new(crate::net::linear::LinearTrainingNode::new(linear))

@@ -19,7 +19,7 @@ mod span;
 mod tools;
 
 pub use runtime::CudaRuntime;
-pub use runtime::InitType;
+pub use runtime::{InitType, RandomInit, RegularInit};
 pub(crate) use span::{DeviceSpan, DeviceSpanMut};
 
 pub(in crate::cuda) use device::kernels;

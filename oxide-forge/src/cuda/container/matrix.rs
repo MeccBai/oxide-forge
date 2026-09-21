@@ -465,7 +465,7 @@ impl CudaRuntime {
         let size = rows * cols;
         let mut buffer = self.get_uninit_buffer(size);
         let mut span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
-        init_type.initialize(&mut span, self, stream);
+        init_type.initialize(&mut span, rows, cols, self, stream);
         self.create_matrix(buffer, rows, cols)
     }
 

@@ -173,15 +173,26 @@ let draft = GraphBuilder::start(MatrixConfig::new(ROWS, WIDTH))
 let mut graph: Graph<true> = draft.init(
     &mut runtime,
     InitConfig::Random {
+        initializer: RandomInit::XavierUniform,
         loss: Loss::MeanSquaredError,
         learning_rate: LearningRateScheduler::new(1.0e-3)
             .linear(100, 1.0e-4),
     },
 )?;
 
-let target = runtime.new_matrix(InitType::Zero, ROWS, WIDTH, None);
+let target = runtime.new_matrix(
+    InitType::Regular(RegularInit::Constant(0.0)),
+    ROWS,
+    WIDTH,
+    None,
+);
 for _ in 0..2 {
-    let input = runtime.new_matrix(InitType::Random, ROWS, WIDTH, None);
+    let input = runtime.new_matrix(
+        InitType::Random(RandomInit::Uniform { min: 0.0, max: 1.0 }),
+        ROWS,
+        WIDTH,
+        None,
+    );
     let loss = graph.train_step(input, &target, 1.0, 0.0, 0.9, &mut runtime);
     println!("loss = {}", loss.sum(&mut runtime, None) / ROWS as f32);
     runtime.recycle_vector(loss);

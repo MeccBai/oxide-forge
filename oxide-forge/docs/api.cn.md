@@ -46,6 +46,7 @@ let draft = GraphBuilder::start(MatrixConfig::new(rows, width))
 let mut graph: Graph<true> = draft.init(
     &mut runtime,
     InitConfig::Random {
+        initializer: RandomInit::XavierUniform,
         loss: Loss::MeanSquaredError,
         learning_rate: LearningRateScheduler::new(1.0e-3),
     },
@@ -55,7 +56,8 @@ let loss = graph.train_step(input, &target, 1.0, 0.0, 0.9, &mut runtime);
 ```
 
 `LinearConfig` 只包含权重形状、是否包含 bias 和 activation，不分配显存。
-`InitConfig::Random` 在 `GraphDraft::init` 时通过传入的 runtime 创建随机权重和零 bias。
+`InitConfig` 分为 `Random`、`Regular` 和 `Load`。随机初始化使用指定的 `RandomInit`
+生成权重，并将 bias 置零；规律初始化将指定的 `RegularInit` 应用于所有参数。
 训练能力由 `Graph<true>` 决定，而不是由另一套 Linear 或 Block 类型决定。
 
 | Builder API | 作用 |
@@ -131,26 +133,50 @@ runtime.span_to_buffer_async(&span);
 
 ```rust
 pub enum InitType {
+    Random(RandomInit),
+    Regular(RegularInit),
+}
+
+pub enum RandomInit {
+    XavierUniform,
+    XavierNormal,
+    KaimingUniform,
+    KaimingNormal,
+    Uniform { min: f32, max: f32 },
+    Normal { mean: f32, std_dev: f32 },
+}
+
+pub enum RegularInit {
+    Constant(f32),
     Sequence,
-    Reserve,
-    Random,
-    Zero,
+    Reverse,
 }
 ```
 
 | 类型 | 内容 |
 | --- | --- |
-| `Sequence` | `0, 1, 2, ...` |
-| `Reserve` | `len, len-1, ...` |
-| `Random` | `[0,1]` 伪随机值 |
-| `Zero` | 全零 |
+| `XavierUniform` | `U(-sqrt(6/(fan_in+fan_out)), +sqrt(...))` |
+| `XavierNormal` | `N(0, sqrt(2/(fan_in+fan_out)))` |
+| `KaimingUniform` | `U(-sqrt(6/fan_in), +sqrt(...))` |
+| `KaimingNormal` | `N(0, sqrt(2/fan_in))` |
+| `Uniform` / `Normal` | 使用明确参数的随机分布 |
+| `Constant` | 全部设为同一个值，包括零 |
+| `Sequence` / `Reverse` | 按索引生成的规律值 |
+
+正态分布通过 GPU 上的 Box-Muller 变换生成。Matrix 的行列分别作为 fan-in/fan-out；
+Vector 使用 `(len, 1)`。
 
 ## Matrix
 
 ### 创建与查询
 
 ```rust
-let matrix = runtime.new_matrix(InitType::Random, rows, cols);
+let matrix = runtime.new_matrix(
+    InitType::Random(RandomInit::KaimingNormal),
+    rows,
+    cols,
+    None,
+);
 
 matrix.rows();
 matrix.cols();
@@ -295,8 +321,12 @@ block，由 CUDA 自动把这些 block 分配到不同 SM。它们不再把 Matr
 ### 创建与属性
 
 ```rust
-let vector = runtime.new_vector(InitType::Random, len);
-let cloned = runtime.clone_vector(&vector);
+let vector = runtime.new_vector(
+    InitType::Random(RandomInit::Uniform { min: 0.0, max: 1.0 }),
+    len,
+    None,
+);
+let cloned = runtime.clone_vector(&vector, None);
 
 vector.len();
 vector.to_host(&runtime);

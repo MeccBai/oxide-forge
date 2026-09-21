@@ -53,6 +53,7 @@ let draft = GraphBuilder::start(MatrixConfig::new(rows, width))
 let mut graph: Graph<true> = draft.init(
     &mut runtime,
     InitConfig::Random {
+        initializer: RandomInit::XavierUniform,
         loss: Loss::MeanSquaredError,
         learning_rate: LearningRateScheduler::new(1.0e-3),
     },
@@ -62,9 +63,11 @@ let loss = graph.train_step(input, &target, 1.0, 0.0, 0.9, &mut runtime);
 ```
 
 `LinearConfig` contains only the weight shape, whether a bias exists, and the
-activation kind. It never allocates device memory. Under `InitConfig::Random`,
-`GraphDraft::init` creates random weights and zero biases using the supplied
-runtime. Training is selected by `Graph<true>`, not by a separate Linear type.
+activation kind. It never allocates device memory. `InitConfig` separates
+`Random`, `Regular`, and `Load`. Random initialization applies the selected
+`RandomInit` to weights and initializes biases to zero; regular initialization
+applies its `RegularInit` to every parameter. Training is selected by
+`Graph<true>`, not by a separate Linear type.
 
 | Builder API | Effect |
 | --- | --- |
@@ -162,26 +165,50 @@ runtime.span_to_buffer_async(&span);
 
 ```rust
 pub enum InitType {
+    Random(RandomInit),
+    Regular(RegularInit),
+}
+
+pub enum RandomInit {
+    XavierUniform,
+    XavierNormal,
+    KaimingUniform,
+    KaimingNormal,
+    Uniform { min: f32, max: f32 },
+    Normal { mean: f32, std_dev: f32 },
+}
+
+pub enum RegularInit {
+    Constant(f32),
     Sequence,
     Reverse,
-    Random,
-    Zero,
 }
 ```
 
 | Variant | Contents |
 | --- | --- |
-| `Sequence` | `0, 1, 2, ...` |
-| `Reverse` | `len, len - 1, ...` |
-| `Random` | Pseudorandom values in `[0, 1]` |
-| `Zero` | All zeroes |
+| `XavierUniform` | `U(-sqrt(6/(fan_in+fan_out)), +sqrt(...))` |
+| `XavierNormal` | `N(0, sqrt(2/(fan_in+fan_out)))` |
+| `KaimingUniform` | `U(-sqrt(6/fan_in), +sqrt(...))` |
+| `KaimingNormal` | `N(0, sqrt(2/fan_in))` |
+| `Uniform` / `Normal` | Explicit distribution parameters |
+| `Constant` | One value, including zero |
+| `Sequence` / `Reverse` | Deterministic index-based values |
+
+Normal values use a device-side Box-Muller transform. Matrix rows and columns
+supply `fan_in` and `fan_out`; vectors use `(len, 1)`.
 
 ## Matrix
 
 ### Construction and properties
 
 ```rust
-let matrix = runtime.new_matrix(InitType::Random, rows, cols, None);
+let matrix = runtime.new_matrix(
+    InitType::Random(RandomInit::KaimingNormal),
+    rows,
+    cols,
+    None,
+);
 
 matrix.rows();
 matrix.cols();
@@ -332,7 +359,11 @@ exclusively borrowed. Transpose before column-wise processing.
 ### Construction and properties
 
 ```rust
-let vector = runtime.new_vector(InitType::Random, len, None);
+let vector = runtime.new_vector(
+    InitType::Random(RandomInit::Uniform { min: 0.0, max: 1.0 }),
+    len,
+    None,
+);
 let cloned = runtime.clone_vector(&vector, None);
 
 vector.len();

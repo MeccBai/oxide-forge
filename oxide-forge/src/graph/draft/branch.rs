@@ -1,5 +1,5 @@
 use super::{DraftStep, GraphDraft, root::compile_steps};
-use crate::cuda::CudaRuntime;
+use crate::cuda::{CudaRuntime, InitType, RegularInit};
 use crate::graph::{Branch, InitConfig, LearningRateScheduler, Loss, MatrixConfig, TrainState};
 use crate::net::checkpoint::CheckpointResult;
 
@@ -62,11 +62,27 @@ impl BranchDraft {
         runtime: &mut CudaRuntime,
         config: InitConfig,
     ) -> CheckpointResult<Branch<TRAINING>> {
-        let (loss, learning_rate) = match config {
+        let (parameter_init, bias_init, loss, learning_rate) = match config {
             InitConfig::Random {
+                initializer,
                 loss,
                 learning_rate,
-            } => (loss, learning_rate),
+            } => (
+                InitType::Random(initializer),
+                InitType::Regular(RegularInit::Constant(0.0)),
+                loss,
+                learning_rate,
+            ),
+            InitConfig::Regular {
+                initializer,
+                loss,
+                learning_rate,
+            } => (
+                InitType::Regular(initializer),
+                InitType::Regular(initializer),
+                loss,
+                learning_rate,
+            ),
             InitConfig::Load(path) => {
                 return Err(format!(
                     "Branch checkpoint loading is not implemented for dynamic topology: {}",
@@ -75,18 +91,27 @@ impl BranchDraft {
                 .into());
             }
         };
-        Ok(self.compile::<TRAINING>(runtime, loss, learning_rate))
+        Ok(self.compile::<TRAINING>(runtime, parameter_init, bias_init, loss, learning_rate))
     }
 
     pub(crate) fn compile<const TRAINING: bool>(
         self,
         runtime: &mut CudaRuntime,
+        parameter_init: InitType,
+        bias_init: InitType,
         loss: Loss,
         learning_rate: LearningRateScheduler,
     ) -> Branch<TRAINING> {
         let input_config = self.get_input_config();
         let output_config = self.get_output_config();
-        let (steps, states) = compile_steps::<TRAINING>(self.steps, runtime, loss, &learning_rate);
+        let (steps, states) = compile_steps::<TRAINING>(
+            self.steps,
+            runtime,
+            parameter_init,
+            bias_init,
+            loss,
+            &learning_rate,
+        );
         Branch {
             input_config,
             output_config,

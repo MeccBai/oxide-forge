@@ -33,7 +33,7 @@ impl CudaRuntime {
     ) -> Vector {
         let mut buffer = self.get_uninit_buffer(size);
         let mut span = DeviceSpanMut::from_buffer(&mut buffer, 0, size);
-        init_type.initialize(&mut span, self, stream);
+        init_type.initialize(&mut span, size, 1, self, stream);
         Vector { buffer }
     }
 
